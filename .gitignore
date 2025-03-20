@@ -1,0 +1,17 @@
+# Ignorar node_modules (carpeta de dependencias)
+node_modules/
+
+# Ignorar el archivo de variables de entorno
+.env
+
+# Ignorar archivos de logs
+*.log
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Ignorar archivos de caché de la terminal
+.cache/
+
+# Ignorar archivos de configuración de VS Code
+.vscode/
