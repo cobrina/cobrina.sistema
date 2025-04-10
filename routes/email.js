@@ -7,7 +7,7 @@ import { check, validationResult } from "express-validator";
 dotenv.config();
 
 const router = express.Router();
-const upload = multer({ limits: { fileSize: 5 * 1024 * 1024 } }); // Máx 5MB
+const upload = multer({ limits: { fileSize: 15 * 1024 * 1024 } }); // Máx 10MB
 
 // 📩 Transporter de contacto (One Page)
 const transporterContacto = nodemailer.createTransport({
