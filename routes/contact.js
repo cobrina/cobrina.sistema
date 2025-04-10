@@ -8,6 +8,16 @@ dotenv.config();
 
 const router = express.Router();
 
+// 🧼 Palabras prohibidas
+const contienePalabrasProhibidas = (texto) => {
+  const palabrasProhibidas = [
+    "mierda","sorete", "joder", "hijo", "puta", "romper", "matar", "cagar", "forro", "gato", "amenaza", "amenazar", "hack"
+  ];
+  const minuscula = texto.toLowerCase();
+  return palabrasProhibidas.some((palabra) => minuscula.includes(palabra));
+};
+
+// 📩 Ruta para contacto desde la One Page
 router.post(
   "/",
   [
@@ -44,14 +54,22 @@ router.post(
       const verifyURL = `https://www.google.com/recaptcha/api/siteverify?secret=${secretKey}&response=${token}`;
       const { data } = await axios.post(verifyURL);
 
-      if (!data.success || data.score < 0.5) {
-        return res.status(403).json({ error: "⚠️ ReCAPTCHA falló. Actividad sospechosa." });
+      if (!data.success || data.score < 0.9) {
+        console.warn("⚠️ reCAPTCHA sospechoso. Score:", data.score);
+        return res.status(403).json({ error: "⚠️ reCAPTCHA falló. Actividad sospechosa." });
       }
 
       console.log("✅ reCAPTCHA validado. Score:", data.score);
     } catch (error) {
       console.error("❌ Error validando reCAPTCHA:", error);
       return res.status(500).json({ error: "Error al verificar el reCAPTCHA." });
+    }
+
+    // 🚫 Filtro de lenguaje ofensivo
+    if (contienePalabrasProhibidas(mensaje)) {
+      const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+      console.warn("❌ Mensaje bloqueado por lenguaje ofensivo. IP:", ip);
+      return res.status(403).json({ error: "Tu mensaje contiene lenguaje inapropiado y fue bloqueado." });
     }
 
     // 📧 Enviar correo con Gmail

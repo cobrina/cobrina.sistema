@@ -3,7 +3,9 @@ import mongoose from "mongoose";
 import cors from "cors";
 import dotenv from "dotenv";
 import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 
+// 📦 Rutas
 import contactRoutes from "./routes/contact.js";
 import authRoutes from "./routes/authRoutes.js";
 import empleadosRoutes from "./routes/empleados.js";
@@ -13,29 +15,66 @@ import emailRoutes from "./routes/email.js";
 dotenv.config();
 
 const app = express();
-app.set("trust proxy", 1); // ✅ Necesario para rate-limit en Render
-
 const PORT = process.env.PORT || 5000;
 
-// 🛡️ Seguridad HTTP
+// ✅ Trust proxy para Render (necesario para rate-limit)
+app.set("trust proxy", 1);
+
+// 🛡️ Seguridad HTTP básica
 app.use(helmet());
-app.disable("x-powered-by"); // 🔒 Oculta Express
+app.disable("x-powered-by");
 
 // 🌍 CORS
 app.use(cors());
 
-// 📦 Parseo de JSON
+// 📦 Parseo de JSON y formularios grandes (hasta 10mb)
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
+// 🛡️ Middleware de Rate Limiting por ruta sensible
+
+// ⛔ Login: max 5 intentos cada 15 minutos
+const limiterLogin = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: "⚠️ Demasiados intentos de login. Intentá nuevamente en 15 minutos.",
+});
+
+// ⛔ Formulario de contacto: max 3 cada 15 minutos
+const limiterContacto = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  message: "⚠️ Demasiados envíos de contacto. Intentá más tarde.",
+});
+
+// ⛔ Enviar recibos: max 3 cada 15 minutos
+const limiterRecibo = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  message: "⚠️ Demasiados envíos de recibo. Intentá más tarde.",
+});
+
+// ⛔ Enviar certificados: max 3 cada 15 minutos
+const limiterCertificado = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  message: "⚠️ Demasiados envíos de certificado. Intentá más tarde.",
+});
+
+// 🛡️ Aplicar los limitadores ANTES de las rutas
+app.use("/auth/login", limiterLogin);
+app.use("/contacto", limiterContacto);
+app.use("/enviar-recibo", limiterRecibo);
+app.use("/enviar-certificado", limiterCertificado);
+
 // ✅ Rutas
-app.use("/", emailRoutes);
 app.use("/contacto", contactRoutes);
 app.use("/auth", authRoutes);
 app.use("/empleados", empleadosRoutes);
 app.use("/certificados", certificadosRoutes);
+app.use("/", emailRoutes);
 
-// 🏠 Ruta base
+// Ruta base
 app.get("/", (req, res) => {
   res.send("API de Cobrina funcionando! 🎉");
 });
