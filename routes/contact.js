@@ -8,7 +8,6 @@ dotenv.config();
 
 const router = express.Router();
 
-// Ruta para contacto desde la One Page
 router.post(
   "/",
   [
@@ -55,21 +54,19 @@ router.post(
       return res.status(500).json({ error: "Error al verificar el reCAPTCHA." });
     }
 
-    // 📧 Enviar correo
+    // 📧 Enviar correo con Gmail
     try {
       const transporter = nodemailer.createTransport({
-        host: process.env.SMTP_HOST,
-        port: 465,
-        secure: true,
+        service: "gmail",
         auth: {
-          user: process.env.SMTP_USER,
-          pass: process.env.SMTP_PASS,
+          user: process.env.SMTP_GMAIL_USER,
+          pass: process.env.SMTP_GMAIL_PASS,
         },
       });
 
       const mailOptions = {
-        from: `"RDC Collections" <${process.env.SMTP_USER}>`,
-        to: process.env.SMTP_USER,
+        from: `"RDC Collections" <${process.env.SMTP_GMAIL_USER}>`,
+        to: process.env.SMTP_GMAIL_USER,
         subject: "Consulta desde la Web",
         html: `
           <h3>Consulta desde la Web</h3>
