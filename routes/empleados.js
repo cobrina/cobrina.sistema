@@ -6,6 +6,7 @@ import { check, validationResult } from "express-validator";
 
 const router = express.Router();
 
+// ✅ Middleware para verificar permisos por rol
 const permitirRoles = (...rolesPermitidos) => {
   return (req, res, next) => {
     if (!rolesPermitidos.includes(req.user.role)) {
@@ -15,15 +16,15 @@ const permitirRoles = (...rolesPermitidos) => {
   };
 };
 
-// ✅ Crear empleado (admin y super-admin)
+// ✅ Crear nuevo empleado (solo super-admin)
 router.post(
   "/crear",
   verifyToken,
-  permitirRoles("admin", "super-admin"),
+  permitirRoles("super-admin"),
   [
     check("username", "El nombre de usuario es obligatorio").notEmpty(),
     check("password", "La contraseña es obligatoria").notEmpty(),
-    check("email", "El correo no es válido").optional().isEmail(),
+    check("email", "El correo es obligatorio").notEmpty().isEmail().withMessage("El correo no es válido"),
     check("role", "El rol es obligatorio").isIn(["operador", "admin"]),
   ],
   async (req, res) => {
@@ -45,114 +46,20 @@ router.post(
       const nuevoEmpleado = new Empleado({
         username,
         password: hashedPassword,
-        email: email || "",
+        email,
         role,
       });
 
       await nuevoEmpleado.save();
-      res.json({ message: "Empleado creado exitosamente" });
+      res.status(201).json({ message: "✅ Empleado creado exitosamente" });
     } catch (error) {
       console.error("❌ Error al crear empleado:", error);
-      res.status(500).json({ error: "Error interno del servidor" });
+      res.status(500).json({ error: "Error interno del servidor al crear empleado" });
     }
   }
 );
 
-// ✅ Ver todos los empleados (solo super-admin)
-router.get(
-  "/todos",
-  verifyToken,
-  permitirRoles("super-admin"),
-  async (req, res) => {
-    try {
-      const empleados = await Empleado.find().select("-password");
-      res.json(empleados);
-    } catch (error) {
-      res.status(500).json({ error: "Error al obtener empleados" });
-    }
-  }
-);
-
-// ✅ Ver perfil propio
-router.get("/mi-perfil", verifyToken, async (req, res) => {
-  try {
-    const empleado = await Empleado.findById(req.user.id).select("-password");
-    res.json(empleado);
-  } catch (error) {
-    res.status(500).json({ error: "Error al obtener perfil" });
-  }
-});
-
-// ✅ Actualizar empleado (admin y super-admin)
-router.put(
-  "/:id",
-  verifyToken,
-  permitirRoles("admin", "super-admin"),
-  [
-    check("email", "El correo no es válido").optional().isEmail(),
-    check("role").optional().isIn(["operador", "admin"]),
-  ],
-  async (req, res) => {
-    const errores = validationResult(req);
-    if (!errores.isEmpty()) {
-      return res.status(400).json({ errores: errores.array() });
-    }
-
-    try {
-      const { username, email, role, password } = req.body;
-
-      const updateData = {};
-      if (username) updateData.username = username;
-      if (email) updateData.email = email;
-      if (role) updateData.role = role;
-      if (password) {
-        const hashed = await bcrypt.hash(password, 10);
-        updateData.password = hashed;
-      }
-
-      const empleadoActualizado = await Empleado.findByIdAndUpdate(
-        req.params.id,
-        updateData,
-        { new: true }
-      ).select("-password");
-
-      if (!empleadoActualizado) {
-        return res.status(404).json({ error: "Empleado no encontrado" });
-      }
-
-      res.json({
-        message: "Empleado actualizado",
-        empleado: empleadoActualizado,
-      });
-    } catch (error) {
-      console.error("❌ Error al actualizar empleado:", error);
-      res.status(500).json({ error: "Error al actualizar el empleado" });
-    }
-  }
-);
-
-// ✅ Eliminar empleado (super-admin)
-router.delete(
-  "/:id",
-  verifyToken,
-  permitirRoles("super-admin"),
-  async (req, res) => {
-    try {
-      const eliminado = await Empleado.findByIdAndDelete(req.params.id);
-
-      if (!eliminado) {
-        return res.status(404).json({ error: "Empleado no encontrado" });
-      }
-
-      res.json({ message: "Empleado eliminado correctamente" });
-    } catch (error) {
-      console.error("❌ Error al eliminar empleado:", error);
-      res.status(500).json({ error: "Error al eliminar el empleado" });
-    }
-  }
-);
-
-// ✅ Empleados paginados (solo super-admin)
+// ✅ Obtener empleados paginados (solo super-admin)
 router.get(
   "/paginated",
   verifyToken,
@@ -183,8 +90,100 @@ router.get(
 
       res.json({ total, empleados });
     } catch (error) {
-      console.error("❌ Error en paginated:", error);
+      console.error("❌ Error al obtener paginados:", error);
       res.status(500).json({ error: "Error al obtener empleados paginados" });
+    }
+  }
+);
+
+// ✅ Actualizar empleado (solo super-admin)
+router.put(
+  "/:id",
+  verifyToken,
+  permitirRoles("super-admin"),
+  [
+    check("email", "El correo es obligatorio").notEmpty().isEmail().withMessage("El correo no es válido"),
+  ],
+  async (req, res) => {
+    const errores = validationResult(req);
+    if (!errores.isEmpty()) {
+      return res.status(400).json({ errores: errores.array() });
+    }
+
+    try {
+      const { username, email, role, password } = req.body;
+
+      const empleado = await Empleado.findById(req.params.id);
+      if (!empleado) {
+        return res.status(404).json({ error: "Empleado no encontrado" });
+      }
+
+      const updateData = {};
+      if (username) updateData.username = username;
+      if (email) updateData.email = email;
+
+      // No permitir cambiar rol si es super-admin
+      if (role && empleado.role !== "super-admin") {
+        updateData.role = role;
+      }
+
+      if (password) {
+        updateData.password = await bcrypt.hash(password, 10);
+      }
+
+      const actualizado = await Empleado.findByIdAndUpdate(req.params.id, updateData, {
+        new: true,
+      }).select("-password");
+
+      res.json({ message: "✅ Empleado actualizado", empleado: actualizado });
+    } catch (error) {
+      console.error("❌ Error al actualizar empleado:", error);
+      res.status(500).json({ error: "Error al actualizar el empleado" });
+    }
+  }
+);
+
+// ✅ Eliminar empleado (solo super-admin)
+router.delete(
+  "/:id",
+  verifyToken,
+  permitirRoles("super-admin"),
+  async (req, res) => {
+    try {
+      const eliminado = await Empleado.findByIdAndDelete(req.params.id);
+      if (!eliminado) {
+        return res.status(404).json({ error: "Empleado no encontrado" });
+      }
+
+      res.json({ message: "✅ Empleado eliminado correctamente" });
+    } catch (error) {
+      console.error("❌ Error al eliminar empleado:", error);
+      res.status(500).json({ error: "Error al eliminar empleado" });
+    }
+  }
+);
+
+// ✅ Obtener perfil propio
+router.get("/mi-perfil", verifyToken, async (req, res) => {
+  try {
+    const empleado = await Empleado.findById(req.user.id).select("-password");
+    res.json(empleado);
+  } catch (error) {
+    res.status(500).json({ error: "Error al obtener perfil" });
+  }
+});
+
+// ✅ Obtener todos los empleados (sólo super-admin)
+router.get(
+  "/todos",
+  verifyToken,
+  permitirRoles("super-admin"),
+  async (req, res) => {
+    try {
+      const empleados = await Empleado.find().select("-password");
+      res.json(empleados);
+    } catch (error) {
+      res.status(500).json({ error: "Error al obtener empleados" });
     }
   }
 );

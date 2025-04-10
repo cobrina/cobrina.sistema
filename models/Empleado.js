@@ -12,7 +12,14 @@ const empleadoSchema = new mongoose.Schema({
     required: [true, "La contraseña es obligatoria"]
   },
   email: {
-    type: String // ✅ Email opcional para todos los roles
+    type: String,
+    required: [true, "El correo es obligatorio"],
+    validate: {
+      validator: function (v) {
+        return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+      },
+      message: "El correo no es válido"
+    }
   },
   imagen: {
     type: String,
@@ -28,7 +35,5 @@ const empleadoSchema = new mongoose.Schema({
     default: Date.now
   }
 });
-
-// ✅ Se eliminó la validación que obligaba el email para admin/super-admin
 
 export default mongoose.model("Empleado", empleadoSchema);
