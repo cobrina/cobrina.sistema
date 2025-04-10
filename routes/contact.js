@@ -11,7 +11,7 @@ const router = express.Router();
 // 🧼 Palabras prohibidas
 const contienePalabrasProhibidas = (texto) => {
   const palabrasProhibidas = [
-    "mierda","sorete", "joder", "hijo", "puta", "romper", "matar", "cagar", "forro", "gato", "amenaza", "amenazar", "hack"
+    "mierda","wacho","chorro","estafa","estafador", "sorete", "joder", "hijo", "puta", "romper", "matar", "cagar", "forro", "gato", "amenaza", "amenazar", "hack"
   ];
   const minuscula = texto.toLowerCase();
   return palabrasProhibidas.some((palabra) => minuscula.includes(palabra));
@@ -48,6 +48,9 @@ router.post(
 
     const { tipo, nombre, empresa, dni, email, telefono, mensaje, token } = req.body;
 
+    // 📍 Capturar IP del remitente
+    const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+
     // ✅ Validación de reCAPTCHA
     try {
       const secretKey = process.env.RECAPTCHA_SECRET;
@@ -67,7 +70,6 @@ router.post(
 
     // 🚫 Filtro de lenguaje ofensivo
     if (contienePalabrasProhibidas(mensaje)) {
-      const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
       console.warn("❌ Mensaje bloqueado por lenguaje ofensivo. IP:", ip);
       return res.status(403).json({ error: "Tu mensaje contiene lenguaje inapropiado y fue bloqueado." });
     }
@@ -96,6 +98,8 @@ router.post(
           <p><strong>Email:</strong> ${email}</p>
           <p><strong>Teléfono:</strong> ${telefono}</p>
           <p><strong>Mensaje:</strong> ${mensaje}</p>
+          <hr />
+          <p><strong>IP del remitente:</strong> ${ip}</p>
         `,
       };
 
