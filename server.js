@@ -13,16 +13,18 @@ import emailRoutes from "./routes/email.js";
 dotenv.config();
 
 const app = express();
+app.set("trust proxy", 1); // ✅ Necesario para rate-limit en Render
+
 const PORT = process.env.PORT || 5000;
 
 // 🛡️ Seguridad HTTP
 app.use(helmet());
-app.disable("x-powered-by"); // 🔒 Oculta que estás usando Express
+app.disable("x-powered-by"); // 🔒 Oculta Express
 
-// 🌍 CORS (podés personalizarlo si lo necesitás)
+// 🌍 CORS
 app.use(cors());
 
-// 📦 Middlewares de parseo
+// 📦 Parseo de JSON
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
@@ -33,7 +35,7 @@ app.use("/auth", authRoutes);
 app.use("/empleados", empleadosRoutes);
 app.use("/certificados", certificadosRoutes);
 
-// ✅ Ruta base
+// 🏠 Ruta base
 app.get("/", (req, res) => {
   res.send("API de Cobrina funcionando! 🎉");
 });
@@ -52,7 +54,7 @@ mongoose
     process.exit(1);
   });
 
-// 🚀 Levantar servidor
+// 🚀 Iniciar servidor
 app.listen(PORT, () => {
   console.log(`✅ Servidor corriendo en http://localhost:${PORT}`);
 });
