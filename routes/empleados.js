@@ -2,43 +2,42 @@ import express from "express";
 import Empleado from "../models/Empleado.js";
 import bcrypt from "bcrypt";
 import verifyToken from "../middleware/verifyToken.js";
+import { check, validationResult } from "express-validator";
 
 const router = express.Router();
 
-// 🔐 Middleware para verificar si el usuario tiene un rol permitido
 const permitirRoles = (...rolesPermitidos) => {
   return (req, res, next) => {
     if (!rolesPermitidos.includes(req.user.role)) {
-      return res
-        .status(403)
-        .json({ error: "No tienes permiso para realizar esta acción" });
+      return res.status(403).json({ error: "No tienes permiso para realizar esta acción" });
     }
     next();
   };
 };
 
-// ✅ Crear empleado (solo admin y super-admin)
+// ✅ Crear empleado (admin y super-admin)
 router.post(
   "/crear",
   verifyToken,
   permitirRoles("admin", "super-admin"),
+  [
+    check("username", "El nombre de usuario es obligatorio").notEmpty(),
+    check("password", "La contraseña es obligatoria").notEmpty(),
+    check("email", "El correo no es válido").optional().isEmail(),
+    check("role", "El rol es obligatorio").isIn(["operador", "admin"]),
+  ],
   async (req, res) => {
-    console.log("📦 Datos recibidos:", req.body); // <--- agregá esto
+    const errores = validationResult(req);
+    if (!errores.isEmpty()) {
+      return res.status(400).json({ errores: errores.array() });
+    }
 
     try {
       const { username, password, email, role } = req.body;
 
-      // Validación simple
-      if (!username || !password) {
-        return res.status(400).json({ error: "Faltan campos obligatorios" });
-      }
-
-      // Validar si ya existe
       const existe = await Empleado.findOne({ username });
       if (existe) {
-        return res
-          .status(400)
-          .json({ error: "Ese nombre de usuario ya existe" });
+        return res.status(400).json({ error: "Ese nombre de usuario ya existe" });
       }
 
       const hashedPassword = await bcrypt.hash(password, 10);
@@ -46,7 +45,7 @@ router.post(
       const nuevoEmpleado = new Empleado({
         username,
         password: hashedPassword,
-        email: email || "", // ✅ Asegura que no sea undefined
+        email: email || "",
         role,
       });
 
@@ -59,9 +58,6 @@ router.post(
   }
 );
 
-// Obtener todos los empleados (solo super-admin)
-
-
 // ✅ Ver todos los empleados (solo super-admin)
 router.get(
   "/todos",
@@ -69,7 +65,7 @@ router.get(
   permitirRoles("super-admin"),
   async (req, res) => {
     try {
-      const empleados = await Empleado.find().select("-password"); // sin password
+      const empleados = await Empleado.find().select("-password");
       res.json(empleados);
     } catch (error) {
       res.status(500).json({ error: "Error al obtener empleados" });
@@ -77,7 +73,7 @@ router.get(
   }
 );
 
-// ✅ Ver perfil propio (operadores y cualquier rol)
+// ✅ Ver perfil propio
 router.get("/mi-perfil", verifyToken, async (req, res) => {
   try {
     const empleado = await Empleado.findById(req.user.id).select("-password");
@@ -87,12 +83,21 @@ router.get("/mi-perfil", verifyToken, async (req, res) => {
   }
 });
 
-// ✅ Actualizar un empleado (solo admin y super-admin)
+// ✅ Actualizar empleado (admin y super-admin)
 router.put(
   "/:id",
   verifyToken,
   permitirRoles("admin", "super-admin"),
+  [
+    check("email", "El correo no es válido").optional().isEmail(),
+    check("role").optional().isIn(["operador", "admin"]),
+  ],
   async (req, res) => {
+    const errores = validationResult(req);
+    if (!errores.isEmpty()) {
+      return res.status(400).json({ errores: errores.array() });
+    }
+
     try {
       const { username, email, role, password } = req.body;
 
@@ -126,7 +131,7 @@ router.put(
   }
 );
 
-// ✅ Eliminar un empleado (solo super-admin)
+// ✅ Eliminar empleado (super-admin)
 router.delete(
   "/:id",
   verifyToken,
@@ -147,42 +152,41 @@ router.delete(
   }
 );
 
+// ✅ Empleados paginados (solo super-admin)
+router.get(
+  "/paginated",
+  verifyToken,
+  permitirRoles("super-admin"),
+  async (req, res) => {
+    try {
+      const page = parseInt(req.query.page) || 1;
+      const limit = 5;
+      const skip = (page - 1) * limit;
 
-// 👤 Obtener empleados paginados y filtrados (solo super-admin)
-router.get("/paginated", verifyToken, permitirRoles("super-admin"), async (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = 5;
-    const skip = (page - 1) * limit;
+      const filtro = {};
+      if (req.query.busqueda) {
+        filtro.$or = [
+          { username: { $regex: req.query.busqueda, $options: "i" } },
+          { email: { $regex: req.query.busqueda, $options: "i" } },
+        ];
+      }
 
-    const filtro = {};
+      if (req.query.role && req.query.role !== "todos") {
+        filtro.role = req.query.role;
+      }
 
-    // 🔍 Búsqueda combinada por nombre o email
-    if (req.query.busqueda) {
-      filtro.$or = [
-        { username: { $regex: req.query.busqueda, $options: "i" } },
-        { email: { $regex: req.query.busqueda, $options: "i" } }
-      ];
+      const total = await Empleado.countDocuments(filtro);
+      const empleados = await Empleado.find(filtro)
+        .select("-password")
+        .skip(skip)
+        .limit(limit);
+
+      res.json({ total, empleados });
+    } catch (error) {
+      console.error("❌ Error en paginated:", error);
+      res.status(500).json({ error: "Error al obtener empleados paginados" });
     }
-
-    if (req.query.role && req.query.role !== "todos") {
-      filtro.role = req.query.role;
-    }
-
-    const total = await Empleado.countDocuments(filtro);
-    const empleados = await Empleado.find(filtro)
-      .select("-password")
-      .skip(skip)
-      .limit(limit);
-
-    res.json({ total, empleados });
-  } catch (error) {
-    console.error("❌ Error en paginated:", error);
-    res.status(500).json({ error: "Error al obtener empleados paginados" });
   }
-});
-
-
-
+);
 
 export default router;

@@ -1,3 +1,5 @@
+import mongoose from "mongoose";
+import { validationResult } from "express-validator";
 import Cartera from "../models/Cartera.js";
 import Direccion from "../models/Direccion.js";
 
@@ -25,12 +27,14 @@ export const crearCartera = async (req, res) => {
       return res.status(400).json({ error: "Todos los campos son obligatorios" });
     }
 
-    // Si es un ObjectId, validamos que exista
-    if (mongoose.Types.ObjectId.isValid(direccion)) {
-      const direccionExistente = await Direccion.findById(direccion);
-      if (!direccionExistente) {
-        return res.status(400).json({ error: "La dirección no existe" });
-      }
+    // Validar ObjectId
+    if (!mongoose.Types.ObjectId.isValid(direccion)) {
+      return res.status(400).json({ error: "ID de dirección inválido" });
+    }
+
+    const direccionExistente = await Direccion.findById(direccion);
+    if (!direccionExistente) {
+      return res.status(404).json({ error: "La dirección no existe" });
     }
 
     const nueva = new Cartera({
@@ -53,19 +57,20 @@ export const editarCartera = async (req, res) => {
   try {
     const { direccion } = req.body;
 
-    if (mongoose.Types.ObjectId.isValid(direccion)) {
+    if (direccion && !mongoose.Types.ObjectId.isValid(direccion)) {
+      return res.status(400).json({ error: "ID de dirección inválido" });
+    }
+
+    if (direccion) {
       const direccionExistente = await Direccion.findById(direccion);
       if (!direccionExistente) {
-        return res.status(400).json({ error: "La dirección no existe" });
+        return res.status(404).json({ error: "La dirección no existe" });
       }
     }
 
     const cartera = await Cartera.findByIdAndUpdate(
       req.params.id,
-      {
-        ...req.body,
-        editadoPor: req.user.username,
-      },
+      { ...req.body, editadoPor: req.user.username },
       { new: true }
     );
 
@@ -79,7 +84,6 @@ export const editarCartera = async (req, res) => {
     res.status(500).json({ error: "Error al editar cartera" });
   }
 };
-
 
 // 🗑️ Eliminar cartera
 export const eliminarCartera = async (req, res) => {
@@ -113,7 +117,13 @@ export const obtenerDirecciones = async (req, res) => {
 // ➕ Crear dirección
 export const crearDireccion = async (req, res) => {
   try {
-    const nueva = new Direccion(req.body);
+    const { nombre, ubicacion } = req.body;
+
+    if (!nombre || !ubicacion) {
+      return res.status(400).json({ error: "Todos los campos son obligatorios" });
+    }
+
+    const nueva = new Direccion({ nombre, ubicacion });
     await nueva.save();
     res.json({ message: "Dirección creada", direccion: nueva });
   } catch (error) {
@@ -128,9 +138,11 @@ export const editarDireccion = async (req, res) => {
     const direccion = await Direccion.findByIdAndUpdate(req.params.id, req.body, {
       new: true,
     });
+
     if (!direccion) {
       return res.status(404).json({ error: "Dirección no encontrada" });
     }
+
     res.json({ message: "Dirección actualizada", direccion });
   } catch (error) {
     console.error("Error al editar dirección:", error.message);
@@ -145,6 +157,7 @@ export const eliminarDireccion = async (req, res) => {
     if (!eliminada) {
       return res.status(404).json({ error: "Dirección no encontrada" });
     }
+
     res.json({ message: "Dirección eliminada" });
   } catch (error) {
     console.error("Error al eliminar dirección:", error.message);
