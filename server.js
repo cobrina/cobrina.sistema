@@ -16,7 +16,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ✅ Trust proxy para Render (necesario para rate-limit)
+// ✅ Trust proxy para Render (necesario para rate-limit y detección de IP)
 app.set("trust proxy", 1);
 
 // 🛡️ Seguridad HTTP básica
@@ -30,22 +30,37 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-// 🛡️ Middleware de Rate Limiting
+// 🔒 IPs bloqueadas (bots o abusos)
+const ipsBloqueadas = [
+  "149.102.242.103",
+  "108.162.238.44",
+  "10.223.177.97",
+  "108.162.246.89",
+  "10.223.154.22"
+];
 
-// ⛔ Login: max 5 intentos cada 15 minutos
+app.use((req, res, next) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  if (ipsBloqueadas.some(bloqueada => ip.includes(bloqueada))) {
+    return res.status(403).send("🚫 Acceso denegado.");
+  }
+  next();
+});
+
+// 🛡️ Middleware de Rate Limiting
 const limiterLogin = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
   message: "⚠️ Demasiados intentos de login. Intentá nuevamente en 15 minutos.",
 });
 
-// ⛔ Formulario de contacto: max 3 cada 15 minutos
 const limiterContacto = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 3,
   message: "⚠️ Demasiados envíos de contacto. Intentá más tarde.",
 });
 
+// Aplicar límites
 app.use("/auth/login", limiterLogin);
 app.use("/contacto", limiterContacto);
 
