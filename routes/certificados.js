@@ -11,17 +11,22 @@ const accesoAdmin = [verifyToken, permitirRoles("admin", "super-admin")];
    🏦 CARTERAS (Transferencias)
 =================================*/
 
-// 📥 Obtener todas las carteras con editor
-router.get("/carteras", ...accesoAdmin, async (req, res) => {
-  try {
-    const carteras = await Cartera.find();
-    res.json(carteras);
-  } catch {
-    res.status(500).json({ error: "Error al obtener carteras" });
+// ✅ Obtener todas las carteras (solo lectura) para todos los roles
+router.get(
+  "/carteras",
+  verifyToken,
+  permitirRoles("super-admin", "admin", "operador"),
+  async (req, res) => {
+    try {
+      const carteras = await Cartera.find();
+      res.json(carteras);
+    } catch {
+      res.status(500).json({ error: "Error al obtener carteras" });
+    }
   }
-});
+);
 
-// ➕ Crear nueva cartera
+// ➕ Crear nueva cartera (solo admin y super-admin)
 router.post(
   "/carteras",
   ...accesoAdmin,
@@ -54,7 +59,7 @@ router.post(
   }
 );
 
-// ✏️ Editar cartera existente
+// ✏️ Editar cartera existente (solo admin y super-admin)
 router.put(
   "/carteras/:id",
   ...accesoAdmin,
@@ -85,7 +90,7 @@ router.put(
   }
 );
 
-// 🗑️ Eliminar cartera
+// 🗑️ Eliminar cartera (solo admin y super-admin)
 router.delete("/carteras/:id", ...accesoAdmin, async (req, res) => {
   try {
     await Cartera.findByIdAndDelete(req.params.id);

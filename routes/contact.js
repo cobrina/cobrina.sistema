@@ -11,7 +11,7 @@ const router = express.Router();
 // 🧼 Palabras prohibidas
 const contienePalabrasProhibidas = (texto) => {
   const palabrasProhibidas = [
-    "mierda","wacho","chorro","estafa","estafador", "sorete", "joder", "hijo", "puta", "romper", "matar", "cagar", "forro", "gato", "amenaza", "amenazar", "hack"
+    "Milei", "Macri", "Perón", "mierda","wacho","chorro","estafa","estafador", "sorete", "joder", "hijo", "puta", "romper", "matar", "cagar", "forro", "gato", "amenaza", "amenazar", "hack"
   ];
   const minuscula = texto.toLowerCase();
   return palabrasProhibidas.some((palabra) => minuscula.includes(palabra));
