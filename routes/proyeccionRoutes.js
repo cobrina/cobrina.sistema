@@ -9,6 +9,7 @@ import {
   obtenerEstadisticasAdmin,
   obtenerProyeccionesFiltradas,
   obtenerResumenGlobal,
+  obtenerProyeccionesParaResumen,
 } from "../controllers/proyeccionController.js";
 
 import verifyToken from "../middleware/verifyToken.js";
@@ -67,5 +68,6 @@ router.get("/exportar/excel", verifyToken, permitirRoles("super-admin", "admin",
 
 router.get("/admin/resumen", verifyToken, permitirRoles("super-admin"), obtenerResumenGlobal);
 
+router.get("/resumen/data", verifyToken, permitirRoles("super-admin", "admin", "operador"), obtenerProyeccionesParaResumen);
 
 export default router;

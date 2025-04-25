@@ -11,7 +11,6 @@ import authRoutes from "./routes/authRoutes.js";
 import empleadosRoutes from "./routes/empleados.js";
 import certificadosRoutes from "./routes/certificados.js";
 import proyeccionRoutes from './routes/proyeccionRoutes.js';
-import exportRoutes from './routes/exportRoutes.js'; // ✅ NUEVO
 import usuarioRoutes from "./routes/usuarioRoutes.js";
 
 
@@ -74,7 +73,6 @@ app.use("/auth", authRoutes);
 app.use("/empleados", empleadosRoutes);
 app.use("/certificados", certificadosRoutes);
 app.use("/proyecciones", proyeccionRoutes); // ✅ Rutas de proyecciones
-app.use("/exportar", exportRoutes);         // ✅ Rutas de exportación (CSV, PDF)
 app.use("/usuarios", usuarioRoutes);
 
 // Ruta base

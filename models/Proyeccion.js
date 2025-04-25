@@ -16,13 +16,16 @@ const proyeccionSchema = new mongoose.Schema(
     },
     concepto: {
       type: String,
-      enum: ["Cuota", "Cancelación", "Anticipo", "Parcial", "Pago a cuenta", "Colchón"],
+      enum: ["Ant-Can", "Anticipo", "Cancelación", "Parcial", "Posible","Cuota"],
       required: false, // ✅ Ya no es obligatorio
     },
     fechaPromesa: {
       type: Date,
-      required: true,
     },
+    fechaPromesaInicial: {
+      type: Date, // 👈 para lógica "Reprogramado"
+    },
+
     fechaProximoLlamado: {
       type: Date, // ✅ Nuevo campo
     },
