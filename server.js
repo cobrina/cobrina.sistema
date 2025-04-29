@@ -12,6 +12,7 @@ import empleadosRoutes from "./routes/empleados.js";
 import certificadosRoutes from "./routes/certificados.js";
 import proyeccionRoutes from './routes/proyeccionRoutes.js';
 import usuarioRoutes from "./routes/usuarioRoutes.js";
+import colchonRoutes from "./routes/colchonRoutes.js";
 
 
 dotenv.config();
@@ -74,6 +75,7 @@ app.use("/empleados", empleadosRoutes);
 app.use("/certificados", certificadosRoutes);
 app.use("/proyecciones", proyeccionRoutes); // ✅ Rutas de proyecciones
 app.use("/usuarios", usuarioRoutes);
+app.use("/colchon", colchonRoutes); // ✅ rutas del colchón
 
 // Ruta base
 app.get("/", (req, res) => {
