@@ -4,54 +4,68 @@ import cors from "cors";
 import dotenv from "dotenv";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
+import compression from "compression";
 
 // 📦 Rutas
 import contactRoutes from "./routes/contact.js";
 import authRoutes from "./routes/authRoutes.js";
 import empleadosRoutes from "./routes/empleados.js";
 import certificadosRoutes from "./routes/certificados.js";
-import proyeccionRoutes from './routes/proyeccionRoutes.js';
+import proyeccionRoutes from "./routes/proyeccionRoutes.js";
 import usuarioRoutes from "./routes/usuarioRoutes.js";
 import colchonRoutes from "./routes/colchonRoutes.js";
-
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ✅ Trust proxy para Render (necesario para rate-limit y detección de IP)
+// ✅ Seteo para que confíe en proxies (Railway)
 app.set("trust proxy", 1);
 
-// 🛡️ Seguridad HTTP básica
+// 🛡️ Seguridad HTTP
 app.use(helmet());
 app.disable("x-powered-by");
 
-// 🌍 CORS
-app.use(cors());
+// 📦 Compresión gzip
+app.use(compression());
 
-// 📦 Parseo de JSON y formularios grandes (hasta 10mb)
+// 🌍 CORS (LOCAL + PRODUCCIÓN)
+const corsOptions = {
+  origin: [
+    "http://localhost:5173",
+    "https://rdccollections.com"
+  ],
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+};
+app.use(cors(corsOptions));
+
+
+
+// 📦 Parseo de JSON y formularios grandes
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-// 🔒 IPs bloqueadas (bots o abusos)
+// 🔒 Bloqueo de IPs sospechosas
 const ipsBloqueadas = [
   "149.102.242.103",
   "108.162.238.44",
   "10.223.177.97",
   "108.162.246.89",
-  "10.223.154.22"
+  "10.223.154.22",
+  "186.137.152.45",
 ];
-
 app.use((req, res, next) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
-  if (ipsBloqueadas.some(bloqueada => ip.includes(bloqueada))) {
+  if (ipsBloqueadas.some((bloqueada) => ip.includes(bloqueada))) {
     return res.status(403).send("🚫 Acceso denegado.");
   }
   next();
 });
 
-// 🛡️ Middleware de Rate Limiting
+// 🔒 Rate Limiting
 const limiterLogin = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -64,7 +78,6 @@ const limiterContacto = rateLimit({
   message: "⚠️ Demasiados envíos de contacto. Intentá más tarde.",
 });
 
-// Aplicar límites
 app.use("/auth/login", limiterLogin);
 app.use("/contacto", limiterContacto);
 
@@ -73,16 +86,16 @@ app.use("/contacto", contactRoutes);
 app.use("/auth", authRoutes);
 app.use("/empleados", empleadosRoutes);
 app.use("/certificados", certificadosRoutes);
-app.use("/proyecciones", proyeccionRoutes); // ✅ Rutas de proyecciones
+app.use("/proyecciones", proyeccionRoutes);
 app.use("/usuarios", usuarioRoutes);
-app.use("/colchon", colchonRoutes); // ✅ rutas del colchón
+app.use("/colchon", colchonRoutes);
 
-// Ruta base
+// 🔵 Ruta de prueba
 app.get("/", (req, res) => {
   res.send("API de Cobrina funcionando! 🎉");
 });
 
-// 🧠 Conexión a MongoDB
+// 🧠 Conexión a MongoDB Atlas
 if (!process.env.MONGO_URI) {
   console.error("❌ Error: MONGO_URI no definido en .env");
   process.exit(1);
@@ -92,11 +105,11 @@ mongoose
   .connect(process.env.MONGO_URI)
   .then(() => console.log("✅ Conectado a MongoDB"))
   .catch((err) => {
-    console.error("❌ Error en MongoDB:", err.message);
+    console.error("❌ Error conectando MongoDB:", err.message);
     process.exit(1);
   });
 
-// 🚀 Iniciar servidor
+// 🚀 Lanzar el servidor
 app.listen(PORT, () => {
-  console.log(`✅ Servidor corriendo en http://localhost:${PORT}`);
+  console.log(`✅ Servidor corriendo en el puerto ${PORT}`);
 });

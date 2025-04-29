@@ -30,6 +30,10 @@ const empleadoSchema = new mongoose.Schema({
     enum: ["operador", "admin", "super-admin"],
     default: "operador"
   },
+  ultimaActividad: { 
+    type: Date, 
+    default: Date.now 
+  },
   createdAt: {
     type: Date,
     default: Date.now

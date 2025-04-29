@@ -1,10 +1,10 @@
 import express from "express";
+import {heartbeat } from "../controllers/authController.js"; // 👈 Agregamos heartbeat
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
 import { check, validationResult } from "express-validator";
 import rateLimit from "express-rate-limit";
-
 import Empleado from "../models/Empleado.js";
 import verifyToken from "../middleware/verifyToken.js";
 
@@ -77,6 +77,9 @@ router.post(
     }
   }
 );
+
+// Nuevo: Heartbeat
+router.post("/heartbeat", verifyToken, heartbeat);
 
 // 🔐 Ruta protegida de prueba
 router.get("/protegido", verifyToken, (req, res) => {
