@@ -1,24 +1,37 @@
 import express from "express";
-import multer from "multer";
 import {
   crearCuota,
+  editarCuota,
+  eliminarCuota,
   filtrarCuotas,
   importarExcel,
   exportarExcel,
-  editarCuota,    // 👈 NUEVO
-  eliminarCuota 
+  obtenerCarterasUnicas,
+  
 } from "../controllers/colchonController.js";
+import { obtenerUsuariosActivos } from "../controllers/usuarioController.js";
+
 import verifyToken from "../middleware/verifyToken.js";
-import permitirRoles from "../middleware/permitirRoles.js";
+import upload from "../middleware/uploadMiddleware.js";
 
 const router = express.Router();
-const upload = multer();
 
-router.post("/crear", verifyToken, crearCuota);
-router.get("/filtrar", verifyToken, filtrarCuotas);
-router.post("/importar-excel", verifyToken, permitirRoles("super-admin"), upload.single("file"), importarExcel);
-router.get("/exportar-excel", verifyToken, exportarExcel);
-router.put("/:id", verifyToken, editarCuota);    // ✏️ Editar cuota
-router.delete("/:id", verifyToken, eliminarCuota); // 🗑️ Eliminar cuota
+// ✅ Alias opcional para mantener el nombre "proteger"
+const proteger = verifyToken;
+
+// Rutas principales
+router.get("/filtrar", proteger, filtrarCuotas);
+router.post("/crear", proteger, crearCuota);
+router.put("/editar/:id", proteger, editarCuota);
+router.delete("/eliminar/:id", proteger, eliminarCuota);
+
+// Rutas de archivos
+router.post("/importar-excel", proteger, upload.single("file"), importarExcel);
+router.get("/exportar-excel", proteger, exportarExcel);
+
+// 🔵 Rutas auxiliares para filtros
+router.get("/carteras", proteger, obtenerCarterasUnicas);
+router.get("/usuarios", proteger, obtenerUsuariosActivos);
+
 
 export default router;

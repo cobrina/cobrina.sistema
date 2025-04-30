@@ -1,6 +1,8 @@
 import Colchon from "../models/Colchon.js";
 import { formatearFecha } from "../utils/formatearFecha.js";
 import ExcelJS from "exceljs";
+import Empleado from "../models/Empleado.js";
+import Cartera from "../models/Cartera.js";
 
 // Crear manual
 export const crearCuota = async (req, res) => {
@@ -66,9 +68,7 @@ export const editarCuota = async (req, res) => {
 
     const rol = req.user.role || req.user.rol;
     if (rol !== "super-admin" && String(cuota.empleadoId) !== req.user.id) {
-      return res
-        .status(403)
-        .json({ error: "No autorizado para editar esta cuota" });
+      return res.status(403).json({ error: "No autorizado para editar esta cuota" });
     }
 
     const {
@@ -121,9 +121,7 @@ export const eliminarCuota = async (req, res) => {
 
     const rol = req.user.role || req.user.rol;
     if (rol !== "super-admin" && String(cuota.empleadoId) !== req.user.id) {
-      return res
-        .status(403)
-        .json({ error: "No autorizado para eliminar esta cuota" });
+      return res.status(403).json({ error: "No autorizado para eliminar esta cuota" });
     }
 
     await cuota.deleteOne();
@@ -134,7 +132,7 @@ export const eliminarCuota = async (req, res) => {
   }
 };
 
-// Filtrar cuotas
+// 📋 Filtrar cuotas
 export const filtrarCuotas = async (req, res) => {
   try {
     const {
@@ -177,22 +175,14 @@ export const filtrarCuotas = async (req, res) => {
     const query = filtros.length ? { $and: filtros } : {};
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    // Buscar cuotas
     const cuotas = await Colchon.find(query)
       .populate("empleadoId", "username")
       .sort({ fechaVencimiento: 1 })
       .skip(skip)
       .limit(parseInt(limit));
 
-    // Buscar total
     const total = await Colchon.countDocuments(query);
 
-    // 📋 Si no hay cuotas, devolver igual una respuesta vacía (opcional)
-    if (!cuotas.length) {
-      return res.json({ total: 0, cuotas: [] });
-    }
-
-    // ✅ Devolver normalmente
     res.json({ total, cuotas });
   } catch (error) {
     console.error("❌ Error al filtrar cuotas:", error);
@@ -200,7 +190,7 @@ export const filtrarCuotas = async (req, res) => {
   }
 };
 
-// Importar Excel
+// 📤 Importar cuotas desde Excel
 export const importarExcel = async (req, res) => {
   try {
     if (!req.file) {
@@ -229,7 +219,7 @@ export const importarExcel = async (req, res) => {
         fiduciario,
       ] = row.values.slice(1);
 
-      if (!dni || !cuotaNumero) return; // Saltar inválidos
+      if (!dni || !cuotaNumero) return;
 
       registros.push({
         cartera: cartera || "-",
@@ -259,7 +249,7 @@ export const importarExcel = async (req, res) => {
   }
 };
 
-// Exportar Excel
+// 📥 Exportar cuotas a Excel
 export const exportarExcel = async (req, res) => {
   try {
     const { cartera, fiduciario } = req.query;
@@ -321,3 +311,16 @@ export const exportarExcel = async (req, res) => {
     res.status(500).json({ error: "Error al exportar Excel" });
   }
 };
+
+// 🔵 Obtener carteras únicas (ordenadas)
+export const obtenerCarterasUnicas = async (req, res) => {
+  try {
+    const carteras = await Cartera.find().select("_id nombre").sort({ nombre: 1 });
+    res.json(carteras);
+  } catch (error) {
+    console.error("❌ Error al obtener carteras:", error);
+    res.status(500).json({ error: "Error al obtener carteras" });
+  }
+};
+
+
