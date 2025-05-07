@@ -7,7 +7,6 @@ import rateLimit from "express-rate-limit";
 import compression from "compression";
 
 // 📦 Rutas
-import contactRoutes from "./routes/contact.js";
 import authRoutes from "./routes/authRoutes.js";
 import empleadosRoutes from "./routes/empleados.js";
 import certificadosRoutes from "./routes/certificados.js";
@@ -42,8 +41,6 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
-
-
 // 📦 Parseo de JSON y formularios grandes
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
@@ -65,24 +62,15 @@ app.use((req, res, next) => {
   next();
 });
 
-// 🔒 Rate Limiting
+// 🔒 Rate Limiting solo para login
 const limiterLogin = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
   message: "⚠️ Demasiados intentos de login. Intentá nuevamente en 15 minutos.",
 });
-
-const limiterContacto = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 3,
-  message: "⚠️ Demasiados envíos de contacto. Intentá más tarde.",
-});
-
 app.use("/auth/login", limiterLogin);
-app.use("/contacto", limiterContacto);
 
 // ✅ Rutas activas
-app.use("/contacto", contactRoutes);
 app.use("/auth", authRoutes);
 app.use("/empleados", empleadosRoutes);
 app.use("/certificados", certificadosRoutes);
