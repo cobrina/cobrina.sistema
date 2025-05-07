@@ -33,7 +33,8 @@ app.use(compression());
 const corsOptions = {
   origin: [
     "http://localhost:5173",
-    "https://rdccollections.com"
+    "https://rdccollections.com",
+    "https://cobrina-rdc.netlify.app"
   ],
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
