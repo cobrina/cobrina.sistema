@@ -106,6 +106,12 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
+// 🛑 Captura de cierre por Railway
+process.on('SIGTERM', () => {
+  console.log("🛑 Railway envió SIGTERM, el servidor está siendo detenido.");
+  process.exit(0);
+});
+
 // 💓 Mantener vivo el contenedor
 setInterval(() => {
   console.log('💓 Ping de vida para evitar apagado automático');
@@ -113,5 +119,5 @@ setInterval(() => {
 
 // 🚀 Lanzar servidor en 0.0.0.0 para Railway
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ Servidor corriendo en el puerto ${PORT}`);
+  console.log(`✅ Escuchando en http://0.0.0.0:${PORT} - API lista para recibir peticiones`);
 });
