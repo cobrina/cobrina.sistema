@@ -6,7 +6,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import compression from "compression";
 
-// 📦 Rutas
+// 📦 Rutas del sistema Cobrina
 import authRoutes from "./routes/authRoutes.js";
 import empleadosRoutes from "./routes/empleados.js";
 import certificadosRoutes from "./routes/certificados.js";
@@ -19,7 +19,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ✅ Seteo para que confíe en proxies (Railway)
+// ✅ Configuración para Railway
 app.set("trust proxy", 1);
 
 // 🛡️ Seguridad HTTP
@@ -29,11 +29,10 @@ app.disable("x-powered-by");
 // 📦 Compresión gzip
 app.use(compression());
 
-// 🌍 CORS (LOCAL + PRODUCCIÓN)
+// 🌍 CORS para producción y desarrollo
 const corsOptions = {
   origin: [
     "http://localhost:5173",
-    "https://rdccollections.com",
     "https://cobrina-rdc.netlify.app"
   ],
   methods: ["GET", "POST", "PUT", "DELETE"],
@@ -42,7 +41,7 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
-// 📦 Parseo de JSON y formularios grandes
+// 📦 JSON y formularios grandes
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
@@ -63,7 +62,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// 🔒 Rate Limiting solo para login
+// 🔒 Limitar intentos de login
 const limiterLogin = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -84,7 +83,7 @@ app.get("/", (req, res) => {
   res.send("API de Cobrina funcionando! 🎉");
 });
 
-// 🧠 Conexión a MongoDB Atlas
+// 🧠 Conexión a MongoDB
 if (!process.env.MONGO_URI) {
   console.error("❌ Error: MONGO_URI no definido en .env");
   process.exit(1);
@@ -98,7 +97,7 @@ mongoose
     process.exit(1);
   });
 
-// 🚀 Lanzar el servidor
-app.listen(PORT, () => {
+// 🚀 Lanzar servidor en 0.0.0.0 para Railway
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Servidor corriendo en el puerto ${PORT}`);
 });
