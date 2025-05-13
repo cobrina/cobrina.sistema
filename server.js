@@ -97,6 +97,20 @@ mongoose
     process.exit(1);
   });
 
+// 🧠 Captura de errores globales
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// 💓 Mantener vivo el contenedor
+setInterval(() => {
+  console.log('💓 Ping de vida para evitar apagado automático');
+}, 5 * 60 * 1000); // cada 5 minutos
+
 // 🚀 Lanzar servidor en 0.0.0.0 para Railway
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Servidor corriendo en el puerto ${PORT}`);
