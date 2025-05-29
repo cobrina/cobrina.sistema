@@ -6,32 +6,33 @@ import {
   filtrarCuotas,
   importarExcel,
   exportarExcel,
-  obtenerCarterasUnicas,
-  
+  obtenerCarterasUnicas
 } from "../controllers/colchonController.js";
-import { obtenerUsuariosActivos } from "../controllers/usuarioController.js";
 
-import verifyToken from "../middleware/verifyToken.js";
-import upload from "../middleware/uploadMiddleware.js";
+import verifyToken from "../middleware/verifyToken.js"; // ✅ Autenticación JWT
+import upload from "../middleware/uploadMiddleware.js"; // ✅ Subida de archivos
 
 const router = express.Router();
 
-// ✅ Alias opcional para mantener el nombre "proteger"
-const proteger = verifyToken;
+// Crear cuota (solo para usuarios autenticados)
+router.post("/", verifyToken, crearCuota);
 
-// Rutas principales
-router.get("/filtrar", proteger, filtrarCuotas);
-router.post("/crear", proteger, crearCuota);
-router.put("/editar/:id", proteger, editarCuota);
-router.delete("/eliminar/:id", proteger, eliminarCuota);
+// Editar cuota
+router.put("/:id", verifyToken, editarCuota);
 
-// Rutas de archivos
-router.post("/importar-excel", proteger, upload.single("file"), importarExcel);
-router.get("/exportar-excel", proteger, exportarExcel);
+// Eliminar cuota
+router.delete("/:id", verifyToken, eliminarCuota);
 
-// 🔵 Rutas auxiliares para filtros
-router.get("/carteras", proteger, obtenerCarterasUnicas);
-router.get("/usuarios", proteger, obtenerUsuariosActivos);
+// Filtrar cuotas
+router.get("/", verifyToken, filtrarCuotas);
 
+// Exportar Excel
+router.get("/exportar", verifyToken, exportarExcel);
+
+// Importar Excel (subida de archivo)
+router.post("/importar", verifyToken, upload.single("archivo"), importarExcel);
+
+// Obtener carteras únicas
+router.get("/carteras", verifyToken, obtenerCarterasUnicas);
 
 export default router;

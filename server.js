@@ -13,6 +13,8 @@ import certificadosRoutes from "./routes/certificados.js";
 import proyeccionRoutes from "./routes/proyeccionRoutes.js";
 import usuarioRoutes from "./routes/usuarioRoutes.js";
 import colchonRoutes from "./routes/colchonRoutes.js";
+import subcesionRoutes from "./routes/subcesionRoutes.js"; // ✅ NUEVO
+import entidadRoutes from "./routes/entidadRoutes.js"; // ✅
 
 dotenv.config();
 
@@ -77,6 +79,8 @@ app.use("/certificados", certificadosRoutes);
 app.use("/proyecciones", proyeccionRoutes);
 app.use("/usuarios", usuarioRoutes);
 app.use("/colchon", colchonRoutes);
+app.use("/subcesiones", subcesionRoutes); // ✅ NUEVA RUTA ACTIVA
+app.use("/entidades", entidadRoutes); // ✅
 
 // 🔵 Ruta de prueba
 app.get("/", (req, res) => {

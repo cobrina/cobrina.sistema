@@ -1,22 +1,29 @@
 import mongoose from "mongoose";
 
 const ColchonSchema = new mongoose.Schema({
-  cartera: { type: String, required: true },
-  dni: { type: Number, required: true },
-  nombreTitular: { type: String, required: true },
-  cuotaNumero: { type: Number, required: true },
-  importeCuota: { type: Number, required: true },
-  saldoPendiente: { type: Number, required: true },
-  fechaVencimiento: { type: Date, required: true },
-  fechaPago: { type: Date },
   estado: {
     type: String,
     enum: ["A cuota", "Cuota 30", "Cuota 60", "Cuota 90"],
     default: "A cuota",
   },
-    observaciones: { type: String },
-  fiduciario: { type: String },
+  entidadId: { type: mongoose.Schema.Types.ObjectId, ref: "Entidad" },
+  idPago: { type: Number },
+  dni: { type: Number, required: true },
+  nombre: { type: String, required: true },
   empleadoId: { type: mongoose.Schema.Types.ObjectId, ref: "Empleado", required: true },
+  turno: { type: String },
+  cartera: { type: String, required: true },
+  mesGenerado: { type: String },
+
+  vencimiento: { type: Number },                  // Día de vencimiento de la cuota
+  cuotaNumero: { type: Number },                  // Cantidad de cuotas (antes llamado 'cuotas')
+  importeCuota: { type: Number, required: true }, // Monto de cada cuota
+  importePagado: { type: Number, default: 0 },    // Monto total pagado en el mes (acumulativo)
+  saldoPendiente: { type: Number, default: 0 },   // Deuda acumulada de meses anteriores
+
+  observaciones: { type: String },
+  fiduciario: { type: String },
+  subCesionId: { type: mongoose.Schema.Types.ObjectId, ref: "SubCesion" },
   creado: { type: Date, default: Date.now },
   ultimaModificacion: { type: Date, default: Date.now }
 });
