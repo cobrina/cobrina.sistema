@@ -33,15 +33,25 @@ app.use(compression());
 
 // 🌍 CORS para producción y desarrollo
 const corsOptions = {
-  origin: [
-    "http://localhost:5173",
-    "https://cobrina-rdc.netlify.app"
-  ],
+  origin: function (origin, callback) {
+    const whitelist = [
+      "http://localhost:5173",
+      "https://cobrina-rdc.netlify.app",
+      "https://rdccollections-production.up.railway.app" // ✅ agregá este si usás esa URL
+    ];
+    if (!origin || whitelist.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("No autorizado por CORS"));
+    }
+  },
+  credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: true,
 };
+
 app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // ✅ Importante para preflight
 
 // 📦 JSON y formularios grandes
 app.use(express.json({ limit: "10mb" }));
@@ -102,23 +112,23 @@ mongoose
   });
 
 // 🧠 Captura de errores globales
-process.on('uncaughtException', (err) => {
-  console.error('❌ Uncaught Exception:', err);
+process.on("uncaughtException", (err) => {
+  console.error("❌ Uncaught Exception:", err);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("❌ Unhandled Rejection at:", promise, "reason:", reason);
 });
 
 // 🛑 Captura de cierre por Railway
-process.on('SIGTERM', () => {
+process.on("SIGTERM", () => {
   console.log("🛑 Railway envió SIGTERM, el servidor está siendo detenido.");
   process.exit(0);
 });
 
 // 💓 Mantener vivo el contenedor
 setInterval(() => {
-  console.log('💓 Ping de vida para evitar apagado automático');
+  console.log("💓 Ping de vida para evitar apagado automático");
 }, 5 * 60 * 1000); // cada 5 minutos
 
 // 🚀 Lanzar servidor en 0.0.0.0 para Railway
