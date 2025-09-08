@@ -1,5 +1,6 @@
+// routes/authRoutes.js
 import express from "express";
-import {heartbeat } from "../controllers/authController.js"; // 👈 Agregamos heartbeat
+import { heartbeat } from "../controllers/authController.js";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
@@ -12,59 +13,82 @@ dotenv.config();
 
 const router = express.Router();
 
-// 🛡️ Limitar intentos de login: máximo 5 intentos cada 15 minutos
+// 🔐 sanity check JWT secret
+if (!process.env.JWT_SECRET) {
+  console.warn("⚠️ JWT_SECRET no está definido. Configuralo en el .env");
+}
+
+// 🛡️ Rate limit login: 5/15m
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
-  message: {
-    error: "Demasiados intentos fallidos. Intenta nuevamente en 15 minutos.",
-  },
+  message: { error: "Demasiados intentos fallidos. Probá en 15 minutos." },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// 🟢 LOGIN - POST /auth/login
+// 🟢 POST /auth/login
+// 🟢 POST /auth/login
 router.post(
   "/login",
   loginLimiter,
   [
-    check("username", "⚠️ El nombre de usuario es obligatorio").notEmpty().isLength({ min: 3 }),
+    check("username", "⚠️ El nombre de usuario es obligatorio").trim().isLength({ min: 3 }),
     check("password", "⚠️ La contraseña es obligatoria").notEmpty(),
   ],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-    const { username, password } = req.body;
+    const usernameRaw = String(req.body.username || "");
+    const password = String(req.body.password || "");
+    const username = usernameRaw.trim();
 
     try {
-      const empleado = await Empleado.findOne({ username });
+      // Buscar por username (case-insensitive) y traer el hash + isActive
+      const empleado = await Empleado.findOne({
+        username: {
+          $regex: new RegExp(`^${username.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}$`, "i"),
+        },
+      }).select("+password role username email ultimaActividad isActive");
 
       if (!empleado) {
-        return res.status(404).json({ error: "Usuario no encontrado" });
+        // mismo status para no revelar si existe o no
+        return res.status(401).json({ error: "Usuario o contraseña inválidos" });
       }
 
-      const match = await bcrypt.compare(password, empleado.password);
-
-      if (!match) {
-        return res.status(401).json({ error: "Contraseña incorrecta" });
+      if (!empleado.password) {
+        return res.status(500).json({ error: "Cuenta sin contraseña definida" });
       }
 
-      const token = jwt.sign(
-        {
-          id: empleado._id,
-          username: empleado.username,
-          role: empleado.role,
-        },
-        process.env.JWT_SECRET,
-        { expiresIn: "1d" }
-      );
+      // ✅ Si el usuario está inactivo, bloquear login
+      if (empleado.isActive === false) {
+        return res.status(403).json({ error: "Usuario inactivo" });
+      }
 
-      res.json({
+      const ok = await bcrypt.compare(password, empleado.password);
+      if (!ok) {
+        return res.status(401).json({ error: "Usuario o contraseña inválidos" });
+      }
+
+      const payload = {
+        id: empleado._id,
+        username: empleado.username,
+        role: empleado.role,
+      };
+
+      const expiresIn = "1d";
+      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn });
+
+      // Actualizar última actividad (sin romper si falla)
+      empleado.ultimaActividad = new Date();
+      empleado.save().catch(() => {});
+
+      return res.json({
         message: "Login exitoso",
         token,
+        token_type: "Bearer",
+        expires_in: expiresIn,
         user: {
           id: empleado._id,
           username: empleado.username,
@@ -72,21 +96,21 @@ router.post(
         },
       });
     } catch (error) {
-      console.error("❌ Error en login:", error);
-      res.status(500).json({ error: "Error interno del servidor" });
+      if (process.env.NODE_ENV === "development") {
+        console.error("❌ Error en login:", error);
+      }
+      return res.status(500).json({ error: "Error interno del servidor" });
     }
   }
 );
 
-// Nuevo: Heartbeat
+
+// ❤️ Heartbeat (mantiene sesión viva/actividad)
 router.post("/heartbeat", verifyToken, heartbeat);
 
 // 🔐 Ruta protegida de prueba
 router.get("/protegido", verifyToken, (req, res) => {
-  res.json({
-    message: "Acceso autorizado",
-    user: req.user,
-  });
+  res.json({ message: "Acceso autorizado", user: req.user });
 });
 
 export default router;

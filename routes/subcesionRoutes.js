@@ -1,48 +1,85 @@
+// routes/subCesionRoutes.js
 import express from "express";
+import mongoose from "mongoose";
+import verifyToken from "../middleware/verifyToken.js";
+import permitirRoles from "../middleware/permitirRoles.js";
 import SubCesion from "../models/SubCesion.js";
 
 const router = express.Router();
 
-// ➕ Crear
-router.post("/", async (req, res) => {
+// Roles permitidos
+const soloAdmin = [verifyToken, permitirRoles("super-admin")];
+const lecturaTodos = [verifyToken, permitirRoles("super-admin", "admin", "operador", "operador-vip")];
+
+/* ===========================
+   🔹 SubCesiones
+=========================== */
+
+// ➕ Crear SubCesión ( super-admin)
+router.post("/", ...soloAdmin, async (req, res) => {
   try {
-    const subcesion = new SubCesion(req.body);
-    await subcesion.save();
-    res.status(201).json(subcesion);
+    const subcesion = await SubCesion.create(req.body);
+    return res.status(201).json(subcesion);
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    if (process.env.NODE_ENV === "development") console.error(error);
+    return res.status(400).json({ error: error.message || "No se pudo crear la SubCesión" });
   }
 });
 
-// 🔄 Editar
-router.put("/:id", async (req, res) => {
+// 🔄 Editar SubCesión ( super-admin)
+router.put("/:id", ...soloAdmin, async (req, res) => {
   try {
-    const subcesion = await SubCesion.findByIdAndUpdate(req.params.id, req.body, {
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "ID inválido" });
+    }
+
+    const subcesion = await SubCesion.findByIdAndUpdate(id, req.body, {
       new: true,
+      runValidators: true,
     });
-    res.json(subcesion);
+
+    if (!subcesion) {
+      return res.status(404).json({ error: "SubCesión no encontrada" });
+    }
+
+    return res.json(subcesion);
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    if (process.env.NODE_ENV === "development") console.error(error);
+    return res.status(400).json({ error: error.message || "Error al actualizar SubCesión" });
   }
 });
 
-// ❌ Eliminar
-router.delete("/:id", async (req, res) => {
+// ❌ Eliminar SubCesión ( super-admin)
+router.delete("/:id", ...soloAdmin, async (req, res) => {
   try {
-    await SubCesion.findByIdAndDelete(req.params.id);
-    res.json({ mensaje: "SubCesión eliminada" });
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "ID inválido" });
+    }
+
+    const eliminado = await SubCesion.findByIdAndDelete(id);
+    if (!eliminado) {
+      return res.status(404).json({ error: "SubCesión no encontrada" });
+    }
+
+    return res.json({ mensaje: "SubCesión eliminada correctamente" });
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    if (process.env.NODE_ENV === "development") console.error(error);
+    return res.status(400).json({ error: error.message || "Error al eliminar SubCesión" });
   }
 });
 
-// 📋 Obtener todas
-router.get("/", async (req, res) => {
+// 📋 Obtener todas las SubCesiones (todos los roles autenticados)
+router.get("/", ...lecturaTodos, async (_req, res) => {
   try {
-    const subcesiones = await SubCesion.find().sort({ nombre: 1 });
-    res.json(subcesiones);
+    const subcesiones = await SubCesion.find().sort({ nombre: 1 }).lean();
+    return res.json(subcesiones);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    if (process.env.NODE_ENV === "development") console.error(error);
+    return res.status(500).json({ error: "Error al obtener SubCesiones" });
   }
 });
 

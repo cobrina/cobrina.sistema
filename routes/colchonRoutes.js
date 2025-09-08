@@ -1,3 +1,4 @@
+// routes/colchonRoutes.js
 import express from "express";
 import {
   crearCuota,
@@ -28,71 +29,90 @@ import {
 
 import verifyToken from "../middleware/verifyToken.js";
 import upload from "../middleware/uploadMiddleware.js";
+import permitirRoles from "../middleware/permitirRoles.js";
 
 const router = express.Router();
 
-// 📤 Exportar cuotas a Excel
-router.get("/exportar", verifyToken, exportarExcel);
+// Helpers de permisos
+const soloSuper = [verifyToken, permitirRoles("super-admin")];
+const superYOps = [verifyToken, permitirRoles("super-admin", "operador", "operador-vip")];
+// ⚠️ admin queda afuera a propósito
 
-// 📤 Exportar pagos
-router.get("/exportar-pagos", verifyToken, exportarPagos);
+/* ================================
+   📥 Descarga de modelos
+================================ */
+router.get("/modelo",       ...soloSuper, descargarModeloColchon);
+router.get("/modelo-pagos", ...soloSuper, descargarModeloPagos);
 
-// 📥 Descargar modelos de Excel
-router.get("/modelo", verifyToken, descargarModeloColchon);
-router.get("/modelo-pagos", verifyToken, descargarModeloPagos);
+/* ================================
+   📤 Exportaciones
+================================ */
+router.get("/exportar",       ...superYOps, exportarExcel);
+router.get("/exportar-pagos", ...superYOps, exportarPagos);
 
-// 📥 Importar desde Excel
-router.post("/importar", verifyToken, upload.single("archivo"), importarExcel);
+/* ================================
+   📥 Importaciones (solo super-admin)
+================================ */
+router.post(
+  "/importar",
+  ...soloSuper,
+  upload.single("archivo"),
+  importarExcel
+);
 router.post(
   "/importar-pagos",
-  verifyToken,
+  ...soloSuper,
   upload.single("archivo"),
   importarPagosDesdeExcel
 );
 
-// 🔍 Consultas auxiliares
-router.get("/carteras", verifyToken, obtenerCarterasUnicas);
-router.get("/estadisticas", verifyToken, obtenerEstadisticasColchon);
+/* ================================
+   🔍 Consultas auxiliares / stats
+================================ */
+router.get("/carteras",     ...superYOps, obtenerCarterasUnicas);
+router.get("/estadisticas", ...superYOps, obtenerEstadisticasColchon);
 
-// ✅ Pagos informados (operadores)
-router.get(
-  "/informar-pago/pendientes",
-  verifyToken,
-  obtenerPagosInformadosPendientes
-);
-router.post("/:id/informar-pago", verifyToken, informarPago);
-router.put(
-  "/:id/informar-pago/:pagoId/visto",
-  verifyToken,
-  marcarPagoInformadoComoVisto
-);
-router.put(
-  "/:id/informar-pago/:pagoId/erroneo",
-  verifyToken,
-  marcarPagoComoErroneo
-);
-router.delete("/:id/informar-pago/:pagoId", verifyToken, eliminarPagoInformado);
+/* ================================
+   💬 Pagos informados (ops y super-admin)
+================================ */
+router.get("/informar-pago/pendientes", ...superYOps, obtenerPagosInformadosPendientes);
+router.post("/:id([0-9a-fA-F]{24})/informar-pago", ...superYOps, informarPago);
+router.put("/:id([0-9a-fA-F]{24})/informar-pago/:pagoId([0-9a-fA-F]{24})/visto",   ...superYOps, marcarPagoInformadoComoVisto);
+router.put("/:id([0-9a-fA-F]{24})/informar-pago/:pagoId([0-9a-fA-F]{24})/erroneo", ...superYOps, marcarPagoComoErroneo);
+router.delete("/:id([0-9a-fA-F]{24})/informar-pago/:pagoId([0-9a-fA-F]{24})",      ...superYOps, eliminarPagoInformado);
 
-// ✅ Pagos reales (admin)
-router.post("/:id/pagos", verifyToken, agregarPago);
-router.delete("/:cuotaId/pago/:pagoId", verifyToken, eliminarPagoReal);
+/* ================================
+   💰 Pagos reales (solo super-admin)
+================================ */
+router.post("/:id([0-9a-fA-F]{24})/pagos",                                           ...soloSuper, agregarPago);
+router.delete("/:cuotaId([0-9a-fA-F]{24})/pago/:pagoId([0-9a-fA-F]{24})",            ...soloSuper, eliminarPagoReal);
 
-// ✅ Limpiar pagos y observaciones
-router.put("/:id/limpiar", verifyToken, limpiarCuota);
+/* ================================
+   🧹 Limpiar pagos/obs
+================================ */
+router.put("/:id([0-9a-fA-F]{24})/limpiar", ...superYOps, limpiarCuota);
 
-// ✅ CRUD Cuotas
-router.post("/", verifyToken, crearCuota);
-router.put("/:id", verifyToken, editarCuota);
-router.delete("/vaciar", verifyToken, eliminarTodasLasCuotas);
-router.delete("/:id", verifyToken, eliminarCuota);
-router.put("/gestionar/:id", verifyToken, registrarGestionCuota);
+/* ================================
+   ☎️ Registrar gestión
+================================ */
+router.put("/gestionar/:id([0-9a-fA-F]{24})", ...superYOps, registrarGestionCuota);
 
-// 🔍 Obtener cuota específica (¡último!)
-router.get("/:id", getCuotaPorId);
+/* ================================
+   🧱 CRUD de cuotas
+================================ */
+router.post("/", ...superYOps, crearCuota);
 
-// 🔍 Filtrar cuotas (¡último también!)
-router.get("/", verifyToken, filtrarCuotas);
+// ⚠️ RUTA FIJA ANTES QUE LAS PARAMÉTRICAS
+router.delete("/vaciar", ...soloSuper, eliminarTodasLasCuotas);
 
+// Rutas con :id limitadas a ObjectId
+router.put("/:id([0-9a-fA-F]{24})",    ...superYOps, editarCuota);
+router.delete("/:id([0-9a-fA-F]{24})", ...superYOps, eliminarCuota);
+router.get("/:id([0-9a-fA-F]{24})",    ...superYOps, getCuotaPorId);
 
+/* ================================
+   🔍 Listado
+================================ */
+router.get("/", ...superYOps, filtrarCuotas);
 
 export default router;

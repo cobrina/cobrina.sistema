@@ -1,3 +1,4 @@
+// routes/proyeccionRoutes.js
 import express from "express";
 import {
   crearProyeccion,
@@ -10,64 +11,124 @@ import {
   obtenerProyeccionesFiltradas,
   obtenerResumenGlobal,
   obtenerProyeccionesParaResumen,
+  exportarProyeccionesExcel,
+  registrarGestion,
+  informarPago,
+  listarPagosInformados,
+  marcarPagoErroneo,
+  importarPagosMasivo,      // ← Importación masiva de pagos (DNI + entidadId + subCesionId)
+  exportarPagosExcel,
+  limpiarPagosProyeccion,
+  limpiarObservacionesProyeccion,
+  importarProyeccionesMasivo, // ← Importación masiva de proyecciones (Entidad/SubCesión)
 } from "../controllers/proyeccionController.js";
 
 import verifyToken from "../middleware/verifyToken.js";
 import permitirRoles from "../middleware/permitirRoles.js";
-import Proyeccion from "../models/Proyeccion.js"; // 👉 necesario para el chequeo por ID
-import { exportarProyeccionesExcel } from "../controllers/proyeccionController.js";
+import Proyeccion from "../models/Proyeccion.js";
+import multer from "multer";
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
 
 const router = express.Router();
 
-// ✅ Crear proyección (todos los empleados pueden)
-router.post("/", verifyToken, permitirRoles("super-admin", "admin", "operador"), crearProyeccion);
+/* ===== Permisos según tu matriz =====
+   - super-admin → acceso total.
+   - admin → ❌ sin acceso.
+   - operador-vip → igual que operador (ámbito propio).
+   - operador → acceso solo a sus datos.
+*/
 
-// ✅ Obtener proyecciones propias (todos los empleados pueden)
-router.get("/mias", verifyToken, permitirRoles("super-admin", "admin", "operador"), obtenerProyeccionesPropias);
+// Crear proyección (usa entidadId + subCesionId)
+router.post("/", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), crearProyeccion);
 
-// ✅ Obtener proyecciones con filtros y paginación
-router.get("/filtrar", verifyToken, permitirRoles("super-admin", "admin", "operador"), obtenerProyeccionesFiltradas);
+// Mis proyecciones
+router.get("/mias", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), obtenerProyeccionesPropias);
 
-// ✅ Actualizar una proyección propia (con chequeo personalizado)
-router.put("/:id", verifyToken, async (req, res, next) => {
-  try {
-    const proyeccion = await Proyeccion.findById(req.params.id);
+// Listado / filtrar (super ve todo; operador y operador-vip solo propias)
+router.get("/filtrar", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), obtenerProyeccionesFiltradas);
 
-    if (!proyeccion) {
-      return res.status(404).json({ error: "Proyección no encontrada" });
+// Registrar gestión (solo dueño — controller valida igualmente)
+router.post("/:id/gestion", verifyToken, permitirRoles("operador", "operador-vip"), registrarGestion);
+
+// Actualizar (dueño o super-admin)
+router.put(
+  "/:id",
+  verifyToken,
+  async (req, res, next) => {
+    try {
+      const proyeccion = await Proyeccion.findById(req.params.id);
+      if (!proyeccion) return res.status(404).json({ error: "Proyección no encontrada" });
+
+      const rol = req.user.role || req.user.rol;
+      const esDueno = String(proyeccion.empleadoId) === String(req.user.id);
+      const esSuper = rol === "super-admin";
+
+      if (!esDueno && !esSuper) {
+        return res.status(403).json({ error: "No tenés permiso para editar esta proyección" });
+      }
+      next();
+    } catch (e) {
+      console.error("Permisos edición:", e);
+      res.status(500).json({ error: "Error interno en autorización" });
     }
+  },
+  actualizarProyeccion
+);
 
-    // Solo puede editar su propia proyección o ser admin/super-admin
-    if (
-      proyeccion.empleadoId.toString() !== req.user.id &&
-      !["admin", "super-admin"].includes(req.user.role)
-    ) {
-      return res.status(403).json({ error: "No tenés permiso para editar esta proyección" });
-    }
+// Eliminar (dueño o super-admin)
+router.delete("/:id", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), eliminarProyeccion);
 
-    next(); // ✅ Si todo OK, continúa al controller
-  } catch (error) {
-    console.error("Error al verificar permisos de edición:", error);
-    return res.status(500).json({ error: "Error interno en autorización" });
-  }
-}, actualizarProyeccion);
+// Ver proyecciones de un operador específico (solo super-admin)
+router.get("/operador/:id", verifyToken, permitirRoles("super-admin"), obtenerProyeccionesPorOperadorId);
 
-// ✅ Eliminar una proyección propia
-router.delete("/:id", verifyToken, permitirRoles("super-admin", "admin", "operador"), eliminarProyeccion);
+// Estadísticas propias (super-admin, operador, operador-vip)
+router.get("/estadisticas", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), obtenerEstadisticasPropias);
 
-// ✅ Ver proyecciones de un operador específico (solo admin/super-admin)
-router.get("/operador/:id", verifyToken, permitirRoles("admin", "super-admin"), obtenerProyeccionesPorOperadorId);
+// Estadísticas globales (solo super-admin)
+router.get("/admin/estadisticas", verifyToken, permitirRoles("super-admin"), obtenerEstadisticasAdmin);
 
-// ✅ Estadísticas del usuario logueado
-router.get("/estadisticas", verifyToken, permitirRoles("super-admin", "admin", "operador"), obtenerEstadisticasPropias);
+// Exportar proyecciones (super-admin → todas / operador y operador-vip → propias)
+router.get("/exportar/excel", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), exportarProyeccionesExcel);
 
-// ✅ Estadísticas globales (solo admin/super-admin)
-router.get("/admin/estadisticas", verifyToken, permitirRoles("admin", "super-admin"), obtenerEstadisticasAdmin);
-
-router.get("/exportar/excel", verifyToken, permitirRoles("super-admin", "admin", "operador"), exportarProyeccionesExcel);
-
+// Resumen global (solo super-admin)
 router.get("/admin/resumen", verifyToken, permitirRoles("super-admin"), obtenerResumenGlobal);
 
-router.get("/resumen/data", verifyToken, permitirRoles("super-admin", "admin", "operador"), obtenerProyeccionesParaResumen);
+// Data para resumen (super-admin, operador, operador-vip)
+router.get("/resumen/data", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), obtenerProyeccionesParaResumen);
+
+// Informar pago (operador / operador-vip dueño; super-admin permitido en ruta, control valida)
+router.post("/:id/informar-pago", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), informarPago);
+
+// Ver pagos informados (operador dueño, operador-vip dueño, super-admin)
+router.get("/:id/pagos-informados", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), listarPagosInformados);
+
+// Marcar pago erróneo / quitar (operador, operador-vip o super-admin)
+router.patch("/:id/pagos/:pagoId/erroneo", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), marcarPagoErroneo);
+router.patch(
+  "/:id/pagos/:pagoId/erroneo/quitar",
+  verifyToken,
+  permitirRoles("super-admin", "operador", "operador-vip"),
+  (req, _res, next) => { req.body.erroneo = false; next(); },
+  marcarPagoErroneo
+);
+
+// Exportar pagos (super-admin todas / operador y operador-vip propias)
+router.get("/exportar/pagos", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), exportarPagosExcel);
+
+// Importar pagos MASIVO (solo super-admin) — requiere columnas: DNI, EntidadId, SubCesionId, Fecha, Monto
+router.post("/pagos/importar", verifyToken, permitirRoles("super-admin"), upload.single("file"), importarPagosMasivo);
+
+// Limpiar pagos (operador/operador-vip → propios; super-admin → todos)
+router.patch("/:id/pagos/limpiar", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), limpiarPagosProyeccion);
+
+// Limpiar observaciones (operador/operador-vip dueño; super-admin)
+router.patch("/:id/observaciones/limpiar", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), limpiarObservacionesProyeccion);
+
+// Importar proyecciones MASIVO (solo super-admin) — usa Entidad/SubCesión
+router.post("/importar", verifyToken, permitirRoles("super-admin"), upload.single("file"), importarProyeccionesMasivo);
 
 export default router;
