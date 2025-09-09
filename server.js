@@ -20,7 +20,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ✅ Configuración para Railway / proxies
+
 app.set("trust proxy", 1);
 
 // 🛡️ Seguridad HTTP
@@ -38,7 +38,6 @@ const corsOptions = {
     const whitelist = [
       "http://localhost:5173",
       "https://cobrina-rdc.netlify.app",
-      "https://cobrina-backend-eue8.onrender.com",
     ];
     // Permitir herramientas sin origin (curl/Postman) o los orígenes de la lista
     if (!origin || whitelist.includes(origin)) {
@@ -101,7 +100,7 @@ app.use("/usuarios", usuarioRoutes);
 app.use("/colchon", colchonRoutes);
 app.use("/subcesiones", subcesionRoutes); // ✅ NUEVA RUTA ACTIVA
 app.use("/entidades", entidadRoutes); // ✅
-app.use("/stickies", stickiesRoutes);
+app.use("/api/stickies", stickiesRoutes);
 
 // 🔵 Ruta de prueba
 app.get("/", (req, res) => {
@@ -131,9 +130,9 @@ process.on("unhandledRejection", (reason, promise) => {
   console.error("❌ Unhandled Rejection at:", promise, "reason:", reason);
 });
 
-// 🛑 Captura de cierre por Railway
+
 process.on("SIGTERM", () => {
-  console.log("🛑 Railway envió SIGTERM, el servidor está siendo detenido.");
+  console.log("🛑 Render envió SIGTERM, el servidor está siendo detenido.");
   process.exit(0);
 });
 
@@ -144,7 +143,7 @@ if (process.env.NODE_ENV !== "production") {
   }, 5 * 60 * 1000);
 }
 
-// 🚀 Lanzar servidor en 0.0.0.0 para Railway
+// 🚀 Lanzar servidor en 0.0.0.0 para render
 app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `✅ Escuchando en http://0.0.0.0:${PORT} - API lista para recibir peticiones`
