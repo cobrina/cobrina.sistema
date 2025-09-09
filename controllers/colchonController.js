@@ -317,7 +317,6 @@ export const editarCuota = async (req, res) => {
   }
 };
 
-
 // Eliminar cuota
 export const eliminarCuota = async (req, res) => {
   try {
@@ -532,16 +531,29 @@ export const importarExcel = async (req, res) => {
     await workbook.xlsx.load(req.file.buffer);
     const worksheet = workbook.worksheets[0];
 
-   const encabezadosEsperados = [
-  "ESTADO","ENTIDAD","DNI","NOMBRE Y APELLIDO","OPERADOR","TURNO",
-  "SUBCESIÓN","VTO CUO","C/CUOTAS","$CUOTA","TELÉFONO",
-];
+    const sinTildes = (s) =>
+      String(s)
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "");
 
+    const encabezadosEsperados = [
+      "ESTADO",
+      "ENTIDAD",
+      "DNI",
+      "NOMBRE Y APELLIDO",
+      "OPERADOR",
+      "TURNO",
+      "SUBCESION",
+      "VTO CUO",
+      "C/CUOTAS",
+      "$CUOTA",
+      "TELEFONO", // ← sin acentos
+    ];
 
     const encabezadosArchivo = worksheet
       .getRow(1)
       .values.slice(1)
-      .map((v) => String(v).trim().toUpperCase());
+      .map((v) => sinTildes(v).trim().toUpperCase());
 
     const validacionEncabezados = encabezadosEsperados.every(
       (e, i) => e === encabezadosArchivo[i]
@@ -609,7 +621,6 @@ export const importarExcel = async (req, res) => {
       const operadorUsername = (row.getCell(5).value || "").toString().trim();
       const turno = (row.getCell(6).value || "").toString().trim();
       const cartera = (row.getCell(7).value || "").toString().trim();
-
       const vtoCuota = parseInt(row.getCell(8).value);
       const cuotas = parseInt(row.getCell(9).value);
       const importeCuota = parseFloat(row.getCell(10).value || 0);
@@ -762,8 +773,18 @@ export const importarExcel = async (req, res) => {
         }
       } catch (err) {
         filasConErrores.push([
-          ...fila.filaExcel,
-          err.message || "Error desconocido",
+          fila.estadoExcel || "",
+          fila.entidad?.numero || "",
+          fila.dni || "",
+          fila.nombre || "",
+          fila.empleadoUsername || "",
+          fila.turno || "",
+          fila.carteraNombre || "", // ← acá va la SubCesión (texto)
+          fila.vtoCuota || "",
+          fila.cuotas || "",
+          fila.importeCuota || "",
+          fila.telefono || "",
+          err?.message || "Error desconocido",
         ]);
       }
     }
@@ -2033,7 +2054,10 @@ export const obtenerEstadisticasColchon = async (req, res) => {
         const f = new Date(p.fecha);
         return f.getMonth() === mesActual && f.getFullYear() === anioActual;
       });
-      const pagadoMesActual = pagosMesActual.reduce((sum, p) => sum + p.monto, 0);
+      const pagadoMesActual = pagosMesActual.reduce(
+        (sum, p) => sum + p.monto,
+        0
+      );
 
       const estadoVisual = cuota.estado || "Desconocido";
       estadoStats[estadoVisual] = (estadoStats[estadoVisual] || 0) + 1;
@@ -2062,7 +2086,7 @@ export const obtenerEstadisticasColchon = async (req, res) => {
       rankingEntidad[entidadNom].cobrado += pagado;
       rankingEntidad[entidadNom].pagos += pagos.length;
 
-      const carteraNom = cuota.cartera || "Sin cartera";
+      const carteraNom = cuota.cartera || "Sin subcesión";
       if (!rankingCartera[carteraNom]) {
         rankingCartera[carteraNom] = { asignado: 0, cobrado: 0, pagos: 0 };
       }
@@ -2126,7 +2150,13 @@ export const obtenerEstadisticasColchon = async (req, res) => {
     );
 
     // Ranking de operadores con desglose por estado
-    const ESTADOS_ORDEN = ["A cuota", "Cuota 30", "Cuota 60", "Cuota 90", "Caída"];
+    const ESTADOS_ORDEN = [
+      "A cuota",
+      "Cuota 30",
+      "Cuota 60",
+      "Cuota 90",
+      "Caída",
+    ];
     const rankingOperadoresArray = Object.entries(rankingOperadores).map(
       ([operador, val]) => {
         const totalAsignado = val.total.asignado || 0;
@@ -2199,7 +2229,6 @@ export const obtenerEstadisticasColchon = async (req, res) => {
   }
 };
 
-
 export const getCuotaPorId = async (req, res) => {
   try {
     const { id } = req.params;
@@ -2258,7 +2287,7 @@ export const registrarGestionCuota = async (req, res) => {
     cuota.ultimaGestion = new Date();
 
     // ✅ Asignar solo si es operador y no tiene aún
-    if (!cuota.empleadoId && ((usuario.role || usuario.rol) === "operador")) {
+    if (!cuota.empleadoId && (usuario.role || usuario.rol) === "operador") {
       cuota.empleadoId = usuario.id;
     }
 

@@ -5,8 +5,6 @@ import dotenv from "dotenv";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import compression from "compression";
-
-// 📦 Rutas del sistema Cobrina
 import authRoutes from "./routes/authRoutes.js";
 import empleadosRoutes from "./routes/empleados.js";
 import certificadosRoutes from "./routes/certificados.js";
