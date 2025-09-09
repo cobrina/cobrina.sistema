@@ -13,13 +13,39 @@ const esOp = (req) => rolDe(req) === "operador";
 const esVip = (req) => rolDe(req) === "operador-vip";
 const esOperativo = (req) => esOp(req) || esVip(req); // ambos operadores
 
-// Helper: recalcular total pagado desde pagosInformados
 const recalcularImportePagado = (proy) =>
   (proy.pagosInformados || [])
     .filter((p) => !p.erroneo)
     .reduce((acc, p) => acc + Number(p.monto || 0), 0);
 
-// Decide el estado de cierre de una promesa previa según lo pagado vs importe
+const parseSelectLabel = (v) => {
+  if (v == null) return "";
+  const s = String(v).trim();
+  const m = s.match(/^\s*(?:[0-9a-f]{24}|\d+)\s*-\s*(.+)$/i);
+  return (m ? m[1] : s).trim();
+};
+
+const toISODate = (v) => {
+  const d = parseExcelDate(v);
+  return d ? d.toISOString().slice(0, 10) : (v == null ? "" : String(v));
+};
+
+const buildLabelMaps = async () => {
+  const [ents, subs] = await Promise.all([
+    Entidad.find({}, "nombre").sort({ nombre: 1 }).lean(),
+    SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
+  ]);
+  const entLabelById = new Map();
+  const subLabelById = new Map();
+  ents.forEach((e, i) => entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`));
+  subs.forEach((s, i) => subLabelById.set(String(s._id), `${i + 1} - ${s.nombre}`));
+  const entLabel = (id, fallbackName) =>
+    id ? (entLabelById.get(String(id)) || (fallbackName ? `- ${fallbackName}` : "")) : (fallbackName || "");
+  const subLabel = (id, fallbackName) =>
+    id ? (subLabelById.get(String(id)) || (fallbackName ? `- ${fallbackName}` : "")) : (fallbackName || "");
+  return { entLabel, subLabel, entLabelById, subLabelById };
+};
+
 const determinarEstadoCierre = (proy) => {
   const importe = Number(proy.importe || 0);
   const pagadoReal = recalcularImportePagado(proy); // solo pagos NO erróneos
@@ -29,7 +55,6 @@ const determinarEstadoCierre = (proy) => {
   return "Cerrada incumplida";
 };
 
-// ✅ Utilidad para crear fechas locales sin desfase horario
 const crearFechaLocal = (fechaStr, finDelDia = false) => {
   const [anio, mes, dia] = fechaStr.split("-").map(Number);
   return new Date(
@@ -43,7 +68,6 @@ const crearFechaLocal = (fechaStr, finDelDia = false) => {
   );
 };
 
-// parsea fechas de Excel (Date, número serial, "dd/mm/aaaa", "aaaa-mm-dd", etc.)
 function parseExcelDate(v) {
   if (v === undefined || v === null || v === "") return null;
 
@@ -98,7 +122,6 @@ const estaCerrada = (p) =>
 
 /* === fin helpers globales === */
 
-// ✅ Función auxiliar para evaluar estado según importe pagado
 export const evaluarEstadoPago = (proy) => {
   const importe = parseFloat(proy.importe || 0);
   const pagado = parseFloat(proy.importePagado || 0);
@@ -108,7 +131,6 @@ export const evaluarEstadoPago = (proy) => {
   return proy.estado; // No cambiar si no aplica
 };
 
-// 🧠 Función para actualizar estados automáticamente
 export const actualizarEstadoAutomaticamente = async (proy) => {
   // 🚫 No recalcular si ya está cerrada o marcada inactiva
   if (proy.isActiva === false || /^Cerrada/.test(proy.estado)) {
@@ -299,17 +321,41 @@ export const crearProyeccion = async (req, res) => {
 export const obtenerProyeccionesPropias = async (req, res) => {
   try {
     if (esAdmin(req)) return res.status(403).json({ error: "Sin acceso" });
-    const proyecciones = await Proyeccion.find({
-      empleadoId: req.user.id,
-    }).sort({ creado: -1 });
-    const actualizadas = await Promise.all(
-      proyecciones.map(actualizarEstadoAutomaticamente)
-    );
-    res.json(actualizadas);
+
+    const campos =
+      "empleadoId dni nombreTitular importe importePagado estado concepto " +
+      "entidadId subCesionId fechaPromesa fechaProximoLlamado creado ultimaModificacion " +
+      "vecesTocada ultimaGestion observaciones";
+
+    const docs = await Proyeccion.find({ empleadoId: req.user.id })
+      .select(campos)
+      .populate("empleadoId", "username")
+      .populate("entidadId", "nombre numero")
+      .populate("subCesionId", "nombre")
+      .sort({ creado: -1 })
+      .lean();
+
+    const resultados = docs.map((p) => {
+      const estadoVista = (typeof clasificarEstado === "function" && p.fechaPromesa)
+        ? clasificarEstado(new Date(p.fechaPromesa))
+        : p.estado;
+
+      return {
+        ...p,
+        empleadoUsername: p?.empleadoId?.username || "-",
+        entidadNombre: p?.entidadId?.nombre || "-",
+        subCesionNombre: p?.subCesionId?.nombre || "-",
+        estado: estadoVista,
+      };
+    });
+
+    return res.json(resultados);
   } catch (error) {
+    console.error("❌ Error al obtener proyecciones propias:", error);
     res.status(500).json({ error: "Error al obtener proyecciones" });
   }
 };
+
 
 // 3. Actualizar proyección
 export const actualizarProyeccion = async (req, res) => {
@@ -600,7 +646,7 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
       anio,
       promesaHoy,
       llamadoHoy,
-      // 👇 NUEVO
+      // NUEVO
       sinGestion,
     } = req.query;
 
@@ -609,9 +655,7 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
       return res.status(403).json({ error: "Sin acceso" });
     }
     if (esSuper(req)) {
-      if (usuarioId) {
-        filtros.push({ empleadoId: usuarioId });
-      }
+      if (usuarioId) filtros.push({ empleadoId: usuarioId });
     } else {
       filtros.push({ empleadoId: req.user.id });
     }
@@ -624,7 +668,7 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
     if (mes) filtros.push({ mes: parseInt(mes) });
     if (anio) filtros.push({ anio: parseInt(anio) });
 
-    // 👇 NUEVO: Filtro "Sin gestión"
+    // Filtro "Sin gestión"
     if (sinGestion === "true") {
       filtros.push({
         $or: [
@@ -636,52 +680,37 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
     }
 
     // Hoy (promesas y llamados)
-    const hoy = new Date();
-    hoy.setHours(0, 0, 0, 0);
-    const mañana = new Date(hoy);
-    mañana.setDate(hoy.getDate() + 1);
+    const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+    const mañana = new Date(hoy); mañana.setDate(hoy.getDate() + 1);
 
     if (promesaHoy === "true") {
       filtros.push({ fechaPromesa: { $gte: hoy, $lt: mañana } });
     }
-
     if (llamadoHoy === "true") {
       filtros.push({ fechaProximoLlamado: { $gte: hoy, $lt: mañana } });
     }
 
-    // Rango de fechas
+    // Rango por tipoFecha
     if (
-      fechaDesde &&
-      fechaHasta &&
+      fechaDesde && fechaHasta &&
       !isNaN(Date.parse(fechaDesde)) &&
       !isNaN(Date.parse(fechaHasta))
     ) {
       const inicio = crearFechaLocal(fechaDesde);
       const fin = crearFechaLocal(fechaHasta, true);
-
       const campoFecha = {
         fechaPromesa: "fechaPromesa",
         creado: "creado",
         modificado: "ultimaModificacion",
       }[tipoFecha || "fechaPromesa"];
-
-      if (campoFecha) {
-        filtros.push({
-          [campoFecha]: { $gte: inicio, $lte: fin },
-        });
-      }
+      if (campoFecha) filtros.push({ [campoFecha]: { $gte: inicio, $lte: fin } });
     }
 
     // Búsqueda libre
     if (buscar) {
       const regex = new RegExp(buscar, "i");
       const posibleDni = parseInt(buscar, 10);
-      const condiciones = [
-        { nombreTitular: regex },
-        { concepto: regex },
-        { estado: regex },
-        // (ya no se busca por cartera/fiduciario texto)
-      ];
+      const condiciones = [{ nombreTitular: regex }, { concepto: regex }, { estado: regex }];
       if (!isNaN(posibleDni)) condiciones.push({ dni: posibleDni });
       filtros.push({ $or: condiciones });
     }
@@ -690,32 +719,55 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
     const query = filtros.length ? { $and: filtros } : {};
 
     // Paginación y orden
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const pageNum = parseInt(page);
+    const pageSize = parseInt(limit);
+    const skip = (pageNum - 1) * pageSize;
     const sortObj = {};
-    if (ordenPor) {
-      sortObj[ordenPor] = orden === "asc" ? 1 : -1;
-    }
+    if (ordenPor) sortObj[ordenPor] = orden === "asc" ? 1 : -1;
 
-    // Búsqueda
-    const resultados = await Proyeccion.find(query)
+    // Campos mínimos para la grilla
+    const campos =
+      "empleadoId dni nombreTitular importe importePagado estado concepto " +
+      "entidadId subCesionId fechaPromesa fechaProximoLlamado creado ultimaModificacion " +
+      "vecesTocada ultimaGestion observaciones";
+
+    // Búsqueda rápida con populate + lean (SIN guardar)
+    const docs = await Proyeccion.find(query)
+      .select(campos)
       .populate("empleadoId", "username")
+      .populate("entidadId", "nombre numero")
+      .populate("subCesionId", "nombre")
       .sort(sortObj)
       .skip(skip)
-      .limit(parseInt(limit));
+      .limit(pageSize)
+      .lean();
 
-    // Actualizar estados en caliente
-    const actualizadas = await Promise.all(
-      resultados.map(actualizarEstadoAutomaticamente)
-    );
+    // Estado “en caliente” (sin persistir) y nombres listos para la tabla
+    const hoyRef = new Date(); hoyRef.setHours(0,0,0,0);
+    const resultados = docs.map((p) => {
+      // si tenés helper clasificarEstado, lo usamos; si no, se cae al estado guardado
+      const estadoVista = (typeof clasificarEstado === "function" && p.fechaPromesa)
+        ? clasificarEstado(new Date(p.fechaPromesa))
+        : p.estado;
+
+      return {
+        ...p,
+        empleadoUsername: p?.empleadoId?.username || "-",
+        entidadNombre: p?.entidadId?.nombre || "-",
+        subCesionNombre: p?.subCesionId?.nombre || "-",
+        // opcional: si querés mostrar distinto sin tocar el guardado
+        estado: estadoVista,
+      };
+    });
 
     const total = await Proyeccion.countDocuments(query);
-
-    res.json({ total, resultados: actualizadas });
+    return res.json({ total, resultados });
   } catch (error) {
     console.error("❌ Error en /proyecciones/filtrar:", error);
     res.status(500).json({ error: "Error al filtrar proyecciones" });
   }
 };
+
 
 // 7. Estadísticas propias
 export const obtenerEstadisticasPropias = async (req, res) => {
@@ -750,7 +802,6 @@ export const obtenerEstadisticasPropias = async (req, res) => {
   }
 };
 
-// 8. Estadísticas globales admin
 export const obtenerEstadisticasAdmin = async (req, res) => {
   try {
     if (!esSuper(req)) return res.status(403).json({ error: "No autorizado" });
@@ -786,178 +837,8 @@ export const obtenerEstadisticasAdmin = async (req, res) => {
   }
 };
 
-export const exportarProyeccionesExcel = async (req, res) => {
-  try {
-    const {
-      estado,
-      concepto,
-      entidadId,
-      subCesionId,
-      buscar,
-      orden = "desc",
-      usuarioId,
-      // fechas (nuevo + compat)
-      tipoFecha,
-      fechaDesde,
-      fechaHasta,
-      desde,
-      hasta,
-    } = req.query;
 
-    if (esAdmin(req)) {
-      return res.status(403).json({ error: "Sin acceso a exportación" });
-    }
 
-    // Filtros base (según rol)
-    const filtros = [];
-    if (esSuper(req)) {
-      if (usuarioId) filtros.push({ empleadoId: usuarioId });
-    } else {
-      filtros.push({ empleadoId: req.user.id });
-    }
-
-    if (estado) filtros.push({ estado });
-    if (concepto) filtros.push({ concepto });
-    if (entidadId) filtros.push({ entidadId });
-    if (subCesionId) filtros.push({ subCesionId });
-
-    // Rango de fechas (fechaPromesa/creado/modificado)
-    const _fechaDesde = fechaDesde || desde;
-    const _fechaHasta = fechaHasta || hasta;
-    if (
-      tipoFecha &&
-      _fechaDesde &&
-      _fechaHasta &&
-      !isNaN(Date.parse(_fechaDesde)) &&
-      !isNaN(Date.parse(_fechaHasta))
-    ) {
-      const desdeLocal = crearFechaLocal(_fechaDesde);
-      const hastaLocal = crearFechaLocal(_fechaHasta, true);
-
-      const campoFecha = {
-        fechaPromesa: "fechaPromesa",
-        creado: "creado",
-        modificado: "ultimaModificacion",
-      }[tipoFecha];
-
-      if (campoFecha) {
-        filtros.push({
-          [campoFecha]: { $gte: desdeLocal, $lte: hastaLocal },
-        });
-      }
-    }
-
-    // Buscar (texto / DNI / ObjectId de entidad o subcesión)
-    if (buscar) {
-      const buscarStr = String(buscar).trim();
-      const regex = new RegExp(buscarStr, "i");
-      const posibleDni = parseInt(buscarStr, 10);
-      const condiciones = [
-        { nombreTitular: regex },
-        { concepto: regex },
-        { estado: regex },
-      ];
-      if (!isNaN(posibleDni)) condiciones.push({ dni: posibleDni });
-      if (mongoose.isValidObjectId(buscarStr)) {
-        condiciones.push({ entidadId: buscarStr });
-        condiciones.push({ subCesionId: buscarStr });
-      }
-      filtros.push({ $or: condiciones });
-    }
-
-    const queryFinal = filtros.length ? { $and: filtros } : {};
-
-    const proyecciones = await Proyeccion.find(queryFinal)
-      .populate("empleadoId", "username")
-      .populate("entidadId", "nombre")
-      .populate("subCesionId", "nombre")
-      .sort({ fechaPromesa: orden === "asc" ? 1 : -1 });
-
-    // ---------- Excel ----------
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet("Proyecciones");
-
-    worksheet.columns = [
-      { header: "Creado por", key: "creadoPor", width: 20 },
-      { header: "DNI", key: "dni", width: 15 },
-      { header: "Titular", key: "nombreTitular", width: 25 },
-      { header: "Importe", key: "importe", width: 12 },
-      { header: "Importe Pagado", key: "importePagado", width: 15 },
-      { header: "Estado", key: "estado", width: 18 },
-      { header: "Concepto", key: "concepto", width: 20 },
-      { header: "Entidad", key: "entidad", width: 24 },
-      { header: "SubCesión", key: "subCesion", width: 24 },
-      { header: "Fecha Promesa", key: "fechaPromesa", width: 15 },
-      {
-        header: "Fecha Próximo Llamado",
-        key: "fechaProximoLlamado",
-        width: 20,
-      },
-      { header: "Creado", key: "creado", width: 15 },
-      { header: "Última Modificación", key: "ultimaModificacion", width: 20 },
-      { header: "Gestiones", key: "vecesTocada", width: 12 },
-      { header: "Última Gestión", key: "ultimaGestion", width: 18 },
-      { header: "Observaciones", key: "observaciones", width: 30 },
-    ];
-
-    // Formato numérico de dinero
-    const moneyFmt = "#,##0.00";
-    ["importe", "importePagado"].forEach((k) => {
-      const col = worksheet.getColumn(k);
-      col.numFmt = moneyFmt;
-      col.alignment = { horizontal: "right" };
-    });
-
-    // Normaliza a número (acepta "7,2" -> 7.2, etc.)
-    const toNumber = (v) => {
-      if (v === null || v === undefined) return 0;
-      if (typeof v === "number") return v;
-      if (typeof v === "string") {
-        const s = v.replace(/\s/g, "").replace(",", ".");
-        const n = Number(s);
-        return isNaN(n) ? 0 : n;
-      }
-      const n = Number(v);
-      return isNaN(n) ? 0 : n;
-    };
-
-    proyecciones.forEach((p) => {
-      worksheet.addRow({
-        creadoPor: p.empleadoId?.username || "-",
-        dni: p.dni,
-        nombreTitular: p.nombreTitular,
-        importe: toNumber(p.importe),
-        importePagado: toNumber(p.importePagado),
-        estado: p.estado,
-        concepto: p.concepto,
-        entidad: p.entidadId?.nombre || String(p.entidadId || "-"),
-        subCesion: p.subCesionId?.nombre || String(p.subCesionId || "-"),
-        fechaPromesa: formatearFecha(p.fechaPromesa),
-        fechaProximoLlamado: formatearFecha(p.fechaProximoLlamado),
-        creado: formatearFecha(p.creado),
-        ultimaModificacion: formatearFecha(p.ultimaModificacion),
-        vecesTocada: p.vecesTocada ?? 0,
-        ultimaGestion: formatearFecha(p.ultimaGestion),
-        observaciones: p.observaciones,
-      });
-    });
-
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
-    res.setHeader(
-      "Content-Disposition",
-      "attachment; filename=proyecciones.xlsx"
-    );
-
-    await workbook.xlsx.write(res);
-    res.end();
-  } catch (error) {
-    console.error("❌ Error al exportar Excel:", error);
-    res.status(500).json({ error: "Error al exportar a Excel" });
-  }
-};
 
 export const obtenerResumenGlobal = async (req, res) => {
   try {
@@ -1312,7 +1193,6 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
   }
 };
 
-// === Informar pago (fecha + monto) ===
 export const informarPago = async (req, res) => {
   try {
     const { id } = req.params; // proyeccionId
@@ -1398,9 +1278,7 @@ export const informarPago = async (req, res) => {
   }
 };
 
-// === Listar pagos informados de una proyección ===
 
-// controllers/proyeccionController.js
 export const listarPagosInformados = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1431,7 +1309,6 @@ export const listarPagosInformados = async (req, res) => {
   }
 };
 
-// === Marcar / desmarcar pago como erróneo ===
 export const marcarPagoErroneo = async (req, res) => {
   try {
     const { id, pagoId } = req.params; // proyeccionId, pagoId
@@ -1505,6 +1382,708 @@ export const marcarPagoErroneo = async (req, res) => {
 
 
 
+
+
+
+
+
+
+export const limpiarPagosProyeccion = async (req, res) => {
+  try {
+    const proyeccion = await Proyeccion.findById(req.params.id);
+    if (!proyeccion) {
+      return res.status(404).json({ error: "Proyección no encontrada" });
+    }
+
+    // 🔒 Bloqueo: no permitir limpiar pagos en cuentas cerradas
+    const cerrada =
+      proyeccion.isActiva === false ||
+      /^Cerrada/.test(String(proyeccion.estado || ""));
+    if (cerrada) {
+      return res.status(409).json({
+        error: "La proyección está cerrada: no se pueden limpiar pagos.",
+      });
+    }
+
+    const rol = rolDe(req);
+
+    // Asegurar array
+    proyeccion.pagosInformados = proyeccion.pagosInformados || [];
+
+    if (esOperativo(req)) {
+      // Operador: limpia SOLO sus propios pagos
+      proyeccion.pagosInformados = proyeccion.pagosInformados.filter(
+        (p) => String(p.operadorId) !== String(req.user.id)
+      );
+    } else if (esSuper(req)) {
+      // Admin / Super-admin: limpia TODOS los pagos
+      proyeccion.pagosInformados = [];
+    } else {
+      // Otros roles no permitidos
+      return res
+        .status(403)
+        .json({ error: "No autorizado para limpiar pagos" });
+    }
+
+    // Recalcular importePagado a partir de pagos NO erróneos
+    proyeccion.importePagado = recalcularImportePagado(proyeccion);
+    proyeccion.ultimaModificacion = new Date();
+
+    await proyeccion.save();
+    await actualizarEstadoAutomaticamente(proyeccion);
+
+    // Devolver proyección actualizada con datos útiles
+    const actualizado = await Proyeccion.findById(proyeccion._id)
+      .populate("empleadoId", "username")
+      .populate("pagosInformados.operadorId", "username");
+
+    return res.json({
+      ok: true,
+      mensaje:
+        rol === "operador"
+          ? "Pagos del operador actual limpiados correctamente"
+          : "Se limpiaron todos los pagos informados",
+      proyeccion: actualizado?.toObject?.() || actualizado,
+    });
+  } catch (err) {
+    console.error("Error al limpiar pagos:", err);
+    return res.status(500).json({ error: "Error interno al limpiar pagos" });
+  }
+};
+
+export const limpiarObservacionesProyeccion = async (req, res) => {
+  try {
+    const proyeccion = await Proyeccion.findById(req.params.id);
+    if (!proyeccion) {
+      return res.status(404).json({ error: "Proyección no encontrada" });
+    }
+
+    // 🔒 Bloqueo: no permitir modificar cuentas cerradas
+    const cerrada =
+      proyeccion.isActiva === false ||
+      /^Cerrada/.test(String(proyeccion.estado || ""));
+    if (cerrada) {
+      return res.status(409).json({
+        error:
+          "La proyección está cerrada: no se pueden limpiar observaciones.",
+      });
+    }
+
+    // 👤 Permisos
+    if (esAdmin(req)) {
+      return res.status(403).json({ error: "Sin acceso" });
+    }
+    if (
+      esOperativo(req) &&
+      String(proyeccion.empleadoId) !== String(req.user.id)
+    ) {
+      return res
+        .status(403)
+        .json({ error: "No autorizado para limpiar observaciones" });
+    }
+    if (!esOperativo(req) && !esSuper(req)) {
+      return res.status(403).json({ error: "Rol no autorizado" });
+    }
+
+    // 🧹 Limpieza
+    proyeccion.observaciones = "";
+    proyeccion.ultimaModificacion = new Date();
+    await proyeccion.save();
+
+    // devolver proyección actualizada (con datos útiles)
+    const actualizado = await Proyeccion.findById(proyeccion._id).populate(
+      "empleadoId",
+      "username"
+    );
+
+    return res.json({
+      ok: true,
+      mensaje: "Observaciones limpiadas",
+      proyeccion: actualizado?.toObject?.() || actualizado,
+    });
+  } catch (err) {
+    console.error("Error al limpiar observaciones:", err);
+    return res
+      .status(500)
+      .json({ error: "Error interno al limpiar observaciones" });
+  }
+};
+
+
+
+
+export const importarPagosMasivo = async (req, res) => {
+  try {
+    // 1) Seguridad por rol (la ruta igual debería tener el middleware)
+    const rol = req.user.role || req.user.rol;
+    if (!["admin", "super-admin"].includes(rol)) {
+      return res.status(403).json({ error: "No autorizado" });
+    }
+
+    // 2) Archivo adjunto
+    if (!req.file || !req.file.buffer) {
+      return res
+        .status(400)
+        .json({ error: "Subí un archivo XLSX (campo: file)" });
+    }
+
+    // 3) Cargar XLSX
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(req.file.buffer);
+    const ws = wb.worksheets[0];
+    if (!ws) return res.status(400).json({ error: "El archivo no tiene hojas" });
+
+    // ==== Helpers locales ====
+    const norm = (s) =>
+      String(s || "")
+        .normalize("NFD")
+        .replace(/\p{Diacritic}/gu, "")
+        .trim()
+        .toLowerCase();
+
+    const NORM_TXT = (s) => String(s || "").trim().toUpperCase();
+
+    // quita prefijos "123 - " o "66f0... - " → queda NOMBRE
+    const parseSelectLabel = (v) => {
+      if (v == null) return "";
+      const s = String(v).trim();
+      const m = s.match(/^\s*(?:[0-9a-f]{24}|\d+)\s*-\s*(.+)$/i);
+      return (m ? m[1] : s).trim();
+    };
+
+    const toISODate = (v) => {
+      const d = (() => {
+        if (v == null) return null;
+        if (v instanceof Date) return v;
+        if (typeof v === "number") {
+          const ms = (v - 25569) * 86400 * 1000; // Excel serial
+          const d = new Date(ms);
+          return isNaN(d) ? null : d;
+        }
+        const s = String(v).trim();
+        if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) {
+          const [dd, mm, aa] = s.split("/").map(Number);
+          return new Date(aa, mm - 1, dd, 12, 0, 0, 0);
+        }
+        const d2 = new Date(s);
+        return isNaN(d2) ? null : d2;
+      })();
+      return d ? d.toISOString().slice(0, 10) : (v == null ? "" : String(v));
+    };
+
+    // etiquetas: Entidad "n - NOMBRE" / SubCesión "NOMBRE"
+    const buildLabelMaps = async () => {
+      const [ents, subs] = await Promise.all([
+        Entidad.find({}, "nombre").sort({ nombre: 1 }).lean(),
+        SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
+      ]);
+      const entLabelById = new Map(); // id -> "n - NOMBRE"
+      const subNameById = new Map();  // id -> "NOMBRE"
+      ents.forEach((e, i) => entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`));
+      subs.forEach((s) => subNameById.set(String(s._id), s.nombre));
+      const entLabel = (id, fallbackName) =>
+        id ? (entLabelById.get(String(id)) || (fallbackName ? `- ${fallbackName}` : "")) : (fallbackName || "");
+      const subLabel = (id, fallbackName) =>
+        id ? (subNameById.get(String(id)) || (fallbackName || "")) : (fallbackName || "");
+      return { entLabel, subLabel };
+    };
+    const { entLabel, subLabel } = await buildLabelMaps();
+
+    // mapear encabezados de la fila 1
+    const headers = {};
+    ws.getRow(1).eachCell((cell, col) => {
+      const key = norm(cell.value);
+      if (key) headers[key] = col;
+    });
+
+    // Alias aceptados (admite ID o NOMBRE)
+    const aliases = {
+      dni: ["dni", "documento", "doc"],
+      entidadId: ["entidadid", "entidad id", "id entidad", "id_entidad"],
+      subCesionId: [
+        "subcesionid",
+        "subcesion id",
+        "id subcesion",
+        "id_subcesion",
+      ],
+      entidad: ["entidad", "empresa"],
+      subCesion: ["subcesion", "sub-cesion", "sub cesion", "subcesión", "sub cesión"],
+      fecha: ["fecha pago", "fecha", "fecha de pago"],
+      monto: ["monto", "importe", "monto pago", "importe pago"],
+      observacion: ["observacion", "observación", "obs"],
+    };
+
+    const getCol = (logical) => {
+      if (headers[logical]) return headers[logical];
+      for (const alias of (aliases[logical] || [])) {
+        const k = norm(alias);
+        if (headers[k]) return headers[k];
+      }
+      return null;
+    };
+
+    // Debe venir: DNI, FECHA, MONTO y (ENTIDAD_ID o ENTIDAD) y (SUBCESION_ID o SUBCESION)
+    const faltan = [];
+    if (!getCol("dni")) faltan.push("DNI");
+    if (!getCol("fecha")) faltan.push("FECHA");
+    if (!getCol("monto")) faltan.push("MONTO");
+    if (!getCol("entidadId") && !getCol("entidad")) faltan.push("ENTIDAD_ID o ENTIDAD");
+    if (!getCol("subCesionId") && !getCol("subCesion")) faltan.push("SUBCESION_ID o SUBCESION");
+
+    if (faltan.length) {
+      return res.status(400).json({
+        error: `Faltan columnas: ${faltan.join(", ")}. Requerido: DNI, (EntidadId o Entidad), (SubCesionId o SubCesion), Fecha, Monto`,
+      });
+    }
+
+    // Fecha: número Excel, Date o string (dd/mm/yyyy o ISO)
+    const parseFecha = (v) => {
+      if (v == null) return null;
+      if (v instanceof Date) return v;
+      if (typeof v === "number") {
+        const ms = (v - 25569) * 86400 * 1000;
+        const d = new Date(ms);
+        return isNaN(d) ? null : d;
+      }
+      const s = String(v).trim();
+      if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) {
+        const [d, m, a] = s.split("/").map(Number);
+        return new Date(a, m - 1, d, 12, 0, 0, 0);
+      }
+      const d2 = new Date(s);
+      return isNaN(d2) ? null : d2;
+    };
+
+    const parseMonto = (v) => {
+      if (v == null) return NaN;
+      if (typeof v === "number") return v;
+      const n = Number(
+        String(v)
+          .replace(/[^\d.,-]/g, "")
+          .replace(",", ".")
+      );
+      return Number.isFinite(n) ? n : NaN;
+    };
+
+    const parseObjectId = (v) => {
+      if (v == null) return null;
+      const s = String(v).trim();
+      return mongoose.Types.ObjectId.isValid(s)
+        ? new mongoose.Types.ObjectId(s)
+        : null;
+    };
+
+    // Cache para no consultar la DB por la misma (dni, entidadId, subCesionId) en cada fila
+    const cacheActivas = new Map();
+    const getActiva = async (dni, entidadId, subCesionId) => {
+      const key = `${dni}::${entidadId}::${subCesionId}`;
+      if (cacheActivas.has(key)) return cacheActivas.get(key);
+      const proy = await Proyeccion.findOne({
+        dni,
+        entidadId,
+        subCesionId,
+        $or: [{ isActiva: true }, { isActiva: { $exists: false } }],
+      });
+      cacheActivas.set(key, proy || null);
+      return proy;
+    };
+
+    // Caches Entidad/SubCesión por nombre
+    const cacheEntPorNombre = new Map(); // NOMBRE→doc/null
+    const cacheSubPorNombre = new Map(); // NOMBRE→doc/null (GLOBAL)
+
+    const buscarEntidadPorNombre = async (nombre) => {
+      if (!nombre) return null;
+      const key = NORM_TXT(nombre);
+      if (cacheEntPorNombre.has(key)) return cacheEntPorNombre.get(key);
+      const ent = await Entidad.findOne({ nombre: key });
+      cacheEntPorNombre.set(key, ent || null);
+      return ent;
+    };
+
+    // GLOBAL: SubCesión por NOMBRE (no depende de entidad)
+    const buscarOCrearSubPorNombre = async (nombre) => {
+      if (!nombre) return null;
+      const key = NORM_TXT(nombre);
+      if (cacheSubPorNombre.has(key)) return cacheSubPorNombre.get(key);
+      let sub = await SubCesion.findOne({ nombre: key });
+      if (!sub) sub = await SubCesion.create({ nombre: key }); // modelo: { nombre: unique }
+      cacheSubPorNombre.set(key, sub);
+      return sub;
+    };
+
+    // Duplicado: mismo día y mismo monto (no erróneo)
+    const esDuplicado = (proy, fechaJS, montoNum) => {
+      const y = fechaJS.getFullYear();
+      const m = fechaJS.getMonth();
+      const d = fechaJS.getDate();
+      return (proy.pagosInformados || []).some((p) => {
+        if (p.erroneo) return false;
+        const pf = new Date(p.fecha);
+        return (
+          pf.getFullYear() === y &&
+          pf.getMonth() === m &&
+          pf.getDate() === d &&
+          Number(p.monto || 0) === Number(montoNum)
+        );
+      });
+    };
+
+    const errores = [];
+    let ok = 0;
+
+    // ---- Recorrer filas (desde 2) ----
+    for (let i = 2; i <= ws.rowCount; i++) {
+      const row = ws.getRow(i);
+
+      const getCell = (logical) => {
+        const col = getCol(logical);
+        return col ? row.getCell(col).value : undefined;
+      };
+
+      const rawDni   = getCell("dni");
+      const rawEntId = getCell("entidadId");
+      const rawSubId = getCell("subCesionId");
+      const rawEntNm = parseSelectLabel(getCell("entidad"));
+      const rawSubNm = parseSelectLabel(getCell("subCesion"));
+      const rawFec   = getCell("fecha");
+      const rawMon   = getCell("monto");
+      const rawObs   = getCell("observacion");
+
+      const dni = Number(String(rawDni || "").replace(/\D/g, ""));
+      let entidadId   = parseObjectId(rawEntId);
+      let subCesionId = parseObjectId(rawSubId);
+      const fechaJS   = parseFecha(rawFec);
+      const montoNum  = parseMonto(rawMon);
+
+      // Resolver ENTIDAD por NOMBRE cuando no hay ID
+      if (!entidadId && rawEntNm) {
+        const ent = await buscarEntidadPorNombre(rawEntNm);
+        if (!ent) {
+          errores.push({
+            fila: i,
+            dni: Number.isFinite(dni) ? dni : String(rawDni ?? ""),
+            entidad: rawEntNm || "",
+            subCesion: rawSubNm || "",
+            fecha: toISODate(rawFec),
+            monto: String(rawMon ?? ""),
+            error: `Entidad "${rawEntNm}" inexistente (no se crea automáticamente)`,
+          });
+          continue;
+        }
+        entidadId = ent._id;
+      }
+
+      // Resolver SUBCESIÓN por NOMBRE (GLOBAL) cuando no hay ID
+      if (!subCesionId && rawSubNm) {
+        const sub = await buscarOCrearSubPorNombre(rawSubNm); // crea si falta
+        subCesionId = sub ? sub._id : null;
+      }
+
+      // Validaciones por fila
+      const rowErr = [];
+      if (!Number.isFinite(dni) || dni <= 0) rowErr.push("DNI inválido");
+      if (!entidadId) rowErr.push("Entidad inválida/ausente (por ID o NOMBRE)");
+      if (!subCesionId) rowErr.push("SubCesión inválida/ausente (por ID o NOMBRE)");
+      if (!fechaJS || isNaN(fechaJS)) rowErr.push("Fecha inválida");
+      if (!Number.isFinite(montoNum) || montoNum <= 0) rowErr.push("Monto inválido");
+
+      if (rowErr.length) {
+        errores.push({
+          fila: i,
+          dni: Number.isFinite(dni) ? dni : String(rawDni ?? ""),
+          entidad: entidadId ? entLabel(entidadId) : (rawEntNm || String(rawEntId || "")),
+          subCesion: subCesionId ? subLabel(subCesionId) : (rawSubNm || String(rawSubId || "")),
+          fecha: toISODate(rawFec),
+          monto: String(rawMon ?? ""),
+          error: rowErr.join(" | "),
+        });
+        continue;
+      }
+
+      // Buscar proyección activa por (dni, entidadId, subCesionId)
+      const proy = await getActiva(dni, entidadId, subCesionId);
+      if (!proy) {
+        errores.push({
+          fila: i,
+          dni,
+          entidad: entLabel(entidadId),
+          subCesion: subLabel(subCesionId),
+          fecha: fechaJS.toISOString().slice(0, 10),
+          monto: montoNum,
+          error: "No existe promesa activa para DNI + Entidad + SubCesión",
+        });
+        continue;
+      }
+
+      // Duplicado
+      if (esDuplicado(proy, fechaJS, montoNum)) {
+        errores.push({
+          fila: i,
+          dni,
+          entidad: entLabel(entidadId),
+          subCesion: subLabel(subCesionId),
+          fecha: fechaJS.toISOString().slice(0, 10),
+          monto: montoNum,
+          error: "Pago duplicado (mismo día y monto ya cargado)",
+        });
+        continue;
+      }
+
+      // Insertar pago informado (NO descuenta deuda real)
+      proy.pagosInformados = proy.pagosInformados || [];
+      proy.pagosInformados.push({
+        fecha: fechaJS,
+        monto: montoNum,
+        operadorId: req.user.id, // quién importó
+        visto: false,
+        erroneo: false,
+        observacion: rawObs ? String(rawObs) : undefined,
+      });
+
+      // Recalcular importePagado solo con NO erróneos
+      proy.importePagado = recalcularImportePagado(proy);
+      proy.ultimaModificacion = new Date();
+
+      await proy.save();
+      await actualizarEstadoAutomaticamente(proy);
+
+      ok++;
+    }
+
+    // ---- Respuesta según errores ----
+    if (errores.length > 0) {
+      const wbErr = new ExcelJS.Workbook();
+      const wsErr = wbErr.addWorksheet("Errores");
+      wsErr.columns = [
+        { header: "Fila", key: "fila", width: 8 },
+        { header: "DNI", key: "dni", width: 14 },
+        { header: "Entidad", key: "entidad", width: 26 },
+        { header: "SubCesión", key: "subCesion", width: 26 },
+        { header: "Fecha", key: "fecha", width: 12 },
+        { header: "Monto", key: "monto", width: 14 },
+        { header: "Error", key: "error", width: 70 },
+      ];
+      errores.forEach((e) => wsErr.addRow(e));
+
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="errores_importacion_pagos.xlsx"'
+      );
+      // 200 con attachment (el front detecta por content-type)
+      await wbErr.xlsx.write(res);
+      return res.end();
+    }
+
+    // ✅ OK total
+    return res.status(200).json({
+      ok: true,
+      procesados: ok,
+      mensaje: `Pagos importados correctamente: ${ok}`,
+    });
+  } catch (e) {
+    console.error("❌ importarPagosMasivo:", e);
+    return res.status(500).json({ error: "Error al importar pagos" });
+  }
+};
+
+
+export const exportarProyeccionesExcel = async (req, res) => {
+  try {
+    const {
+      estado,
+      concepto,
+      entidadId,
+      subCesionId,
+      buscar,
+      orden = "desc",
+      usuarioId,
+      // fechas (nuevo + compat)
+      tipoFecha,
+      fechaDesde,
+      fechaHasta,
+      desde,
+      hasta,
+    } = req.query;
+
+    if (esAdmin(req)) {
+      return res.status(403).json({ error: "Sin acceso a exportación" });
+    }
+
+    // etiquetas: Entidad "n - NOMBRE" / SubCesión "NOMBRE"
+    const buildLabelMaps = async () => {
+      const [ents, subs] = await Promise.all([
+        Entidad.find({}, "nombre").sort({ nombre: 1 }).lean(),
+        SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
+      ]);
+      const entLabelById = new Map(); // id -> "n - NOMBRE"
+      const subNameById = new Map();  // id -> "NOMBRE"
+      ents.forEach((e, i) => entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`));
+      subs.forEach((s) => subNameById.set(String(s._id), s.nombre));
+      const entLabel = (id, fallbackName) =>
+        id ? (entLabelById.get(String(id)) || (fallbackName ? `- ${fallbackName}` : "")) : (fallbackName || "");
+      const subLabel = (id, fallbackName) =>
+        id ? (subNameById.get(String(id)) || (fallbackName || "")) : (fallbackName || "");
+      return { entLabel, subLabel };
+    };
+    const { entLabel, subLabel } = await buildLabelMaps();
+
+    // Filtros base (según rol)
+    const filtros = [];
+    if (esSuper(req)) {
+      if (usuarioId) filtros.push({ empleadoId: usuarioId });
+    } else {
+      filtros.push({ empleadoId: req.user.id });
+    }
+
+    if (estado) filtros.push({ estado });
+    if (concepto) filtros.push({ concepto });
+    if (entidadId) filtros.push({ entidadId });
+    if (subCesionId) filtros.push({ subCesionId });
+
+    // Rango de fechas (fechaPromesa/creado/modificado)
+    const _fechaDesde = fechaDesde || desde;
+    const _fechaHasta = fechaHasta || hasta;
+    if (
+      tipoFecha &&
+      _fechaDesde &&
+      _fechaHasta &&
+      !isNaN(Date.parse(_fechaDesde)) &&
+      !isNaN(Date.parse(_fechaHasta))
+    ) {
+      const desdeLocal = crearFechaLocal(_fechaDesde);
+      const hastaLocal = crearFechaLocal(_fechaHasta, true);
+
+      const campoFecha = {
+        fechaPromesa: "fechaPromesa",
+        creado: "creado",
+        modificado: "ultimaModificacion",
+      }[tipoFecha];
+
+      if (campoFecha) {
+        filtros.push({
+          [campoFecha]: { $gte: desdeLocal, $lte: hastaLocal },
+        });
+      }
+    }
+
+    // Buscar (texto / DNI / ObjectId de entidad o subcesión)
+    if (buscar) {
+      const buscarStr = String(buscar).trim();
+      const regex = new RegExp(buscarStr, "i");
+      const posibleDni = parseInt(buscarStr, 10);
+      const condiciones = [
+        { nombreTitular: regex },
+        { concepto: regex },
+        { estado: regex },
+      ];
+      if (!isNaN(posibleDni)) condiciones.push({ dni: posibleDni });
+      if (mongoose.isValidObjectId(buscarStr)) {
+        condiciones.push({ entidadId: buscarStr });
+        condiciones.push({ subCesionId: buscarStr });
+      }
+      filtros.push({ $or: condiciones });
+    }
+
+    const queryFinal = filtros.length ? { $and: filtros } : {};
+
+    const proyecciones = await Proyeccion.find(queryFinal)
+      .populate("empleadoId", "username")
+      .populate("entidadId", "nombre")
+      .populate("subCesionId", "nombre")
+      .sort({ fechaPromesa: orden === "asc" ? 1 : -1 });
+
+    // ---------- Excel ----------
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Proyecciones");
+
+    worksheet.columns = [
+      { header: "Creado por", key: "creadoPor", width: 20 },
+      { header: "DNI", key: "dni", width: 15 },
+      { header: "Titular", key: "nombreTitular", width: 25 },
+      { header: "Importe", key: "importe", width: 12 },
+      { header: "Importe Pagado", key: "importePagado", width: 15 },
+      { header: "Estado", key: "estado", width: 18 },
+      { header: "Concepto", key: "concepto", width: 20 },
+      { header: "Entidad", key: "entidad", width: 24 },
+      { header: "SubCesión", key: "subCesion", width: 24 },
+      { header: "Fecha Promesa", key: "fechaPromesa", width: 15 },
+      {
+        header: "Fecha Próximo Llamado",
+        key: "fechaProximoLlamado",
+        width: 20,
+      },
+      { header: "Creado", key: "creado", width: 15 },
+      { header: "Última Modificación", key: "ultimaModificacion", width: 20 },
+      { header: "Gestiones", key: "vecesTocada", width: 12 },
+      { header: "Última Gestión", key: "ultimaGestion", width: 18 },
+      { header: "Observaciones", key: "observaciones", width: 30 },
+    ];
+
+    // Formato numérico de dinero
+    const moneyFmt = "#,##0.00";
+    ["importe", "importePagado"].forEach((k) => {
+      const col = worksheet.getColumn(k);
+      col.numFmt = moneyFmt;
+      col.alignment = { horizontal: "right" };
+    });
+
+    // Normaliza a número (acepta "7,2" -> 7.2, etc.)
+    const toNumber = (v) => {
+      if (v === null || v === undefined) return 0;
+      if (typeof v === "number") return v;
+      if (typeof v === "string") {
+        const s = v.replace(/\s/g, "").replace(",", ".");
+        const n = Number(s);
+        return isNaN(n) ? 0 : n;
+      }
+      const n = Number(v);
+      return isNaN(n) ? 0 : n;
+    };
+
+    proyecciones.forEach((p) => {
+      worksheet.addRow({
+        creadoPor: p.empleadoId?.username || "-",
+        dni: p.dni,
+        nombreTitular: p.nombreTitular,
+        importe: toNumber(p.importe),
+        importePagado: toNumber(p.importePagado),
+        estado: p.estado,
+        concepto: p.concepto,
+        entidad: entLabel(p.entidadId?._id || p.entidadId, p.entidadId?.nombre),
+        subCesion: subLabel(p.subCesionId?._id || p.subCesionId, p.subCesionId?.nombre),
+        fechaPromesa: formatearFecha(p.fechaPromesa),
+        fechaProximoLlamado: formatearFecha(p.fechaProximoLlamado),
+        creado: formatearFecha(p.creado),
+        ultimaModificacion: formatearFecha(p.ultimaModificacion),
+        vecesTocada: p.vecesTocada ?? 0,
+        ultimaGestion: formatearFecha(p.ultimaGestion),
+        observaciones: p.observaciones,
+      });
+    });
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      "attachment; filename=proyecciones.xlsx"
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    console.error("❌ Error al exportar Excel:", error);
+    res.status(500).json({ error: "Error al exportar a Excel" });
+  }
+};
+
+
 export const exportarPagosExcel = async (req, res) => {
   try {
     const {
@@ -1570,7 +2149,6 @@ export const exportarPagosExcel = async (req, res) => {
         { nombreTitular: regex },
         { concepto: regex },
         { estado: regex },
-        // Nota: ya no buscamos por 'cartera' ni 'fiduciario'
       ];
       if (!isNaN(posibleDni)) condiciones.push({ dni: posibleDni });
       filtros.push({ $or: condiciones });
@@ -1589,6 +2167,24 @@ export const exportarPagosExcel = async (req, res) => {
     const pagosHasta = rangoHasta;
     const excluirErroneos = String(soloNoErroneos).toLowerCase() === "true";
 
+    // etiquetas: Entidad "n - NOMBRE" / SubCesión "NOMBRE"
+    const buildLabelMaps = async () => {
+      const [ents, subs] = await Promise.all([
+        Entidad.find({}, "nombre").sort({ nombre: 1 }).lean(),
+        SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
+      ]);
+      const entLabelById = new Map(); // id -> "n - NOMBRE"
+      const subNameById = new Map();  // id -> "NOMBRE"
+      ents.forEach((e, i) => entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`));
+      subs.forEach((s) => subNameById.set(String(s._id), s.nombre));
+      const entLabel = (id, fallbackName) =>
+        id ? (entLabelById.get(String(id)) || (fallbackName ? `- ${fallbackName}` : "")) : (fallbackName || "");
+      const subLabel = (id, fallbackName) =>
+        id ? (subNameById.get(String(id)) || (fallbackName || "")) : (fallbackName || "");
+      return { entLabel, subLabel };
+    };
+    const { entLabel, subLabel } = await buildLabelMaps();
+
     // --- armar Excel ---
     const workbook = new ExcelJS.Workbook();
     const ws = workbook.addWorksheet("Pagos informados");
@@ -1596,8 +2192,8 @@ export const exportarPagosExcel = async (req, res) => {
     ws.columns = [
       { header: "Creado por", key: "creadoPor", width: 20 },
       { header: "Estado promesa", key: "estado", width: 18 },
-      { header: "EntidadId", key: "entidadId", width: 26 },
-      { header: "SubCesionId", key: "subCesionId", width: 26 },
+      { header: "Entidad", key: "entidad", width: 26 },     // "n - NOMBRE"
+      { header: "SubCesión", key: "subCesion", width: 26 },  // "NOMBRE"
       { header: "DNI", key: "dni", width: 14 },
       { header: "Titular", key: "titular", width: 24 },
       { header: "Importe promesa", key: "importe", width: 16 },
@@ -1612,8 +2208,8 @@ export const exportarPagosExcel = async (req, res) => {
       const base = {
         creadoPor: p.empleadoId?.username || "-",
         estado: p.estado,
-        entidadId: p.entidadId ? String(p.entidadId) : "",
-        subCesionId: p.subCesionId ? String(p.subCesionId) : "",
+        entidad: entLabel(p.entidadId),
+        subCesion: subLabel(p.subCesionId),
         dni: p.dni,
         titular: p.nombreTitular,
         importe: p.importe,
@@ -1659,465 +2255,7 @@ export const exportarPagosExcel = async (req, res) => {
   }
 };
 
-export const importarPagosMasivo = async (req, res) => {
-  try {
-    // 1) Seguridad por rol (la ruta igual debería tener el middleware)
-    const rol = req.user.role || req.user.rol;
-    if (!["admin", "super-admin"].includes(rol)) {
-      return res.status(403).json({ error: "No autorizado" });
-    }
 
-    // 2) Archivo adjunto
-    if (!req.file || !req.file.buffer) {
-      return res
-        .status(400)
-        .json({ error: "Subí un archivo XLSX (campo: file)" });
-    }
-
-    // 3) Cargar XLSX
-    const wb = new ExcelJS.Workbook();
-    await wb.xlsx.load(req.file.buffer);
-    const ws = wb.worksheets[0];
-    if (!ws) return res.status(400).json({ error: "El archivo no tiene hojas" });
-
-    // ---- Helpers locales ----
-    const norm = (s) =>
-      String(s || "")
-        .normalize("NFD")
-        .replace(/\p{Diacritic}/gu, "")
-        .trim()
-        .toLowerCase();
-
-    const NORM_TXT = (s) => String(s || "").trim().toUpperCase();
-
-    // mapear encabezados de la fila 1
-    const headers = {};
-    ws.getRow(1).eachCell((cell, col) => {
-      const key = norm(cell.value);
-      if (key) headers[key] = col;
-    });
-
-    // Alias aceptados (admite ID o NOMBRE)
-    const aliases = {
-      dni: ["dni", "documento", "doc"],
-      entidadId: ["entidadid", "entidad id", "id entidad", "id_entidad"],
-      subCesionId: [
-        "subcesionid",
-        "subcesion id",
-        "id subcesion",
-        "id_subcesion",
-      ],
-      entidad: ["entidad", "empresa"],
-      subCesion: ["subcesion", "sub-cesion", "sub cesion", "subcesión", "sub cesión"],
-      fecha: ["fecha pago", "fecha", "fecha de pago"],
-      monto: ["monto", "importe", "monto pago", "importe pago"],
-      observacion: ["observacion", "observación", "obs"],
-    };
-
-    const getCol = (logical) => {
-      if (headers[logical]) return headers[logical];
-      for (const alias of aliases[logical] || []) {
-        const k = norm(alias);
-        if (headers[k]) return headers[k];
-      }
-      return null;
-    };
-
-    // Debe venir: DNI, FECHA, MONTO y (ENTIDAD_ID o ENTIDAD) y (SUBCESION_ID o SUBCESION)
-    const faltan = [];
-    if (!getCol("dni")) faltan.push("DNI");
-    if (!getCol("fecha")) faltan.push("FECHA");
-    if (!getCol("monto")) faltan.push("MONTO");
-    if (!getCol("entidadId") && !getCol("entidad")) faltan.push("ENTIDAD_ID o ENTIDAD");
-    if (!getCol("subCesionId") && !getCol("subCesion")) faltan.push("SUBCESION_ID o SUBCESION");
-
-    if (faltan.length) {
-      return res.status(400).json({
-        error: `Faltan columnas: ${faltan.join(", ")}. Requerido: DNI, (EntidadId o Entidad), (SubCesionId o SubCesion), Fecha, Monto`,
-      });
-    }
-
-    // Fecha: número Excel, Date o string (dd/mm/yyyy o ISO)
-    const parseFecha = (v) => {
-      if (v == null) return null;
-      if (v instanceof Date) return v;
-      if (typeof v === "number") {
-        // 25569 = 1970-01-01
-        const ms = (v - 25569) * 86400 * 1000;
-        const d = new Date(ms);
-        return isNaN(d) ? null : d;
-      }
-      const s = String(v).trim();
-      if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) {
-        const [d, m, a] = s.split("/").map(Number);
-        return new Date(a, m - 1, d, 12, 0, 0, 0);
-      }
-      const d2 = new Date(s);
-      return isNaN(d2) ? null : d2;
-    };
-
-    const parseMonto = (v) => {
-      if (v == null) return NaN;
-      if (typeof v === "number") return v;
-      const n = Number(
-        String(v)
-          .replace(/[^\d.,-]/g, "")
-          .replace(",", ".")
-      );
-      return Number.isFinite(n) ? n : NaN;
-    };
-
-    const parseObjectId = (v) => {
-      if (v == null) return null;
-      const s = String(v).trim();
-      return mongoose.Types.ObjectId.isValid(s)
-        ? new mongoose.Types.ObjectId(s)
-        : null;
-    };
-
-    // Cache para no consultar la DB por la misma (dni, entidadId, subCesionId) en cada fila
-    const cacheActivas = new Map();
-    const getActiva = async (dni, entidadId, subCesionId) => {
-      const key = `${dni}::${entidadId}::${subCesionId}`;
-      if (cacheActivas.has(key)) return cacheActivas.get(key);
-      const proy = await Proyeccion.findOne({
-        dni,
-        entidadId,
-        subCesionId,
-        $or: [{ isActiva: true }, { isActiva: { $exists: false } }],
-      });
-      cacheActivas.set(key, proy || null);
-      return proy;
-    };
-
-    // Caches Entidad/SubCesión por nombre
-    const cacheEntPorNombre = new Map(); // NOMBRE→doc/null
-    const cacheSubPorNombre = new Map(); // NOMBRE→doc/null (GLOBAL)
-
-    const buscarEntidadPorNombre = async (nombre) => {
-      if (!nombre) return null;
-      const key = NORM_TXT(nombre);
-      if (cacheEntPorNombre.has(key)) return cacheEntPorNombre.get(key);
-      const ent = await Entidad.findOne({ nombre: key });
-      cacheEntPorNombre.set(key, ent || null);
-      return ent;
-    };
-
-    // 👇 GLOBAL: SubCesión por NOMBRE (no depende de entidad)
-    const buscarOCrearSubPorNombre = async (nombre) => {
-      if (!nombre) return null;
-      const key = NORM_TXT(nombre);
-      if (cacheSubPorNombre.has(key)) return cacheSubPorNombre.get(key);
-      let sub = await SubCesion.findOne({ nombre: key });
-      if (!sub) sub = await SubCesion.create({ nombre: key }); // modelo: { nombre: unique }
-      cacheSubPorNombre.set(key, sub);
-      return sub;
-    };
-
-    // Duplicado: mismo día y mismo monto (no erróneo)
-    const esDuplicado = (proy, fechaJS, montoNum) => {
-      const y = fechaJS.getFullYear();
-      const m = fechaJS.getMonth();
-      const d = fechaJS.getDate();
-      return (proy.pagosInformados || []).some((p) => {
-        if (p.erroneo) return false;
-        const pf = new Date(p.fecha);
-        return (
-          pf.getFullYear() === y &&
-          pf.getMonth() === m &&
-          pf.getDate() === d &&
-          Number(p.monto || 0) === Number(montoNum)
-        );
-      });
-    };
-
-    const errores = [];
-    let ok = 0;
-
-    // ---- Recorrer filas (desde 2) ----
-    for (let i = 2; i <= ws.rowCount; i++) {
-      const row = ws.getRow(i);
-
-      const getCell = (logical) => {
-        const col = getCol(logical);
-        return col ? row.getCell(col).value : undefined;
-      };
-
-      const rawDni   = getCell("dni");
-      const rawEntId = getCell("entidadId");
-      const rawSubId = getCell("subCesionId");
-      const rawEntNm = getCell("entidad");
-      const rawSubNm = getCell("subCesion");
-      const rawFec   = getCell("fecha");
-      const rawMon   = getCell("monto");
-      const rawObs   = getCell("observacion");
-
-      const dni = Number(String(rawDni || "").replace(/\D/g, ""));
-      let entidadId   = parseObjectId(rawEntId);
-      let subCesionId = parseObjectId(rawSubId);
-      const fechaJS   = parseFecha(rawFec);
-      const montoNum  = parseMonto(rawMon);
-
-      // Resolver ENTIDAD por NOMBRE cuando no hay ID
-      if (!entidadId && rawEntNm) {
-        const ent = await buscarEntidadPorNombre(rawEntNm);
-        if (!ent) {
-          errores.push({
-            fila: i,
-            dni: Number.isFinite(dni) ? dni : String(rawDni ?? ""),
-            entidadId: String(rawEntNm ?? ""),
-            subCesionId: String(rawSubNm ?? ""),
-            fecha: String(rawFec ?? ""),
-            monto: String(rawMon ?? ""),
-            error: `Entidad "${rawEntNm}" inexistente (no se crea automáticamente)`,
-          });
-          continue;
-        }
-        entidadId = ent._id;
-      }
-
-      // Resolver SUBCESIÓN por NOMBRE (GLOBAL) cuando no hay ID
-      if (!subCesionId && rawSubNm) {
-        const sub = await buscarOCrearSubPorNombre(rawSubNm); // crea si falta
-        subCesionId = sub ? sub._id : null;
-      }
-
-      // Validaciones por fila
-      const rowErr = [];
-      if (!Number.isFinite(dni) || dni <= 0) rowErr.push("DNI inválido");
-      if (!entidadId) rowErr.push("Entidad inválida/ausente (por ID o NOMBRE)");
-      if (!subCesionId) rowErr.push("SubCesión inválida/ausente (por ID o NOMBRE)");
-      if (!fechaJS || isNaN(fechaJS)) rowErr.push("Fecha inválida");
-      if (!Number.isFinite(montoNum) || montoNum <= 0) rowErr.push("Monto inválido");
-
-      if (rowErr.length) {
-        errores.push({
-          fila: i,
-          dni: Number.isFinite(dni) ? dni : String(rawDni ?? ""),
-          entidadId: entidadId ? String(entidadId) : String(rawEntId ?? rawEntNm ?? ""),
-          subCesionId: subCesionId ? String(subCesionId) : String(rawSubId ?? rawSubNm ?? ""),
-          fecha: String(rawFec ?? ""),
-          monto: String(rawMon ?? ""),
-          error: rowErr.join(" | "),
-        });
-        continue;
-      }
-
-      // Buscar proyección activa por (dni, entidadId, subCesionId)
-      const proy = await getActiva(dni, entidadId, subCesionId);
-      if (!proy) {
-        errores.push({
-          fila: i,
-          dni,
-          entidadId: String(entidadId),
-          subCesionId: String(subCesionId),
-          fecha: fechaJS.toISOString().slice(0, 10),
-          monto: montoNum,
-          error: "No existe promesa activa para DNI + Entidad + SubCesión",
-        });
-        continue;
-      }
-
-      // Duplicado
-      if (esDuplicado(proy, fechaJS, montoNum)) {
-        errores.push({
-          fila: i,
-          dni,
-          entidadId: String(entidadId),
-          subCesionId: String(subCesionId),
-          fecha: fechaJS.toISOString().slice(0, 10),
-          monto: montoNum,
-          error: "Pago duplicado (mismo día y monto ya cargado)",
-        });
-        continue;
-      }
-
-      // Insertar pago informado (NO descuenta deuda real)
-      proy.pagosInformados = proy.pagosInformados || [];
-      proy.pagosInformados.push({
-        fecha: fechaJS,
-        monto: montoNum,
-        operadorId: req.user.id, // quién importó
-        visto: false,
-        erroneo: false,
-        observacion: rawObs ? String(rawObs) : undefined,
-      });
-
-      // Recalcular importePagado solo con NO erróneos
-      proy.importePagado = recalcularImportePagado(proy);
-      proy.ultimaModificacion = new Date();
-
-      await proy.save();
-      await actualizarEstadoAutomaticamente(proy);
-
-      ok++;
-    }
-
-    // ---- Respuesta según errores ----
-    if (errores.length > 0) {
-      const wbErr = new ExcelJS.Workbook();
-      const wsErr = wbErr.addWorksheet("Errores");
-      wsErr.columns = [
-        { header: "Fila", key: "fila", width: 8 },
-        { header: "DNI", key: "dni", width: 14 },
-        { header: "EntidadId", key: "entidadId", width: 26 },
-        { header: "SubCesionId", key: "subCesionId", width: 26 },
-        { header: "Fecha", key: "fecha", width: 14 },
-        { header: "Monto", key: "monto", width: 14 },
-        { header: "Error", key: "error", width: 60 },
-      ];
-      errores.forEach((e) => wsErr.addRow(e));
-
-      res.setHeader(
-        "Content-Type",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-      );
-      res.setHeader(
-        "Content-Disposition",
-        'attachment; filename="errores_importacion_pagos.xlsx"'
-      );
-      // 200 con attachment (el front detecta por content-type)
-      await wbErr.xlsx.write(res);
-      return res.end();
-    }
-
-    // ✅ OK total
-    return res.status(200).json({
-      ok: true,
-      procesados: ok,
-      mensaje: `Pagos importados correctamente: ${ok}`,
-    });
-  } catch (e) {
-    console.error("❌ importarPagosMasivo:", e);
-    return res.status(500).json({ error: "Error al importar pagos" });
-  }
-};
-
-
-// Limpiar pagos informados de una proyección
-export const limpiarPagosProyeccion = async (req, res) => {
-  try {
-    const proyeccion = await Proyeccion.findById(req.params.id);
-    if (!proyeccion) {
-      return res.status(404).json({ error: "Proyección no encontrada" });
-    }
-
-    // 🔒 Bloqueo: no permitir limpiar pagos en cuentas cerradas
-    const cerrada =
-      proyeccion.isActiva === false ||
-      /^Cerrada/.test(String(proyeccion.estado || ""));
-    if (cerrada) {
-      return res.status(409).json({
-        error: "La proyección está cerrada: no se pueden limpiar pagos.",
-      });
-    }
-
-    const rol = rolDe(req);
-
-    // Asegurar array
-    proyeccion.pagosInformados = proyeccion.pagosInformados || [];
-
-    if (esOperativo(req)) {
-      // Operador: limpia SOLO sus propios pagos
-      proyeccion.pagosInformados = proyeccion.pagosInformados.filter(
-        (p) => String(p.operadorId) !== String(req.user.id)
-      );
-    } else if (esSuper(req)) {
-      // Admin / Super-admin: limpia TODOS los pagos
-      proyeccion.pagosInformados = [];
-    } else {
-      // Otros roles no permitidos
-      return res
-        .status(403)
-        .json({ error: "No autorizado para limpiar pagos" });
-    }
-
-    // Recalcular importePagado a partir de pagos NO erróneos
-    proyeccion.importePagado = recalcularImportePagado(proyeccion);
-    proyeccion.ultimaModificacion = new Date();
-
-    await proyeccion.save();
-    await actualizarEstadoAutomaticamente(proyeccion);
-
-    // Devolver proyección actualizada con datos útiles
-    const actualizado = await Proyeccion.findById(proyeccion._id)
-      .populate("empleadoId", "username")
-      .populate("pagosInformados.operadorId", "username");
-
-    return res.json({
-      ok: true,
-      mensaje:
-        rol === "operador"
-          ? "Pagos del operador actual limpiados correctamente"
-          : "Se limpiaron todos los pagos informados",
-      proyeccion: actualizado?.toObject?.() || actualizado,
-    });
-  } catch (err) {
-    console.error("Error al limpiar pagos:", err);
-    return res.status(500).json({ error: "Error interno al limpiar pagos" });
-  }
-};
-
-// Limpiar observaciones de una proyección
-export const limpiarObservacionesProyeccion = async (req, res) => {
-  try {
-    const proyeccion = await Proyeccion.findById(req.params.id);
-    if (!proyeccion) {
-      return res.status(404).json({ error: "Proyección no encontrada" });
-    }
-
-    // 🔒 Bloqueo: no permitir modificar cuentas cerradas
-    const cerrada =
-      proyeccion.isActiva === false ||
-      /^Cerrada/.test(String(proyeccion.estado || ""));
-    if (cerrada) {
-      return res.status(409).json({
-        error:
-          "La proyección está cerrada: no se pueden limpiar observaciones.",
-      });
-    }
-
-    // 👤 Permisos
-    if (esAdmin(req)) {
-      return res.status(403).json({ error: "Sin acceso" });
-    }
-    if (
-      esOperativo(req) &&
-      String(proyeccion.empleadoId) !== String(req.user.id)
-    ) {
-      return res
-        .status(403)
-        .json({ error: "No autorizado para limpiar observaciones" });
-    }
-    if (!esOperativo(req) && !esSuper(req)) {
-      return res.status(403).json({ error: "Rol no autorizado" });
-    }
-
-    // 🧹 Limpieza
-    proyeccion.observaciones = "";
-    proyeccion.ultimaModificacion = new Date();
-    await proyeccion.save();
-
-    // devolver proyección actualizada (con datos útiles)
-    const actualizado = await Proyeccion.findById(proyeccion._id).populate(
-      "empleadoId",
-      "username"
-    );
-
-    return res.json({
-      ok: true,
-      mensaje: "Observaciones limpiadas",
-      proyeccion: actualizado?.toObject?.() || actualizado,
-    });
-  } catch (err) {
-    console.error("Error al limpiar observaciones:", err);
-    return res
-      .status(500)
-      .json({ error: "Error interno al limpiar observaciones" });
-  }
-};
-
-// Importar proyecciones (masivo) — SOLO super-admin
 export const importarProyeccionesMasivo = async (req, res) => {
   try {
     if (!esSuper(req)) {
@@ -2181,6 +2319,14 @@ export const importarProyeccionesMasivo = async (req, res) => {
       return undefined;
     };
 
+    // helper: quitar prefijo "n - " de selects
+    const parseSelectLabel = (v) => {
+      if (v == null) return "";
+      const s = String(v).trim();
+      const m = s.match(/^\s*(?:[0-9a-f]{24}|\d+)\s*-\s*(.+)$/i);
+      return (m ? m[1] : s).trim();
+    };
+
     // Parsear filas
     const rows = [];
     ws.eachRow((row, rowNumber) => {
@@ -2224,7 +2370,7 @@ export const importarProyeccionesMasivo = async (req, res) => {
     const cacheEntidades = new Map(); // nombre → doc
     const cacheSubs = new Map();      // nombre → doc  (GLOBAL por nombre)
 
-    // 🔎 Entidad: NO crear si no existe
+    // Entidad: NO crear si no existe
     const getEntidad = async (nombre) => {
       const key = normTxt(nombre);
       if (cacheEntidades.has(key)) return cacheEntidades.get(key);
@@ -2233,12 +2379,12 @@ export const importarProyeccionesMasivo = async (req, res) => {
       return ent;
     };
 
-    // ✅ SubCesión GLOBAL por nombre (tu modelo) — crea si no existe
+    // SubCesión GLOBAL por nombre — crea si no existe
     const getSubCesion = async (nombre) => {
       const key = normTxt(nombre);
       if (cacheSubs.has(key)) return cacheSubs.get(key);
       let sub = await SubCesion.findOne({ nombre: key });
-      if (!sub) sub = await SubCesion.create({ nombre: key }); // el modelo tiene unique:true en nombre
+      if (!sub) sub = await SubCesion.create({ nombre: key }); // unique:true en nombre
       cacheSubs.set(key, sub);
       return sub;
     };
@@ -2263,8 +2409,8 @@ export const importarProyeccionesMasivo = async (req, res) => {
     for (const r of rows) {
       const fila = r.rowNumber;
       try {
-        const entidadNombre = getField(r, ENTIDAD_KEYS);
-        const subNombre = getField(r, SUBCESION_KEYS);
+        const entidadNombre = parseSelectLabel(getField(r, ENTIDAD_KEYS));
+        const subNombre = parseSelectLabel(getField(r, SUBCESION_KEYS));
         const concepto = String(r["CONCEPTO"] || "").trim();
         const dniRaw = String(r["DNI"] || "").trim();
         const nombre = String(r["NOMBRE"] || "").trim();
@@ -2311,7 +2457,7 @@ export const importarProyeccionesMasivo = async (req, res) => {
           throw new Error(`Entidad "${entidadNombre}" inexistente (debe crearse previamente)`);
         }
 
-        // 🔑 SubCesión GLOBAL (por nombre)
+        // SubCesión GLOBAL (por nombre)
         const sub = await getSubCesion(subNombre);
 
         const anio = fechaProm.getFullYear();
@@ -2483,6 +2629,3 @@ export const importarProyeccionesMasivo = async (req, res) => {
     res.status(500).json({ error: "Error interno al importar proyecciones" });
   }
 };
-
-
-
