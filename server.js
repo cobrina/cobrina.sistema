@@ -38,7 +38,7 @@ const corsOptions = {
     const whitelist = [
       "http://localhost:5173",
       "https://cobrina-rdc.netlify.app",
-      "https://rdccollections-production.up.railway.app",
+      "https://cobrina-backend-eue8.onrender.com",
     ];
     // Permitir herramientas sin origin (curl/Postman) o los orígenes de la lista
     if (!origin || whitelist.includes(origin)) {
@@ -101,7 +101,7 @@ app.use("/usuarios", usuarioRoutes);
 app.use("/colchon", colchonRoutes);
 app.use("/subcesiones", subcesionRoutes); // ✅ NUEVA RUTA ACTIVA
 app.use("/entidades", entidadRoutes); // ✅
-app.use("/api/stickies", stickiesRoutes);
+app.use("/stickies", stickiesRoutes);
 
 // 🔵 Ruta de prueba
 app.get("/", (req, res) => {
