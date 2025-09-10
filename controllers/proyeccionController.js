@@ -27,7 +27,7 @@ const parseSelectLabel = (v) => {
 
 const toISODate = (v) => {
   const d = parseExcelDate(v);
-  return d ? d.toISOString().slice(0, 10) : (v == null ? "" : String(v));
+  return d ? d.toISOString().slice(0, 10) : v == null ? "" : String(v);
 };
 
 const buildLabelMaps = async () => {
@@ -37,12 +37,22 @@ const buildLabelMaps = async () => {
   ]);
   const entLabelById = new Map();
   const subLabelById = new Map();
-  ents.forEach((e, i) => entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`));
-  subs.forEach((s, i) => subLabelById.set(String(s._id), `${i + 1} - ${s.nombre}`));
+  ents.forEach((e, i) =>
+    entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`)
+  );
+  subs.forEach((s, i) =>
+    subLabelById.set(String(s._id), `${i + 1} - ${s.nombre}`)
+  );
   const entLabel = (id, fallbackName) =>
-    id ? (entLabelById.get(String(id)) || (fallbackName ? `- ${fallbackName}` : "")) : (fallbackName || "");
+    id
+      ? entLabelById.get(String(id)) ||
+        (fallbackName ? `- ${fallbackName}` : "")
+      : fallbackName || "";
   const subLabel = (id, fallbackName) =>
-    id ? (subLabelById.get(String(id)) || (fallbackName ? `- ${fallbackName}` : "")) : (fallbackName || "");
+    id
+      ? subLabelById.get(String(id)) ||
+        (fallbackName ? `- ${fallbackName}` : "")
+      : fallbackName || "";
   return { entLabel, subLabel, entLabelById, subLabelById };
 };
 
@@ -318,6 +328,7 @@ export const crearProyeccion = async (req, res) => {
 };
 
 // 2. Obtener proyecciones propias
+// 2. Obtener proyecciones propias
 export const obtenerProyeccionesPropias = async (req, res) => {
   try {
     if (esAdmin(req)) return res.status(403).json({ error: "Sin acceso" });
@@ -336,16 +347,22 @@ export const obtenerProyeccionesPropias = async (req, res) => {
       .lean();
 
     const resultados = docs.map((p) => {
-      const estadoVista = (typeof clasificarEstado === "function" && p.fechaPromesa)
-        ? clasificarEstado(new Date(p.fechaPromesa))
-        : p.estado;
+      // Si está Pagado / Pagado parcial / Cerrada*, mostramos ese estado tal cual.
+      // Si no, calculamos una vista por fecha (opcional) sin tocar `estado`.
+      const esEstadoFijo =
+        /^Pagado(?: parcial)?$/i.test(p.estado || "") || /^Cerrada/i.test(p.estado || "");
+      const estadoVista = esEstadoFijo
+        ? p.estado
+        : (typeof clasificarEstado === "function" && p.fechaPromesa
+            ? clasificarEstado(new Date(p.fechaPromesa))
+            : p.estado);
 
       return {
-        ...p,
+        ...p, // ← incluye `estado` tal como está guardado en BD
         empleadoUsername: p?.empleadoId?.username || "-",
         entidadNombre: p?.entidadId?.nombre || "-",
         subCesionNombre: p?.subCesionId?.nombre || "-",
-        estado: estadoVista,
+        estadoVista, // ← opcional para UI
       };
     });
 
@@ -646,8 +663,7 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
       anio,
       promesaHoy,
       llamadoHoy,
-      // NUEVO
-      sinGestion,
+      sinGestion, // opcional
     } = req.query;
 
     const filtros = [];
@@ -668,7 +684,7 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
     if (mes) filtros.push({ mes: parseInt(mes) });
     if (anio) filtros.push({ anio: parseInt(anio) });
 
-    // Filtro "Sin gestión"
+    // Sin gestión
     if (sinGestion === "true") {
       filtros.push({
         $or: [
@@ -680,30 +696,19 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
     }
 
     // Hoy (promesas y llamados)
-    const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
-    const mañana = new Date(hoy); mañana.setDate(hoy.getDate() + 1);
-
-    if (promesaHoy === "true") {
-      filtros.push({ fechaPromesa: { $gte: hoy, $lt: mañana } });
-    }
-    if (llamadoHoy === "true") {
-      filtros.push({ fechaProximoLlamado: { $gte: hoy, $lt: mañana } });
-    }
+    const hoy = new Date();
+    hoy.setHours(0, 0, 0, 0);
+    const mañana = new Date(hoy);
+    mañana.setDate(hoy.getDate() + 1);
+    if (promesaHoy === "true") filtros.push({ fechaPromesa: { $gte: hoy, $lt: mañana } });
+    if (llamadoHoy === "true") filtros.push({ fechaProximoLlamado: { $gte: hoy, $lt: mañana } });
 
     // Rango por tipoFecha
-    if (
-      fechaDesde && fechaHasta &&
-      !isNaN(Date.parse(fechaDesde)) &&
-      !isNaN(Date.parse(fechaHasta))
-    ) {
+    if (fechaDesde && fechaHasta && !isNaN(Date.parse(fechaDesde)) && !isNaN(Date.parse(fechaHasta))) {
       const inicio = crearFechaLocal(fechaDesde);
       const fin = crearFechaLocal(fechaHasta, true);
-      const campoFecha = {
-        fechaPromesa: "fechaPromesa",
-        creado: "creado",
-        modificado: "ultimaModificacion",
-      }[tipoFecha || "fechaPromesa"];
-      if (campoFecha) filtros.push({ [campoFecha]: { $gte: inicio, $lte: fin } });
+      const campoFecha = ({ fechaPromesa: "fechaPromesa", creado: "creado", modificado: "ultimaModificacion" }[tipoFecha]) || "fechaPromesa";
+      filtros.push({ [campoFecha]: { $gte: inicio, $lte: fin } });
     }
 
     // Búsqueda libre
@@ -725,13 +730,12 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
     const sortObj = {};
     if (ordenPor) sortObj[ordenPor] = orden === "asc" ? 1 : -1;
 
-    // Campos mínimos para la grilla
     const campos =
       "empleadoId dni nombreTitular importe importePagado estado concepto " +
       "entidadId subCesionId fechaPromesa fechaProximoLlamado creado ultimaModificacion " +
       "vecesTocada ultimaGestion observaciones";
 
-    // Búsqueda rápida con populate + lean (SIN guardar)
+    // Traemos con nombres ya resueltos
     const docs = await Proyeccion.find(query)
       .select(campos)
       .populate("empleadoId", "username")
@@ -742,21 +746,21 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
       .limit(pageSize)
       .lean();
 
-    // Estado “en caliente” (sin persistir) y nombres listos para la tabla
-    const hoyRef = new Date(); hoyRef.setHours(0,0,0,0);
     const resultados = docs.map((p) => {
-      // si tenés helper clasificarEstado, lo usamos; si no, se cae al estado guardado
-      const estadoVista = (typeof clasificarEstado === "function" && p.fechaPromesa)
-        ? clasificarEstado(new Date(p.fechaPromesa))
-        : p.estado;
+      const esEstadoFijo =
+        /^Pagado(?: parcial)?$/i.test(p.estado || "") || /^Cerrada/i.test(p.estado || "");
+      const estadoVista = esEstadoFijo
+        ? p.estado
+        : (typeof clasificarEstado === "function" && p.fechaPromesa
+            ? clasificarEstado(new Date(p.fechaPromesa))
+            : p.estado);
 
       return {
-        ...p,
+        ...p, // ← `estado` queda intacto (lo que guardaste después del pago)
         empleadoUsername: p?.empleadoId?.username || "-",
         entidadNombre: p?.entidadId?.nombre || "-",
         subCesionNombre: p?.subCesionId?.nombre || "-",
-        // opcional: si querés mostrar distinto sin tocar el guardado
-        estado: estadoVista,
+        estadoVista, // ← opcional para UI
       };
     });
 
@@ -836,9 +840,6 @@ export const obtenerEstadisticasAdmin = async (req, res) => {
     res.status(500).json({ error: "Error al calcular estadísticas globales" });
   }
 };
-
-
-
 
 export const obtenerResumenGlobal = async (req, res) => {
   try {
@@ -1278,7 +1279,6 @@ export const informarPago = async (req, res) => {
   }
 };
 
-
 export const listarPagosInformados = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1379,14 +1379,6 @@ export const marcarPagoErroneo = async (req, res) => {
     return res.status(500).json({ error: "No se pudo marcar el pago" });
   }
 };
-
-
-
-
-
-
-
-
 
 export const limpiarPagosProyeccion = async (req, res) => {
   try {
@@ -1509,9 +1501,6 @@ export const limpiarObservacionesProyeccion = async (req, res) => {
   }
 };
 
-
-
-
 export const importarPagosMasivo = async (req, res) => {
   try {
     // 1) Seguridad por rol (la ruta igual debería tener el middleware)
@@ -1531,7 +1520,8 @@ export const importarPagosMasivo = async (req, res) => {
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(req.file.buffer);
     const ws = wb.worksheets[0];
-    if (!ws) return res.status(400).json({ error: "El archivo no tiene hojas" });
+    if (!ws)
+      return res.status(400).json({ error: "El archivo no tiene hojas" });
 
     // ==== Helpers locales ====
     const norm = (s) =>
@@ -1541,7 +1531,10 @@ export const importarPagosMasivo = async (req, res) => {
         .trim()
         .toLowerCase();
 
-    const NORM_TXT = (s) => String(s || "").trim().toUpperCase();
+    const NORM_TXT = (s) =>
+      String(s || "")
+        .trim()
+        .toUpperCase();
 
     // quita prefijos "123 - " o "66f0... - " → queda NOMBRE
     const parseSelectLabel = (v) => {
@@ -1568,7 +1561,7 @@ export const importarPagosMasivo = async (req, res) => {
         const d2 = new Date(s);
         return isNaN(d2) ? null : d2;
       })();
-      return d ? d.toISOString().slice(0, 10) : (v == null ? "" : String(v));
+      return d ? d.toISOString().slice(0, 10) : v == null ? "" : String(v);
     };
 
     // etiquetas: Entidad "n - NOMBRE" / SubCesión "NOMBRE"
@@ -1578,13 +1571,20 @@ export const importarPagosMasivo = async (req, res) => {
         SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
       ]);
       const entLabelById = new Map(); // id -> "n - NOMBRE"
-      const subNameById = new Map();  // id -> "NOMBRE"
-      ents.forEach((e, i) => entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`));
+      const subNameById = new Map(); // id -> "NOMBRE"
+      ents.forEach((e, i) =>
+        entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`)
+      );
       subs.forEach((s) => subNameById.set(String(s._id), s.nombre));
       const entLabel = (id, fallbackName) =>
-        id ? (entLabelById.get(String(id)) || (fallbackName ? `- ${fallbackName}` : "")) : (fallbackName || "");
+        id
+          ? entLabelById.get(String(id)) ||
+            (fallbackName ? `- ${fallbackName}` : "")
+          : fallbackName || "";
       const subLabel = (id, fallbackName) =>
-        id ? (subNameById.get(String(id)) || (fallbackName || "")) : (fallbackName || "");
+        id
+          ? subNameById.get(String(id)) || fallbackName || ""
+          : fallbackName || "";
       return { entLabel, subLabel };
     };
     const { entLabel, subLabel } = await buildLabelMaps();
@@ -1607,7 +1607,13 @@ export const importarPagosMasivo = async (req, res) => {
         "id_subcesion",
       ],
       entidad: ["entidad", "empresa"],
-      subCesion: ["subcesion", "sub-cesion", "sub cesion", "subcesión", "sub cesión"],
+      subCesion: [
+        "subcesion",
+        "sub-cesion",
+        "sub cesion",
+        "subcesión",
+        "sub cesión",
+      ],
       fecha: ["fecha pago", "fecha", "fecha de pago"],
       monto: ["monto", "importe", "monto pago", "importe pago"],
       observacion: ["observacion", "observación", "obs"],
@@ -1615,7 +1621,7 @@ export const importarPagosMasivo = async (req, res) => {
 
     const getCol = (logical) => {
       if (headers[logical]) return headers[logical];
-      for (const alias of (aliases[logical] || [])) {
+      for (const alias of aliases[logical] || []) {
         const k = norm(alias);
         if (headers[k]) return headers[k];
       }
@@ -1627,12 +1633,16 @@ export const importarPagosMasivo = async (req, res) => {
     if (!getCol("dni")) faltan.push("DNI");
     if (!getCol("fecha")) faltan.push("FECHA");
     if (!getCol("monto")) faltan.push("MONTO");
-    if (!getCol("entidadId") && !getCol("entidad")) faltan.push("ENTIDAD_ID o ENTIDAD");
-    if (!getCol("subCesionId") && !getCol("subCesion")) faltan.push("SUBCESION_ID o SUBCESION");
+    if (!getCol("entidadId") && !getCol("entidad"))
+      faltan.push("ENTIDAD_ID o ENTIDAD");
+    if (!getCol("subCesionId") && !getCol("subCesion"))
+      faltan.push("SUBCESION_ID o SUBCESION");
 
     if (faltan.length) {
       return res.status(400).json({
-        error: `Faltan columnas: ${faltan.join(", ")}. Requerido: DNI, (EntidadId o Entidad), (SubCesionId o SubCesion), Fecha, Monto`,
+        error: `Faltan columnas: ${faltan.join(
+          ", "
+        )}. Requerido: DNI, (EntidadId o Entidad), (SubCesionId o SubCesion), Fecha, Monto`,
       });
     }
 
@@ -1741,20 +1751,20 @@ export const importarPagosMasivo = async (req, res) => {
         return col ? row.getCell(col).value : undefined;
       };
 
-      const rawDni   = getCell("dni");
+      const rawDni = getCell("dni");
       const rawEntId = getCell("entidadId");
       const rawSubId = getCell("subCesionId");
       const rawEntNm = parseSelectLabel(getCell("entidad"));
       const rawSubNm = parseSelectLabel(getCell("subCesion"));
-      const rawFec   = getCell("fecha");
-      const rawMon   = getCell("monto");
-      const rawObs   = getCell("observacion");
+      const rawFec = getCell("fecha");
+      const rawMon = getCell("monto");
+      const rawObs = getCell("observacion");
 
       const dni = Number(String(rawDni || "").replace(/\D/g, ""));
-      let entidadId   = parseObjectId(rawEntId);
+      let entidadId = parseObjectId(rawEntId);
       let subCesionId = parseObjectId(rawSubId);
-      const fechaJS   = parseFecha(rawFec);
-      const montoNum  = parseMonto(rawMon);
+      const fechaJS = parseFecha(rawFec);
+      const montoNum = parseMonto(rawMon);
 
       // Resolver ENTIDAD por NOMBRE cuando no hay ID
       if (!entidadId && rawEntNm) {
@@ -1784,16 +1794,22 @@ export const importarPagosMasivo = async (req, res) => {
       const rowErr = [];
       if (!Number.isFinite(dni) || dni <= 0) rowErr.push("DNI inválido");
       if (!entidadId) rowErr.push("Entidad inválida/ausente (por ID o NOMBRE)");
-      if (!subCesionId) rowErr.push("SubCesión inválida/ausente (por ID o NOMBRE)");
+      if (!subCesionId)
+        rowErr.push("SubCesión inválida/ausente (por ID o NOMBRE)");
       if (!fechaJS || isNaN(fechaJS)) rowErr.push("Fecha inválida");
-      if (!Number.isFinite(montoNum) || montoNum <= 0) rowErr.push("Monto inválido");
+      if (!Number.isFinite(montoNum) || montoNum <= 0)
+        rowErr.push("Monto inválido");
 
       if (rowErr.length) {
         errores.push({
           fila: i,
           dni: Number.isFinite(dni) ? dni : String(rawDni ?? ""),
-          entidad: entidadId ? entLabel(entidadId) : (rawEntNm || String(rawEntId || "")),
-          subCesion: subCesionId ? subLabel(subCesionId) : (rawSubNm || String(rawSubId || "")),
+          entidad: entidadId
+            ? entLabel(entidadId)
+            : rawEntNm || String(rawEntId || ""),
+          subCesion: subCesionId
+            ? subLabel(subCesionId)
+            : rawSubNm || String(rawSubId || ""),
           fecha: toISODate(rawFec),
           monto: String(rawMon ?? ""),
           error: rowErr.join(" | "),
@@ -1891,7 +1907,6 @@ export const importarPagosMasivo = async (req, res) => {
   }
 };
 
-
 export const exportarProyeccionesExcel = async (req, res) => {
   try {
     const {
@@ -1921,13 +1936,20 @@ export const exportarProyeccionesExcel = async (req, res) => {
         SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
       ]);
       const entLabelById = new Map(); // id -> "n - NOMBRE"
-      const subNameById = new Map();  // id -> "NOMBRE"
-      ents.forEach((e, i) => entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`));
+      const subNameById = new Map(); // id -> "NOMBRE"
+      ents.forEach((e, i) =>
+        entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`)
+      );
       subs.forEach((s) => subNameById.set(String(s._id), s.nombre));
       const entLabel = (id, fallbackName) =>
-        id ? (entLabelById.get(String(id)) || (fallbackName ? `- ${fallbackName}` : "")) : (fallbackName || "");
+        id
+          ? entLabelById.get(String(id)) ||
+            (fallbackName ? `- ${fallbackName}` : "")
+          : fallbackName || "";
       const subLabel = (id, fallbackName) =>
-        id ? (subNameById.get(String(id)) || (fallbackName || "")) : (fallbackName || "");
+        id
+          ? subNameById.get(String(id)) || fallbackName || ""
+          : fallbackName || "";
       return { entLabel, subLabel };
     };
     const { entLabel, subLabel } = await buildLabelMaps();
@@ -2055,7 +2077,10 @@ export const exportarProyeccionesExcel = async (req, res) => {
         estado: p.estado,
         concepto: p.concepto,
         entidad: entLabel(p.entidadId?._id || p.entidadId, p.entidadId?.nombre),
-        subCesion: subLabel(p.subCesionId?._id || p.subCesionId, p.subCesionId?.nombre),
+        subCesion: subLabel(
+          p.subCesionId?._id || p.subCesionId,
+          p.subCesionId?.nombre
+        ),
         fechaPromesa: formatearFecha(p.fechaPromesa),
         fechaProximoLlamado: formatearFecha(p.fechaProximoLlamado),
         creado: formatearFecha(p.creado),
@@ -2082,7 +2107,6 @@ export const exportarProyeccionesExcel = async (req, res) => {
     res.status(500).json({ error: "Error al exportar a Excel" });
   }
 };
-
 
 export const exportarPagosExcel = async (req, res) => {
   try {
@@ -2174,13 +2198,20 @@ export const exportarPagosExcel = async (req, res) => {
         SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
       ]);
       const entLabelById = new Map(); // id -> "n - NOMBRE"
-      const subNameById = new Map();  // id -> "NOMBRE"
-      ents.forEach((e, i) => entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`));
+      const subNameById = new Map(); // id -> "NOMBRE"
+      ents.forEach((e, i) =>
+        entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`)
+      );
       subs.forEach((s) => subNameById.set(String(s._id), s.nombre));
       const entLabel = (id, fallbackName) =>
-        id ? (entLabelById.get(String(id)) || (fallbackName ? `- ${fallbackName}` : "")) : (fallbackName || "");
+        id
+          ? entLabelById.get(String(id)) ||
+            (fallbackName ? `- ${fallbackName}` : "")
+          : fallbackName || "";
       const subLabel = (id, fallbackName) =>
-        id ? (subNameById.get(String(id)) || (fallbackName || "")) : (fallbackName || "");
+        id
+          ? subNameById.get(String(id)) || fallbackName || ""
+          : fallbackName || "";
       return { entLabel, subLabel };
     };
     const { entLabel, subLabel } = await buildLabelMaps();
@@ -2192,8 +2223,8 @@ export const exportarPagosExcel = async (req, res) => {
     ws.columns = [
       { header: "Creado por", key: "creadoPor", width: 20 },
       { header: "Estado promesa", key: "estado", width: 18 },
-      { header: "Entidad", key: "entidad", width: 26 },     // "n - NOMBRE"
-      { header: "SubCesión", key: "subCesion", width: 26 },  // "NOMBRE"
+      { header: "Entidad", key: "entidad", width: 26 }, // "n - NOMBRE"
+      { header: "SubCesión", key: "subCesion", width: 26 }, // "NOMBRE"
       { header: "DNI", key: "dni", width: 14 },
       { header: "Titular", key: "titular", width: 24 },
       { header: "Importe promesa", key: "importe", width: 16 },
@@ -2255,7 +2286,6 @@ export const exportarPagosExcel = async (req, res) => {
   }
 };
 
-
 export const importarProyeccionesMasivo = async (req, res) => {
   try {
     if (!esSuper(req)) {
@@ -2279,7 +2309,9 @@ export const importarProyeccionesMasivo = async (req, res) => {
     ws.getRow(1).eachCell((cell, colNumber) => {
       headerMap.set(
         colNumber,
-        String(cell.value || "").trim().toUpperCase()
+        String(cell.value || "")
+          .trim()
+          .toUpperCase()
       );
     });
 
@@ -2287,7 +2319,12 @@ export const importarProyeccionesMasivo = async (req, res) => {
     const headersPresent = new Set(Array.from(headerMap.values()));
     const ENTIDAD_KEYS = ["ENTIDAD", "EMPRESA"];
     const SUBCESION_KEYS = [
-      "SUBCESION", "SUBCESIÓN", "SUB CESION", "SUB CESIÓN", "SUB-CESION", "SUB-CESIÓN",
+      "SUBCESION",
+      "SUBCESIÓN",
+      "SUB CESION",
+      "SUB CESIÓN",
+      "SUB-CESION",
+      "SUB-CESIÓN",
     ];
 
     const hasEntidad = ENTIDAD_KEYS.some((k) => headersPresent.has(k));
@@ -2311,7 +2348,14 @@ export const importarProyeccionesMasivo = async (req, res) => {
 
     // Opcional: columna de asignación de empleado
     const CANDIDATOS_EMPLEADO = new Set([
-      "EMPLEADO","USUARIO","OPERADOR","ASIGNADO A","ASIGNADO_A","ASIGNADO","CREADO POR","CREADO_POR",
+      "EMPLEADO",
+      "USUARIO",
+      "OPERADOR",
+      "ASIGNADO A",
+      "ASIGNADO_A",
+      "ASIGNADO",
+      "CREADO POR",
+      "CREADO_POR",
     ]);
 
     const getField = (obj, variants) => {
@@ -2349,10 +2393,20 @@ export const importarProyeccionesMasivo = async (req, res) => {
     // Empleados
     const empleados = await Empleado.find({}, "username email").lean();
     const byUsername = new Map(
-      empleados.map((e) => [String(e.username || "").trim().toLowerCase(), e._id])
+      empleados.map((e) => [
+        String(e.username || "")
+          .trim()
+          .toLowerCase(),
+        e._id,
+      ])
     );
     const byEmail = new Map(
-      empleados.map((e) => [String(e.email || "").trim().toLowerCase(), e._id])
+      empleados.map((e) => [
+        String(e.email || "")
+          .trim()
+          .toLowerCase(),
+        e._id,
+      ])
     );
     const resolverEmpleado = (valorCrudo) => {
       if (valorCrudo == null) return null;
@@ -2365,10 +2419,13 @@ export const importarProyeccionesMasivo = async (req, res) => {
     };
 
     // Entidad / SubCesión
-    const normTxt = (s) => String(s || "").trim().toUpperCase();
+    const normTxt = (s) =>
+      String(s || "")
+        .trim()
+        .toUpperCase();
 
     const cacheEntidades = new Map(); // nombre → doc
-    const cacheSubs = new Map();      // nombre → doc  (GLOBAL por nombre)
+    const cacheSubs = new Map(); // nombre → doc  (GLOBAL por nombre)
 
     // Entidad: NO crear si no existe
     const getEntidad = async (nombre) => {
@@ -2396,7 +2453,9 @@ export const importarProyeccionesMasivo = async (req, res) => {
       const k = keyPair(dni, entidadId, subCesionId);
       if (activaCache.has(k)) return activaCache.get(k);
       const proy = await Proyeccion.findOne({
-        dni, entidadId, subCesionId,
+        dni,
+        entidadId,
+        subCesionId,
         $or: [{ isActiva: true }, { isActiva: { $exists: false } }],
       }).sort({ creado: -1 });
       activaCache.set(k, proy || null);
@@ -2433,7 +2492,10 @@ export const importarProyeccionesMasivo = async (req, res) => {
           if (resuelto) ownerId = resuelto;
           else {
             advertencias.push({
-              fila, dni: dniRaw, entidad: entidadNombre, subCesion: subNombre,
+              fila,
+              dni: dniRaw,
+              entidad: entidadNombre,
+              subCesion: subNombre,
               motivo: `Empleado "${asignTexto}" no encontrado. Se asignó al importador.`,
             });
           }
@@ -2445,8 +2507,10 @@ export const importarProyeccionesMasivo = async (req, res) => {
         if (!concepto) throw new Error("CONCEPTO es obligatorio");
         if (!dniRaw) throw new Error("DNI es obligatorio");
         if (!nombre) throw new Error("NOMBRE es obligatorio");
-        if (!fechaProm) throw new Error("FECHA DE PROMESA inválida/obligatoria");
-        if (!Number.isFinite(importe) || importe <= 0) throw new Error("IMPORTE inválido (>0)");
+        if (!fechaProm)
+          throw new Error("FECHA DE PROMESA inválida/obligatoria");
+        if (!Number.isFinite(importe) || importe <= 0)
+          throw new Error("IMPORTE inválido (>0)");
 
         const dni = Number(String(dniRaw).replace(/\D/g, ""));
         if (!Number.isFinite(dni) || dni <= 0) throw new Error("DNI inválido");
@@ -2454,7 +2518,9 @@ export const importarProyeccionesMasivo = async (req, res) => {
         // Resolver Entidad (NO crear). Si no existe → error
         const entidad = await getEntidad(entidadNombre);
         if (!entidad) {
-          throw new Error(`Entidad "${entidadNombre}" inexistente (debe crearse previamente)`);
+          throw new Error(
+            `Entidad "${entidadNombre}" inexistente (debe crearse previamente)`
+          );
         }
 
         // SubCesión GLOBAL (por nombre)
@@ -2483,12 +2549,20 @@ export const importarProyeccionesMasivo = async (req, res) => {
           await doc.save();
 
           advertencias.push({
-            fila, dni, entidad: entidad.nombre, subCesion: sub.nombre,
+            fila,
+            dni,
+            entidad: entidad.nombre,
+            subCesion: sub.nombre,
             motivo: `Duplicado en el archivo. Se ACTUALIZÓ la proyección creada en la fila ${filaCreacion}.`,
           });
           resultados.push({
-            fila, dni, entidadId: String(entidad._id), subCesionId: String(sub._id),
-            _id: String(doc._id), ok: true, actualizado: true,
+            fila,
+            dni,
+            entidadId: String(entidad._id),
+            subCesionId: String(sub._id),
+            _id: String(doc._id),
+            ok: true,
+            actualizado: true,
           });
           continue;
         }
@@ -2503,7 +2577,10 @@ export const importarProyeccionesMasivo = async (req, res) => {
           await activaPrevia.save();
           activaCache.set(k, null);
           advertencias.push({
-            fila, dni, entidad: entidad.nombre, subCesion: sub.nombre,
+            fila,
+            dni,
+            entidad: entidad.nombre,
+            subCesion: sub.nombre,
             motivo: `Se cerró la proyección activa previa (${activaPrevia._id}) como: ${estadoCierre}.`,
           });
         }
@@ -2519,7 +2596,8 @@ export const importarProyeccionesMasivo = async (req, res) => {
           fechaProximoLlamado: fechaProx || undefined,
           importe,
           estado: clasificarEstado(fechaProm),
-          anio, mes,
+          anio,
+          mes,
           isActiva: true,
           empleadoId: ownerId,
           creado: new Date(),
@@ -2541,7 +2619,8 @@ export const importarProyeccionesMasivo = async (req, res) => {
               if (tel) actual.telefono = tel;
               actual.fechaPromesa = fechaProm;
               actual.fechaProximoLlamado = fechaProx || undefined;
-              actual.fechaPromesaInicial = actual.fechaPromesaInicial || fechaProm;
+              actual.fechaPromesaInicial =
+                actual.fechaPromesaInicial || fechaProm;
               actual.importe = importe;
               actual.estado = clasificarEstado(fechaProm);
               actual.anio = anio;
@@ -2555,8 +2634,13 @@ export const importarProyeccionesMasivo = async (req, res) => {
 
               creadasEnCorrida.set(k, { doc: actual, filaCreacion: fila });
               resultados.push({
-                fila, dni, entidadId: String(entidad._id), subCesionId: String(sub._id),
-                _id: String(actual._id), ok: true, actualizado: true,
+                fila,
+                dni,
+                entidadId: String(entidad._id),
+                subCesionId: String(sub._id),
+                _id: String(actual._id),
+                ok: true,
+                actualizado: true,
               });
               continue;
             }
@@ -2568,8 +2652,12 @@ export const importarProyeccionesMasivo = async (req, res) => {
 
         creadasEnCorrida.set(k, { doc: nueva, filaCreacion: fila });
         resultados.push({
-          fila, dni, entidadId: String(entidad._id), subCesionId: String(sub._id),
-          _id: String(nueva._id), ok: true,
+          fila,
+          dni,
+          entidadId: String(entidad._id),
+          subCesionId: String(sub._id),
+          _id: String(nueva._id),
+          ok: true,
         });
       } catch (e) {
         errores.push({
@@ -2596,14 +2684,22 @@ export const importarProyeccionesMasivo = async (req, res) => {
       ];
       for (const a of advertencias) {
         wsOut.addRow({
-          fila: a.fila, dni: a.dni, entidad: a.entidad, subCesion: a.subCesion,
-          resultado: "ADVERTENCIA", mensaje: a.motivo,
+          fila: a.fila,
+          dni: a.dni,
+          entidad: a.entidad,
+          subCesion: a.subCesion,
+          resultado: "ADVERTENCIA",
+          mensaje: a.motivo,
         });
       }
       for (const er of errores) {
         wsOut.addRow({
-          fila: er.fila, dni: er.dni, entidad: er.entidad, subCesion: er.subCesion,
-          resultado: "ERROR", mensaje: er.error,
+          fila: er.fila,
+          dni: er.dni,
+          entidad: er.entidad,
+          subCesion: er.subCesion,
+          resultado: "ERROR",
+          mensaje: er.error,
         });
       }
       const buf = await wbOut.xlsx.writeBuffer();
