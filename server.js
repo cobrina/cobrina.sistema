@@ -14,6 +14,7 @@ import colchonRoutes from "./routes/colchonRoutes.js";
 import subcesionRoutes from "./routes/subcesionRoutes.js"; // ✅ NUEVO
 import entidadRoutes from "./routes/entidadRoutes.js"; // ✅
 import stickiesRoutes from "./routes/stickiesRoutes.js";
+import tipsRoutes from "./routes/tipsRoutes.js"; // ✅ NUEVO (ESM)
 
 dotenv.config();
 
@@ -101,6 +102,7 @@ app.use("/colchon", colchonRoutes);
 app.use("/subcesiones", subcesionRoutes); // ✅ NUEVA RUTA ACTIVA
 app.use("/entidades", entidadRoutes); // ✅
 app.use("/api/stickies", stickiesRoutes);
+app.use("/api/tips", tipsRoutes); // ✅ Tips de Cobranza
 
 // 🔵 Ruta de prueba
 app.get("/", (req, res) => {

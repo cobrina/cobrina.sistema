@@ -356,30 +356,34 @@ export const filtrarCuotas = async (req, res) => {
     } = req.query;
 
     const rol = req.user.role || req.user.rol;
-    const filtrosBase = [];
 
-    // 🔐 Restricción por operador
+    // 🔐 Acceso
     if (esAdmin(req)) {
       return res.status(403).json({ error: "Sin acceso al módulo Colchón" });
     }
+
+    // ---------- Filtros base ----------
+    const filtrosBase = [];
+
+    // Por operador (seguridad)
     if (esOperativo(req)) {
       filtrosBase.push({ empleadoId: req.user.id });
     } else if (usuarioId) {
       filtrosBase.push({ empleadoId: usuarioId });
     }
 
-    // 🔍 Filtro por DNI
+    // DNI exacto
     if (dni) {
       const dniParsed = parseInt(dni, 10);
       if (!isNaN(dniParsed)) filtrosBase.push({ dni: dniParsed });
     }
 
-    // 🔍 Filtro por nombre parcial
+    // Nombre parcial
     if (nombre) {
       filtrosBase.push({ nombre: new RegExp(nombre, "i") });
     }
 
-    // 🔍 Filtros por entidad y subCesión — usamos ObjectId para que funcione siempre
+    // Entidad/SubCesión (ObjectId válidos)
     if (entidad && mongoose.Types.ObjectId.isValid(entidad)) {
       filtrosBase.push({ entidadId: new mongoose.Types.ObjectId(entidad) });
     }
@@ -387,7 +391,7 @@ export const filtrarCuotas = async (req, res) => {
       filtrosBase.push({ subCesionId: new mongoose.Types.ObjectId(subCesion) });
     }
 
-    // 📅 Filtro por rango de vencimiento (día del mes)
+    // Día de vencimiento
     if (diaDesde !== undefined || diaHasta !== undefined) {
       const desde = Math.max(1, Math.min(parseInt(diaDesde || 1, 10), 31));
       const hasta = Math.max(1, Math.min(parseInt(diaHasta || 31, 10), 31));
@@ -396,7 +400,7 @@ export const filtrarCuotas = async (req, res) => {
       }
     }
 
-    // 🎯 Filtro: cuotas sin gestión
+    // Sin gestión
     if (sinGestion === "true") {
       filtrosBase.push({
         $or: [
@@ -407,98 +411,160 @@ export const filtrarCuotas = async (req, res) => {
       });
     }
 
-    // 💬 Filtro: cuotas con pagos informados no vistos
+    // Con pagos informados no vistos
     if (conPagosNoVistos === "true") {
       filtrosBase.push({ "pagosInformados.visto": false });
     }
 
-    // 🧩 Construcción de la query final
-    const baseQuery = filtrosBase.length ? { $and: filtrosBase } : {};
+    const baseMatch = filtrosBase.length ? { $and: filtrosBase } : {};
 
-    // 📦 Buscar cuotas
-    const cuotasBrutas = await Colchon.find(baseQuery)
-      .populate("empleadoId", "username _id")
-      .populate("entidadId", "nombre numero")
-      .populate("subCesionId", "nombre")
-      .populate("pagosInformados.operadorId", "username _id")
-      .lean();
+    // ---------- Sort ----------
+    const pageNumber = Math.max(1, parseInt(page, 10) || 1);
+    const pageLimit = Math.max(1, parseInt(limit, 10) || 10);
+    const skip = (pageNumber - 1) * pageLimit;
+    const sortDir = sortDirection === "desc" ? -1 : 1;
 
-    // 🧠 Calcular estado dinámico
-    const cuotasConEstado = cuotasBrutas.map((cuota) => {
-      const estadoBase = cuota.estadoOriginal || cuota.estado;
-      const estadoFinal =
-        (cuota.pagos?.length ?? 0) > 0 ? "A cuota" : estadoBase;
+    // Ordenar por campos "poblados": necesitamos lookups ANTES del $sort
+    // Alias de campos de sort admitidos
+    const sortFieldMap = {
+      vencimiento: "vencimiento",
+      dni: "dni",
+      nombre: "nombre",
+      cuotaNumero: "cuotaNumero",
+      importeCuota: "importeCuota",
+      empleadoId: "empleado.username", // sort por username
+      entidadId: "entidad.nombre",     // sort por nombre de entidad
+      subCesionId: "subcesion.nombre", // sort por nombre de subcesión
+      saldoPendiente: "saldoPendiente",
+    };
+    const sortFieldKey = (sortBy || "vencimiento").trim();
+    const sortField = sortFieldMap[sortFieldKey] || "vencimiento";
+    const sortStage = { $sort: { [sortField]: sortDir, _id: 1 } }; // _id como desempate estable
 
-      // calcular cuotas adeudadas sin helpers
-      const cuotasAdeudadas =
-        Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
-          ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0)
-              .length
-          : (() => {
-              const imp = Number(cuota.importeCuota) || 0;
-              const saldo = Number(cuota.saldoPendiente) || 0;
-              return imp > 0 ? Math.floor(saldo / imp) : 0;
-            })();
+    // ---------- Pipeline común ----------
+    const basePipeline = [
+      { $match: baseMatch },
+
+      // Estado final = "A cuota" si hay pagos; si no, estadoOriginal/estado
+      {
+        $addFields: {
+          _pagCount: { $size: { $ifNull: ["$pagos", []] } },
+          estadoFinal: {
+            $cond: [
+              { $gt: [{ $size: { $ifNull: ["$pagos", []] } }, 0] },
+              "A cuota",
+              { $ifNull: ["$estadoOriginal", "$estado"] },
+            ],
+          },
+        },
+      },
+
+      // Lookups para poder ordenar por nombres y devolver info lista
+      {
+        $lookup: {
+          from: "empleados",
+          localField: "empleadoId",
+          foreignField: "_id",
+          as: "empleado",
+          pipeline: [{ $project: { _id: 1, username: 1 } }],
+        },
+      },
+      { $unwind: { path: "$empleado", preserveNullAndEmptyArrays: true } },
+
+      {
+        $lookup: {
+          from: "entidads",
+          localField: "entidadId",
+          foreignField: "_id",
+          as: "entidad",
+          pipeline: [{ $project: { _id: 1, nombre: 1, numero: 1 } }],
+        },
+      },
+      { $unwind: { path: "$entidad", preserveNullAndEmptyArrays: true } },
+
+      {
+        $lookup: {
+          from: "subcesions",
+          localField: "subCesionId",
+          foreignField: "_id",
+          as: "subcesion",
+          pipeline: [{ $project: { _id: 1, nombre: 1 } }],
+        },
+      },
+      { $unwind: { path: "$subcesion", preserveNullAndEmptyArrays: true } },
+    ];
+
+    // Si viene filtro por estado, aplicarlo sobre estadoFinal
+    if (estado) {
+      basePipeline.push({ $match: { estadoFinal: estado } });
+    }
+
+    // ---------- Conteo total filtrado ----------
+    const conteoPipeline = [...basePipeline, { $count: "count" }];
+
+    const conteoRes = await Colchon.aggregate(conteoPipeline);
+    const totalFiltrado = conteoRes?.[0]?.count || 0;
+
+    // ---------- Data paginada ----------
+    const dataPipeline = [
+      ...basePipeline,
+      sortStage,
+      { $skip: skip },
+      { $limit: pageLimit },
+
+      // Proyección final para reducir payload
+      {
+        $project: {
+          _id: 1,
+          dni: 1,
+          nombre: 1,
+          vencimiento: 1,
+          cuotaNumero: 1,
+          importeCuota: 1,
+          saldoPendiente: 1,
+          deudaPorMes: 1,
+          telefono: 1,
+          turno: 1,
+          vecesTocada: 1,
+          fechaUltimaTocada: 1,
+          usuarioUltimoTocado: 1,
+          pagos: 1, // necesario para estadoFinal
+          pagosInformados: 1, // si querés mantenerlo
+          estadoOriginal: 1,
+          estado: "$estadoFinal",
+
+          // embebidos simplificados
+          empleadoId: { _id: "$empleado._id", username: "$empleado.username" },
+          entidadId: {
+            _id: "$entidad._id",
+            nombre: "$entidad.nombre",
+            numero: "$entidad.numero",
+          },
+          subCesionId: { _id: "$subcesion._id", nombre: "$subcesion.nombre" },
+        },
+      },
+    ];
+
+    const resultadosAgg = await Colchon.aggregate(dataPipeline);
+
+    // Calcular alertaDeuda en JS (barato porque ya viene paginado)
+    const resultados = resultadosAgg.map((cuota) => {
+      // cuotas adeudadas: por deudaPorMes si existe; si no, por saldo/importe
+      const cuotasAdeudadas = Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
+        ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0).length
+        : (() => {
+            const imp = Number(cuota.importeCuota) || 0;
+            const saldo = Number(cuota.saldoPendiente) || 0;
+            return imp > 0 ? Math.floor(saldo / imp) : 0;
+          })();
 
       return {
         ...cuota,
-        estado: estadoFinal,
-        alertaDeuda: estadoFinal === "A cuota" && cuotasAdeudadas > 1,
+        alertaDeuda: cuota.estado === "A cuota" && cuotasAdeudadas > 1,
       };
     });
 
-    // 🎯 Filtro por estado, si se especifica
-    const cuotasFiltradas = estado
-      ? cuotasConEstado.filter((c) => c.estado === estado)
-      : cuotasConEstado;
-
-    const totalFiltrado = cuotasFiltradas.length;
-
-    // ✂️ Paginación + ordenación en memoria
-    const pageNumber = parseInt(page, 10);
-    const pageLimit = parseInt(limit, 10);
-    const skip = (pageNumber - 1) * pageLimit;
-    const sortField = (sortBy || "vencimiento").trim();
-    const sortDir = sortDirection === "desc" ? -1 : 1;
-
-    const getSortValue = (item, field) => {
-      if (field === "entidadId") return item.entidadId?.nombre ?? "";
-      if (field === "empleadoId") return item.empleadoId?.username ?? "";
-      return item[field];
-    };
-
-    const resultados = cuotasFiltradas
-      .sort((a, b) => {
-        const aVal = getSortValue(a, sortField);
-        const bVal = getSortValue(b, sortField);
-
-        // undefined/null al final
-        const aU = aVal === undefined || aVal === null;
-        const bU = bVal === undefined || bVal === null;
-        if (aU && bU) return 0;
-        if (aU) return 1;
-        if (bU) return -1;
-
-        // strings vs números
-        if (typeof aVal === "string" && typeof bVal === "string") {
-          const cmp = aVal.localeCompare(bVal, "es", { sensitivity: "base" });
-          return sortDir === 1 ? cmp : -cmp;
-        }
-
-        const aNum = Number(aVal);
-        const bNum = Number(bVal);
-        if (!isNaN(aNum) && !isNaN(bNum)) {
-          return sortDir === 1 ? aNum - bNum : bNum - aNum;
-        }
-
-        // fallback genérico
-        if (aVal < bVal) return -1 * sortDir;
-        if (aVal > bVal) return 1 * sortDir;
-        return 0;
-      })
-      .slice(skip, skip + pageLimit);
-
-    // 🧮 totalGeneral (según rol)
+    // ---------- totalGeneral (por rol) ----------
     const filtroGeneral =
       rol === "operador"
         ? { empleadoId: req.user.id }
@@ -508,7 +574,7 @@ export const filtrarCuotas = async (req, res) => {
 
     const totalGeneral = await Colchon.countDocuments(filtroGeneral);
 
-    // 📤 Respuesta final
+    // ---------- Respuesta ----------
     res.json({
       resultados,
       totalFiltrado,
@@ -519,6 +585,7 @@ export const filtrarCuotas = async (req, res) => {
     res.status(500).json({ error: "Error al filtrar cuotas" });
   }
 };
+
 
 // Importar desde Excel
 export const importarExcel = async (req, res) => {
