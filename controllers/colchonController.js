@@ -336,6 +336,10 @@ export const eliminarCuota = async (req, res) => {
   }
 };
 
+// Helper para castear a ObjectId cuando corresponde (aggregate NO castea automáticamente)
+const toObjId = (v) =>
+  mongoose.Types.ObjectId.isValid(v) ? new mongoose.Types.ObjectId(v) : v;
+
 export const filtrarCuotas = async (req, res) => {
   try {
     const {
@@ -365,11 +369,11 @@ export const filtrarCuotas = async (req, res) => {
     // ---------- Filtros base ----------
     const filtrosBase = [];
 
-    // Por operador (seguridad)
+    // Por operador (seguridad) — importante castear a ObjectId para aggregate
     if (esOperativo(req)) {
-      filtrosBase.push({ empleadoId: req.user.id });
+      filtrosBase.push({ empleadoId: toObjId(req.user.id) });
     } else if (usuarioId) {
-      filtrosBase.push({ empleadoId: usuarioId });
+      filtrosBase.push({ empleadoId: toObjId(usuarioId) });
     }
 
     // DNI exacto
@@ -424,7 +428,6 @@ export const filtrarCuotas = async (req, res) => {
     const skip = (pageNumber - 1) * pageLimit;
     const sortDir = sortDirection === "desc" ? -1 : 1;
 
-    // Ordenar por campos "poblados": necesitamos lookups ANTES del $sort
     // Alias de campos de sort admitidos
     const sortFieldMap = {
       vencimiento: "vencimiento",
@@ -529,7 +532,7 @@ export const filtrarCuotas = async (req, res) => {
           fechaUltimaTocada: 1,
           usuarioUltimoTocado: 1,
           pagos: 1, // necesario para estadoFinal
-          pagosInformados: 1, // si querés mantenerlo
+          pagosInformados: 1,
           estadoOriginal: 1,
           estado: "$estadoFinal",
 
@@ -549,14 +552,14 @@ export const filtrarCuotas = async (req, res) => {
 
     // Calcular alertaDeuda en JS (barato porque ya viene paginado)
     const resultados = resultadosAgg.map((cuota) => {
-      // cuotas adeudadas: por deudaPorMes si existe; si no, por saldo/importe
-      const cuotasAdeudadas = Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
-        ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0).length
-        : (() => {
-            const imp = Number(cuota.importeCuota) || 0;
-            const saldo = Number(cuota.saldoPendiente) || 0;
-            return imp > 0 ? Math.floor(saldo / imp) : 0;
-          })();
+      const cuotasAdeudadas =
+        Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
+          ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0).length
+          : (() => {
+              const imp = Number(cuota.importeCuota) || 0;
+              const saldo = Number(cuota.saldoPendiente) || 0;
+              return imp > 0 ? Math.floor(saldo / imp) : 0;
+            })();
 
       return {
         ...cuota,
@@ -566,10 +569,10 @@ export const filtrarCuotas = async (req, res) => {
 
     // ---------- totalGeneral (por rol) ----------
     const filtroGeneral =
-      rol === "operador"
-        ? { empleadoId: req.user.id }
+      (rol === "operador" || rol === "operador-vip")
+        ? { empleadoId: toObjId(req.user.id) }
         : usuarioId
-        ? { empleadoId: usuarioId }
+        ? { empleadoId: toObjId(usuarioId) }
         : {};
 
     const totalGeneral = await Colchon.countDocuments(filtroGeneral);
@@ -585,6 +588,7 @@ export const filtrarCuotas = async (req, res) => {
     res.status(500).json({ error: "Error al filtrar cuotas" });
   }
 };
+
 
 
 // Importar desde Excel
