@@ -37,7 +37,6 @@ function diaFinUTC(raw) {
   return new Date(d0.getTime() + 86399999); // 24h - 1ms
 }
 
-
 // --- helper para parsear filtro DNI (uno o varios) ---
 function buildDniFilter(raw) {
   if (!raw) return null;
@@ -77,11 +76,9 @@ export async function cargar(req, res) {
       return res.status(400).json({ error: "No hay filas para cargar." });
     }
 
-    // Si marcás reemplazarTodo, borra solo lo del usuario logueado
+    // Si marcás reemplazarTodo, borra TODO el universo de gestiones
     if (reemplazarTodo) {
-      await ReporteGestion.deleteMany({
-        propietario: new mongoose.Types.ObjectId(usuarioId),
-      });
+      await ReporteGestion.deleteMany({});
     }
 
     // helpers de normalizacion
@@ -120,8 +117,7 @@ export async function cargar(req, res) {
       if (!dni || !fechaStr || !usuarioRaw || !entidadRaw) {
         errores.push({
           fila: row,
-          motivo:
-            "Faltan campos obligatorios (DNI, FECHA, USUARIO o ENTIDAD)",
+          motivo: "Faltan campos obligatorios (DNI, FECHA, USUARIO o ENTIDAD)",
           row: { ...f },
         });
         return;
@@ -142,9 +138,7 @@ export async function cargar(req, res) {
       const resultadoGestion = norm(
         f?.["RESULTADO GESTION"] ?? f?.resultadoGestion
       );
-      const estadoCuenta = norm(
-        f?.["ESTADO DE LA CUENTA"] ?? f?.estadoCuenta
-      );
+      const estadoCuenta = norm(f?.["ESTADO DE LA CUENTA"] ?? f?.estadoCuenta);
 
       // normalizaciones coherentes con el modelo
       const horaNorm = normalizarHora(horaStr) || "00:00:00"; // HH:mm:ss
@@ -201,9 +195,7 @@ export async function cargar(req, res) {
       const telMail = norm(f?.["TEL-MAIL MARCADO"] ?? f?.telMailMarcado);
       const nombreDeudor = norm(f?.["NOMBRE DEUDOR"] ?? f?.nombreDeudor);
       let observacion = norm(
-        f?.["OBSERVACION GESTION"] ??
-          f?.observacionGestion ??
-          f?.observacion
+        f?.["OBSERVACION GESTION"] ?? f?.observacionGestion ?? f?.observacion
       );
       if (observacion.length > 3000) observacion = observacion.slice(0, 3000);
 
@@ -343,6 +335,7 @@ export async function cargar(req, res) {
   }
 }
 
+
 export async function listar(req, res) {
   try {
     const usuarioId = getUsuarioId(req);
@@ -369,13 +362,12 @@ export async function listar(req, res) {
       fields = "min",
     } = req.query || {};
 
-    // ---- Construcción de query base (scope)
+    // ---- Construcción de query base (scope GLOBAL, ya no por propietario)
     const q = {
-      propietario: new mongoose.Types.ObjectId(usuarioId),
       borrado: { $ne: true },
     };
 
-       // Rango de fechas (día completo UTC)
+    // Rango de fechas (día completo UTC)
     if (desde || hasta) {
       const dDesde = desde ? diaInicioUTC(String(desde).trim()) : null;
       const dHasta = hasta ? diaFinUTC(String(hasta).trim()) : null;
@@ -386,7 +378,6 @@ export async function listar(req, res) {
         if (dHasta) q.fecha.$lte = dHasta;
       }
     }
-
 
     // DNI (uno o varios)
     const dniFilter = buildDniFilter(dni);
@@ -479,26 +470,19 @@ export async function listar(req, res) {
 export async function limpiar(req, res) {
   try {
     const usuarioId = getUsuarioId(req);
-    const rawOnlyMine = (req.body && req.body.onlyMine) ?? true; // por defecto true
-    const onlyMine =
-      typeof rawOnlyMine === "string"
-        ? rawOnlyMine.toLowerCase() === "true"
-        : Boolean(rawOnlyMine);
+    if (!usuarioId) {
+      return res.status(401).json({ error: "Token invalido o ausente." });
+    }
 
     // filtros opcionales (mismo contract que /listar)
     const f = req.body?.filtros || {};
     const { desde, hasta, operador, entidad, tipoContacto, estadoCuenta, dni } =
       f;
 
-    // base
+    // base GLOBAL (ya no filtramos por propietario)
     const q = {};
-    if (onlyMine) {
-      if (!usuarioId)
-        return res.status(401).json({ error: "Token invalido o ausente." });
-      q.propietario = new mongoose.Types.ObjectId(usuarioId);
-    }
 
-      // construir filtros (idéntico criterio que /listar, día completo UTC)
+    // construir filtros (idéntico criterio que /listar, día completo UTC)
     if (desde || hasta) {
       const dDesde = desde ? diaInicioUTC(String(desde).trim()) : null;
       const dHasta = hasta ? diaFinUTC(String(hasta).trim()) : null;
@@ -509,7 +493,6 @@ export async function limpiar(req, res) {
         if (dHasta) q.fecha.$lte = dHasta;
       }
     }
-
 
     const rxExact = (s) =>
       new RegExp(`^${escapeRegex(String(s).trim())}$`, "i");
@@ -522,13 +505,15 @@ export async function limpiar(req, res) {
     const dniFilter = buildDniFilter(dni);
     if (dniFilter) q.dni = dniFilter;
 
-    // Si no vino NINGÚN filtro (todo vacio), borra todo el scope (propietario o global)
+    // Si no vino NINGÚN filtro (todo vacio), borra TODO el universo de gestiones
+    // (igual requiere JWT válido)
     const r = await ReporteGestion.deleteMany(q);
     return res.json({ ok: true, borrados: r.deletedCount || 0 });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
 }
+
 
 /** GET /api/reportes-gestiones/export/pdf (stub hasta implementar server-side) */
 export async function exportarPDF(_req, res) {
@@ -549,8 +534,10 @@ export async function catalogos(req, res) {
       return res.status(401).json({ error: "Token invalido o ausente." });
     }
 
-       const { desde, hasta } = req.query || {};
-    const base = { propietario: new mongoose.Types.ObjectId(usuarioId) };
+    const { desde, hasta } = req.query || {};
+
+    // Base GLOBAL: ya no filtramos por propietario, solo por fecha si viene
+    const base = {};
 
     if (desde || hasta) {
       const dDesde = desde ? diaInicioUTC(String(desde).trim()) : null;
@@ -562,7 +549,6 @@ export async function catalogos(req, res) {
         if (dHasta) base.fecha.$lte = dHasta;
       }
     }
-
 
     // Operadores activos desde Empleado
     const operadores = (
@@ -577,7 +563,7 @@ export async function catalogos(req, res) {
       await Entidad.find().select("nombre").sort({ numero: 1 }).lean()
     ).map((x) => String(x.nombre || ""));
 
-    // Tipos/estados desde las gestiones (libres)
+    // Tipos/estados desde las gestiones (libres, pero ahora globales)
     const [tiposRaw, estadosRaw] = await Promise.all([
       ReporteGestion.distinct("tipoContacto", base),
       ReporteGestion.distinct("estadoCuenta", base),
@@ -601,6 +587,7 @@ export async function catalogos(req, res) {
     return res.status(500).json({ error: e.message });
   }
 }
+
 // controllers/reportesGestionesController.js (handler corregido)
 export async function comparativo(req, res) {
   try {
@@ -619,7 +606,7 @@ export async function comparativo(req, res) {
       estadoCuenta,
     } = req.query || {};
 
-       // --------- Fechas (día completo UTC, alineado al modelo) ---------
+    // --------- Fechas (día completo UTC, alineado al modelo) ---------
     const d1 = diaInicioUTC(desde);
     const d2 = diaInicioUTC(hasta);
     const endOfDayUTC = (d) => new Date(d.getTime() + 86399999);
@@ -627,7 +614,6 @@ export async function comparativo(req, res) {
     if (!d1 || !d2 || d2 < d1) {
       return res.status(400).json({ error: "Rango de fechas invalido" });
     }
-
 
     // Rango “previo” con la misma longitud
     const days = Math.floor((endOfDayUTC(d2) - d1) / 86400000) + 1; // inclusive
@@ -640,9 +626,8 @@ export async function comparativo(req, res) {
     const rxExact = (s) =>
       new RegExp(`^${escapeRegex(String(s).trim())}$`, "i");
 
-    const base = {
-      propietario: new mongoose.Types.ObjectId(usuarioId),
-    };
+    // 🔹 Base GLOBAL: ya no filtramos por propietario
+    const base = {};
 
     const addFilters = (q) => {
       const out = { ...base };
@@ -915,8 +900,8 @@ export async function resumenDia(req, res) {
     const rxExact = (s) =>
       new RegExp(`^${escapeRegex(String(s).trim())}$`, "i");
 
+    // 🔹 Match GLOBAL: ya no filtramos por propietario, solo por fecha + filtros
     const match = {
-      propietario: new mongoose.Types.ObjectId(usuarioId),
       fecha: { $gte: desde, $lte: hasta },
     };
     if (operador) match.usuario = rxExact(operador);
@@ -941,7 +926,7 @@ export async function resumenDia(req, res) {
           _id: "$usuario",
           dnisSet: { $addToSet: "$dni" },
           gestiones: { $sum: 1 },
-          minHora: { $min: "$hora" }, // ← ahora usamos la cadena "HH:mm:ss"
+          minHora: { $min: "$hora" }, // ← usamos la cadena "HH:mm:ss"
           maxHora: { $max: "$hora" },
         },
       },
@@ -1058,8 +1043,8 @@ export async function calendarioMes(req, res) {
     const rxExact = (s) =>
       new RegExp(`^${escapeRegex(String(s).trim())}$`, "i");
 
+    // 🔹 Match GLOBAL: ya no filtramos por propietario, solo por fecha + filtros
     const match = {
-      propietario: new mongoose.Types.ObjectId(usuarioId),
       fecha: { $gte: desde, $lte: hasta },
     };
     if (operador) match.usuario = rxExact(operador);
@@ -1129,7 +1114,10 @@ export async function calendarioMes(req, res) {
             $cond: [
               { $gt: ["$minTrabajados", 0] },
               {
-                $divide: ["$dnisUnicos", { $divide: ["$minTrabajados", 3600] }],
+                $divide: [
+                  "$dnisUnicos",
+                  { $divide: ["$minTrabajados", 3600] },
+                ],
               },
               0,
             ],
@@ -1139,7 +1127,7 @@ export async function calendarioMes(req, res) {
       { $sort: { fecha: 1 } },
     ]).collation({ locale: "es", strength: 1 });
 
-    // 🔹 Formatear correctamente las horas
+    // 🔹 Formatear correctamente las horas (placeholder por si querés tocar algo luego)
     agg = agg.map((d) => ({
       ...d,
     }));
@@ -1171,8 +1159,8 @@ export async function calendarioMesMatriz(req, res) {
     const d2 = new Date(Date.UTC(year, month + 1, 0));
     const endOfDay = (d) => new Date(d.getTime() + 86399999);
 
+    // 🔹 Base GLOBAL: ya no filtramos por propietario, solo por fecha
     const base = {
-      propietario: new mongoose.Types.ObjectId(usuarioId),
       fecha: { $gte: d1, $lte: endOfDay(d2) },
     };
 
@@ -1245,6 +1233,7 @@ export async function calendarioMesMatriz(req, res) {
     return res.status(500).json({ error: e.message });
   }
 }
+
 // --- /api/reportes-gestiones/analytics/casos-nuevos (90 días, sin lookup) ---
 export async function casosNuevos(req, res) {
   try {
@@ -1288,12 +1277,11 @@ export async function casosNuevos(req, res) {
       ? Math.max(0, Number(minDiasStr))
       : 90; // 🎯 por defecto 90 días
 
-    const ownerId = new mongoose.Types.ObjectId(usuarioId);
+    // 🔹 Ya no usamos ownerId / propietario, el cálculo es GLOBAL
 
     // --- 1) DNI “recientes”: tuvieron al menos UNA gestión en [d1 - MIN_DIAS, d1)
     const corteInicio = new Date(d1.getTime() - MIN_DIAS * 86400000); // d1 - 90 días
     const recientesDNIs = await ReporteGestion.distinct("dni", {
-      propietario: ownerId,
       fecha: { $gte: corteInicio, $lt: d1 },
     }).collation({ locale: "es", strength: 1 }); // respeta normalización
 
@@ -1301,7 +1289,6 @@ export async function casosNuevos(req, res) {
 
     // --- 2) DNIs gestionados en el rango actual, con filtros “visibles” (operador/entidad/etc)
     const baseMatch = {
-      propietario: ownerId,
       fecha: { $gte: d1, $lte: endOfDayUTC(d2) },
     };
     if (operador) baseMatch.usuario = operador; // igualdad pura => index-friendly
