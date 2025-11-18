@@ -335,7 +335,6 @@ export async function cargar(req, res) {
   }
 }
 
-
 export async function listar(req, res) {
   try {
     const usuarioId = getUsuarioId(req);
