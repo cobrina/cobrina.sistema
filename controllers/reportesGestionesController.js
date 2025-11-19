@@ -465,7 +465,6 @@ export async function listar(req, res) {
   }
 }
 
-// controllers/reportesGestionesController.js (reemplazar funcion limpiar)
 export async function limpiar(req, res) {
   try {
     const usuarioId = getUsuarioId(req);
@@ -512,7 +511,6 @@ export async function limpiar(req, res) {
     return res.status(500).json({ error: e.message });
   }
 }
-
 
 /** GET /api/reportes-gestiones/export/pdf (stub hasta implementar server-side) */
 export async function exportarPDF(_req, res) {
@@ -1113,10 +1111,7 @@ export async function calendarioMes(req, res) {
             $cond: [
               { $gt: ["$minTrabajados", 0] },
               {
-                $divide: [
-                  "$dnisUnicos",
-                  { $divide: ["$minTrabajados", 3600] },
-                ],
+                $divide: ["$dnisUnicos", { $divide: ["$minTrabajados", 3600] }],
               },
               0,
             ],
