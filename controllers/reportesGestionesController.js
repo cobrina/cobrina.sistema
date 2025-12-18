@@ -20,6 +20,38 @@ function getUsuarioId(req) {
 const escapeRegex = (s = "") =>
   String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// ✅ NUEVO: soporta filtros múltiples (CSV) o array
+const splitCSV = (raw) => {
+  if (!raw) return [];
+  if (Array.isArray(raw)) raw = raw.join(",");
+  return String(raw)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+};
+
+// ✅ NUEVO: regex exacta (case-insensitive) para 1 o muchos valores (CSV)
+// Devuelve: /^(... )$/i  ó  { $in: [/^...$/i, /^...$/i] }
+const rxExactMulti = (raw, mapFn = (x) => x) => {
+  const arr = splitCSV(raw)
+    .map((x) => mapFn(String(x).trim()))
+    .filter(Boolean);
+  if (!arr.length) return null;
+
+  const regs = arr.map((v) => new RegExp(`^${escapeRegex(v)}$`, "i"));
+  return regs.length === 1 ? regs[0] : { $in: regs };
+};
+
+// ✅ NUEVO: exact match index-friendly (strings) para 1 o muchos valores (CSV)
+// Útil si el campo ya está normalizado (usuario lower, entidad upper)
+const inExactMultiStrings = (raw, mapFn = (x) => x) => {
+  const arr = splitCSV(raw)
+    .map((x) => mapFn(String(x).trim()))
+    .filter(Boolean);
+  if (!arr.length) return null;
+  return arr.length === 1 ? arr[0] : { $in: arr };
+};
+
 // Normaliza un string de fecha (dd/mm/yyyy, yyyy-mm-dd, serial Excel)
 // a INICIO de día UTC (00:00:00.000)
 function diaInicioUTC(raw) {
@@ -76,21 +108,22 @@ export async function cargar(req, res) {
       return res.status(400).json({ error: "No hay filas para cargar." });
     }
 
-    // Si marcás reemplazarTodo, borra TODO el universo de gestiones
+    // ✅ Si marcás reemplazarTodo, borra SOLO el universo de este propietario
     if (reemplazarTodo) {
-      await ReporteGestion.deleteMany({});
+      await ReporteGestion.deleteMany({
+        propietario: new mongoose.Types.ObjectId(usuarioId),
+      });
     }
 
-    // helpers de normalizacion
     const norm = (s) => String(s ?? "").trim();
     const normUser = (s) => norm(s).toLowerCase();
     const normEntidad = (s) => norm(s).toUpperCase();
 
-    // catalogos precargados
     const [empleados, entidades] = await Promise.all([
       Empleado.find({ isActive: true }).select("username").lean(),
       Entidad.find().select("nombre").lean(),
     ]);
+
     const setUsers = new Set(
       empleados.map((e) => String(e.username || "").toLowerCase())
     );
@@ -104,16 +137,14 @@ export async function cargar(req, res) {
     const rawRows = [];
 
     filas.forEach((f, idx) => {
-      const row = idx + 2; // encabezado en fila 1
+      const row = idx + 2;
 
-      // base obligatoria
       const dni = norm(f?.DNI ?? f?.dni);
       const fechaStr = norm(f?.FECHA ?? f?.fecha);
       const horaStr = norm(f?.HORA ?? f?.hora);
       const usuarioRaw = norm(f?.USUARIO ?? f?.usuario);
       const entidadRaw = norm(f?.ENTIDAD ?? f?.entidad);
 
-      // 👉 ahora también exigimos ENTIDAD no vacía
       if (!dni || !fechaStr || !usuarioRaw || !entidadRaw) {
         errores.push({
           fila: row,
@@ -133,42 +164,37 @@ export async function cargar(req, res) {
         return;
       }
 
-      // campos de clave
       const tipoContacto = norm(f?.["TIPO CONTACTO"] ?? f?.tipoContacto);
       const resultadoGestion = norm(
         f?.["RESULTADO GESTION"] ?? f?.resultadoGestion
       );
       const estadoCuenta = norm(f?.["ESTADO DE LA CUENTA"] ?? f?.estadoCuenta);
 
-      // normalizaciones coherentes con el modelo
-      const horaNorm = normalizarHora(horaStr) || "00:00:00"; // HH:mm:ss
-      const fechaKey = fDate.toISOString().slice(0, 10); // yyyy-mm-dd
+      const horaNorm = normalizarHora(horaStr) || "00:00:00";
+      const fechaKey = fDate.toISOString().slice(0, 10);
 
       const usuario = normUser(usuarioRaw);
       let entidad = normEntidad(entidadRaw);
-      if (entidad.length > 120) entidad = entidad.slice(0, 120); // defensivo
+      if (entidad.length > 120) entidad = entidad.slice(0, 120);
 
-      // 🔴 VALIDACIÓN DURA: usuario debe existir en Empleado.isActive = true
       if (!setUsers.has(usuario)) {
         errores.push({
           fila: row,
           motivo: `Usuario "${usuarioRaw}" no existe como username activo en la tabla Empleados.`,
           row: { ...f },
         });
-        return; // ⛔ NO seguimos con esta fila, NO se inserta
+        return;
       }
 
-      // 🔴 VALIDACIÓN DURA: entidad debe existir en Entidad
       if (!setEnts.has(entidad)) {
         errores.push({
           fila: row,
           motivo: `Entidad "${entidadRaw}" no existe en la tabla Entidades.`,
           row: { ...f },
         });
-        return; // ⛔ NO seguimos con esta fila
+        return;
       }
 
-      // duplicado dentro del archivo (misma clave que el indice unico)
       const key = [
         dni,
         fechaKey,
@@ -191,7 +217,6 @@ export async function cargar(req, res) {
       }
       seen.add(key);
 
-      // resto de campos
       const telMail = norm(f?.["TEL-MAIL MARCADO"] ?? f?.telMailMarcado);
       const nombreDeudor = norm(f?.["NOMBRE DEUDOR"] ?? f?.nombreDeudor);
       let observacion = norm(
@@ -199,7 +224,6 @@ export async function cargar(req, res) {
       );
       if (observacion.length > 3000) observacion = observacion.slice(0, 3000);
 
-      // copia cruda para reporte de errores
       rawRows.push({
         DNI: dni,
         "NOMBRE DEUDOR": nombreDeudor,
@@ -214,7 +238,6 @@ export async function cargar(req, res) {
         ENTIDAD: entidadRaw,
       });
 
-      // ⚠️ mailsDetectados: SOLO desde TEL-MAIL MARCADO (no Observacion)
       const mailsSoloTel = extraerEmails(telMail);
 
       docs.push({
@@ -224,13 +247,13 @@ export async function cargar(req, res) {
         nombreDeudor,
         fecha: fDate,
         hora: horaNorm,
-        usuario, // minusculas
+        usuario,
         tipoContacto,
         resultadoGestion,
         estadoCuenta,
         telMailMarcado: telMail,
         observacionGestion: observacion,
-        entidad, // MAYÚSCULAS
+        entidad,
         mailsDetectados: mailsSoloTel,
       });
     });
@@ -247,6 +270,7 @@ export async function cargar(req, res) {
 
     let insertados = 0;
     let duplicadosEnBD = 0;
+
     try {
       const inserted = await ReporteGestion.insertMany(docs, {
         ordered: false,
@@ -338,12 +362,10 @@ export async function cargar(req, res) {
 export async function listar(req, res) {
   try {
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId) {
+    if (!usuarioId)
       return res.status(401).json({ error: "Token invalido o ausente." });
-    }
 
     const {
-      // Filtros
       desde,
       hasta,
       operador,
@@ -351,18 +373,16 @@ export async function listar(req, res) {
       tipoContacto,
       estadoCuenta,
       dni,
-      // Paginación
       page = 1,
       limit = 200,
-      // Ordenamiento
       sortKey,
       sortDir,
-      // downsampling de campos (min|full)
       fields = "min",
     } = req.query || {};
 
-    // ---- Construcción de query base (scope GLOBAL, ya no por propietario)
+    // ✅ Scope por propietario SIEMPRE
     const q = {
+      propietario: new mongoose.Types.ObjectId(usuarioId),
       borrado: { $ne: true },
     };
 
@@ -370,7 +390,6 @@ export async function listar(req, res) {
     if (desde || hasta) {
       const dDesde = desde ? diaInicioUTC(String(desde).trim()) : null;
       const dHasta = hasta ? diaFinUTC(String(hasta).trim()) : null;
-
       if (dDesde || dHasta) {
         q.fecha = {};
         if (dDesde) q.fecha.$gte = dDesde;
@@ -382,20 +401,21 @@ export async function listar(req, res) {
     const dniFilter = buildDniFilter(dni);
     if (dniFilter) q.dni = dniFilter;
 
-    // Filtros exactos (case-insensitive)
-    const rxExact = (s) =>
-      new RegExp(`^${escapeRegex(String(s).trim())}$`, "i");
-    if (operador) q.usuario = rxExact(operador);
-    if (entidad) q.entidad = rxExact(entidad);
-    if (tipoContacto) q.tipoContacto = rxExact(tipoContacto);
-    if (estadoCuenta) q.estadoCuenta = rxExact(estadoCuenta);
+    // filtros multi (case-insensitive)
+    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+    const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
 
-    // ---- Paginación
+    if (fUsuario) q.usuario = fUsuario;
+    if (fEntidad) q.entidad = fEntidad;
+    if (fTipo) q.tipoContacto = fTipo;
+    if (fEstado) q.estadoCuenta = fEstado;
+
     const pageNum = Math.max(1, Number(page) || 1);
     const limitNum = Math.min(1000, Math.max(1, Number(limit) || 200));
     const skip = (pageNum - 1) * limitNum;
 
-    // ---- Ordenamiento (whitelist + defaults)
     const ALLOWED_SORT = new Set([
       "dni",
       "nombreDeudor",
@@ -409,19 +429,15 @@ export async function listar(req, res) {
       "observacionGestion",
       "entidad",
     ]);
+
     const key = ALLOWED_SORT.has(String(sortKey)) ? String(sortKey) : "fecha";
     const dir = String(sortDir).toLowerCase() === "asc" ? 1 : -1;
 
     let sortStage = {};
-    if (key === "fecha") {
-      sortStage = { fecha: dir, hora: dir, _id: 1 };
-    } else if (key === "hora") {
-      sortStage = { hora: dir, fecha: dir, _id: 1 };
-    } else {
-      sortStage = { [key]: dir, fecha: -1, hora: -1, _id: 1 };
-    }
+    if (key === "fecha") sortStage = { fecha: dir, hora: dir, _id: 1 };
+    else if (key === "hora") sortStage = { hora: dir, fecha: dir, _id: 1 };
+    else sortStage = { [key]: dir, fecha: -1, hora: -1, _id: 1 };
 
-    // ---- Proyección liviana por defecto
     const PROJ_MIN = {
       dni: 1,
       nombreDeudor: 1,
@@ -436,10 +452,10 @@ export async function listar(req, res) {
       entidad: 1,
       mailsDetectados: 1,
     };
+
     const projectStage =
       fields === "min" ? { $project: PROJ_MIN } : { $project: { __v: 0 } };
 
-    // ---- Total y página con aggregate (+ allowDiskUse)
     const [total, items] = await Promise.all([
       ReporteGestion.countDocuments(q),
       ReporteGestion.aggregate([
@@ -468,23 +484,19 @@ export async function listar(req, res) {
 export async function limpiar(req, res) {
   try {
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId) {
+    if (!usuarioId)
       return res.status(401).json({ error: "Token invalido o ausente." });
-    }
 
-    // filtros opcionales (mismo contract que /listar)
     const f = req.body?.filtros || {};
     const { desde, hasta, operador, entidad, tipoContacto, estadoCuenta, dni } =
       f;
 
-    // base GLOBAL (ya no filtramos por propietario)
-    const q = {};
+    // ✅ Scope por propietario SIEMPRE
+    const q = { propietario: new mongoose.Types.ObjectId(usuarioId) };
 
-    // construir filtros (idéntico criterio que /listar, día completo UTC)
     if (desde || hasta) {
       const dDesde = desde ? diaInicioUTC(String(desde).trim()) : null;
       const dHasta = hasta ? diaFinUTC(String(hasta).trim()) : null;
-
       if (dDesde || dHasta) {
         q.fecha = {};
         if (dDesde) q.fecha.$gte = dDesde;
@@ -492,19 +504,19 @@ export async function limpiar(req, res) {
       }
     }
 
-    const rxExact = (s) =>
-      new RegExp(`^${escapeRegex(String(s).trim())}$`, "i");
-    if (operador) q.usuario = rxExact(operador);
-    if (entidad) q.entidad = rxExact(entidad);
-    if (tipoContacto) q.tipoContacto = rxExact(tipoContacto);
-    if (estadoCuenta) q.estadoCuenta = rxExact(estadoCuenta);
+    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+    const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
 
-    // DNI (uno o varios)
+    if (fUsuario) q.usuario = fUsuario;
+    if (fEntidad) q.entidad = fEntidad;
+    if (fTipo) q.tipoContacto = fTipo;
+    if (fEstado) q.estadoCuenta = fEstado;
+
     const dniFilter = buildDniFilter(dni);
     if (dniFilter) q.dni = dniFilter;
 
-    // Si no vino NINGÚN filtro (todo vacio), borra TODO el universo de gestiones
-    // (igual requiere JWT válido)
     const r = await ReporteGestion.deleteMany(q);
     return res.json({ ok: true, borrados: r.deletedCount || 0 });
   } catch (e) {
@@ -523,23 +535,23 @@ export async function exportarPDF(_req, res) {
   }
 }
 
-/** GET /api/reportes-gestiones/catalogos */
 export async function catalogos(req, res) {
   try {
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId) {
+    if (!usuarioId)
       return res.status(401).json({ error: "Token invalido o ausente." });
-    }
 
     const { desde, hasta } = req.query || {};
 
-    // Base GLOBAL: ya no filtramos por propietario, solo por fecha si viene
-    const base = {};
+    // ✅ base por propietario
+    const base = {
+      propietario: new mongoose.Types.ObjectId(usuarioId),
+      borrado: { $ne: true },
+    };
 
     if (desde || hasta) {
       const dDesde = desde ? diaInicioUTC(String(desde).trim()) : null;
       const dHasta = hasta ? diaFinUTC(String(hasta).trim()) : null;
-
       if (dDesde || dHasta) {
         base.fecha = {};
         if (dDesde) base.fecha.$gte = dDesde;
@@ -547,7 +559,6 @@ export async function catalogos(req, res) {
       }
     }
 
-    // Operadores activos desde Empleado
     const operadores = (
       await Empleado.find({ isActive: true })
         .select("username")
@@ -555,12 +566,10 @@ export async function catalogos(req, res) {
         .lean()
     ).map((e) => String(e.username || ""));
 
-    // Entidades desde Entidad
     const entidades = (
       await Entidad.find().select("nombre").sort({ numero: 1 }).lean()
     ).map((x) => String(x.nombre || ""));
 
-    // Tipos/estados desde las gestiones (libres, pero ahora globales)
     const [tiposRaw, estadosRaw] = await Promise.all([
       ReporteGestion.distinct("tipoContacto", base),
       ReporteGestion.distinct("estadoCuenta", base),
@@ -585,25 +594,19 @@ export async function catalogos(req, res) {
   }
 }
 
-// controllers/reportesGestionesController.js (handler corregido)
+// controllers/reportesGestionesController.js
 export async function comparativo(req, res) {
   try {
-    const usuarioId = getUsuarioId(req); // usamos el helper de arriba
+    const usuarioId = getUsuarioId(req);
     if (!usuarioId) {
       return res.status(401).json({ error: "Token invalido o ausente." });
     }
 
-    // --------- Entrada ---------
-    const {
-      desde, // puede venir dd/mm/yyyy, dd-mm-yyyy, yyyy-mm-dd, serial Excel
-      hasta,
-      operador,
-      entidad,
-      tipoContacto,
-      estadoCuenta,
-    } = req.query || {};
+    const owner = new mongoose.Types.ObjectId(usuarioId);
 
-    // --------- Fechas (día completo UTC, alineado al modelo) ---------
+    const { desde, hasta, operador, entidad, tipoContacto, estadoCuenta, dni } =
+      req.query || {};
+
     const d1 = diaInicioUTC(desde);
     const d2 = diaInicioUTC(hasta);
     const endOfDayUTC = (d) => new Date(d.getTime() + 86399999);
@@ -612,27 +615,33 @@ export async function comparativo(req, res) {
       return res.status(400).json({ error: "Rango de fechas invalido" });
     }
 
-    // Rango “previo” con la misma longitud
-    const days = Math.floor((endOfDayUTC(d2) - d1) / 86400000) + 1; // inclusive
-    const prevEnd = new Date(d1.getTime() - 86400000); // dia anterior al inicio actual
+    const days = Math.floor((endOfDayUTC(d2) - d1) / 86400000) + 1;
+    const prevEnd = new Date(d1.getTime() - 86400000);
     const prevStart = new Date(prevEnd.getTime() - (days - 1) * 86400000);
 
-    // --------- Query base + filtros ---------
-    const escapeRegex = (s = "") =>
-      String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const rxExact = (s) =>
-      new RegExp(`^${escapeRegex(String(s).trim())}$`, "i");
-
-    // 🔹 Base GLOBAL: ya no filtramos por propietario
-    const base = {};
+    // ✅ Scope por propietario + borrado
+    const base = {
+      propietario: owner,
+      borrado: { $ne: true },
+    };
 
     const addFilters = (q) => {
       const out = { ...base };
       if (q?.fecha) out.fecha = q.fecha;
-      if (operador) out.usuario = rxExact(operador);
-      if (entidad) out.entidad = rxExact(entidad);
-      if (tipoContacto) out.tipoContacto = rxExact(tipoContacto);
-      if (estadoCuenta) out.estadoCuenta = rxExact(estadoCuenta);
+
+      const dniFilter = buildDniFilter(dni);
+      if (dniFilter) out.dni = dniFilter;
+
+      const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+      const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+      const fTipo = rxExactMulti(tipoContacto);
+      const fEstado = rxExactMulti(estadoCuenta);
+
+      if (fUsuario) out.usuario = fUsuario;
+      if (fEntidad) out.entidad = fEntidad;
+      if (fTipo) out.tipoContacto = fTipo;
+      if (fEstado) out.estadoCuenta = fEstado;
+
       return out;
     };
 
@@ -641,7 +650,6 @@ export async function comparativo(req, res) {
       fecha: { $gte: prevStart, $lte: endOfDayUTC(prevEnd) },
     });
 
-    // --------- Utilidades de KPI ---------
     const esContactoDoc = {
       $or: [
         { resultadoGestion: { $regex: /contactad[oa]/i } },
@@ -650,14 +658,22 @@ export async function comparativo(req, res) {
     };
     const esMailLibreDoc = { resultadoGestion: { $regex: /mail\s*libre/i } };
 
-    // Pipeline comun para computar KPIs
+    const HORA_SAFE = {
+      $convert: {
+        input: "$hora",
+        to: "string",
+        onError: "00:00:00",
+        onNull: "00:00:00",
+      },
+    };
+
     const pipelineKPIs = (matchQ) => [
       { $match: matchQ },
       {
         $project: {
           dni: 1,
           fecha: 1,
-          hora: 1,
+          horaStr: HORA_SAFE,
           usuario: 1,
           tipoContacto: 1,
           resultadoGestion: 1,
@@ -665,7 +681,7 @@ export async function comparativo(req, res) {
           telMailMarcado: 1,
           isContacto: esContactoDoc,
           isMailLibre: esMailLibreDoc,
-          horaHH: { $substr: ["$hora", 0, 2] },
+          horaHH: { $substrBytes: [HORA_SAFE, 0, 2] },
         },
       },
       {
@@ -698,40 +714,37 @@ export async function comparativo(req, res) {
               },
             },
           ],
-          orden: [
-            {
-              $project: {
-                dni: 1,
-                fecha: 1,
-                hora: 1,
-                ts: { $add: [{ $toLong: "$fecha" }, 0] },
-              },
-            },
-            { $sort: { fecha: 1, hora: 1, _id: 1 } },
-          ],
         },
       },
     ];
 
     const [actAgg, prevAgg] = await Promise.all([
-      ReporteGestion.aggregate(pipelineKPIs(qActual)).collation({
-        locale: "es",
-        strength: 1,
-      }),
-      ReporteGestion.aggregate(pipelineKPIs(qPrevio)).collation({
-        locale: "es",
-        strength: 1,
-      }),
+      ReporteGestion.aggregate(pipelineKPIs(qActual))
+        .allowDiskUse(true)
+        .collation({ locale: "es", strength: 1 }),
+      ReporteGestion.aggregate(pipelineKPIs(qPrevio))
+        .allowDiskUse(true)
+        .collation({ locale: "es", strength: 1 }),
     ]);
 
-    const fold = (agg, rangoDias) => {
-      const base = agg?.[0]?.base?.[0] || {};
-      const gestiones = base.gestiones || 0;
-      const dnisUnicos = (base.dnisSet || []).filter(Boolean).length || 0;
-      const contactos = base.contactos || 0;
+    function daysHabilesEntre(a, b) {
+      let c = 0;
+      const d = new Date(a);
+      while (d <= b) {
+        const wd = d.getUTCDay();
+        if (wd >= 1 && wd <= 5) c++;
+        d.setUTCDate(d.getUTCDate() + 1);
+      }
+      return Math.max(c, 1);
+    }
 
-      const diasHabiles = rangoDias;
-      const dnisPorDia = diasHabiles ? dnisUnicos / diasHabiles : 0;
+    const fold = (agg, rangoDiasHabiles) => {
+      const base0 = agg?.[0]?.base?.[0] || {};
+      const gestiones = base0.gestiones || 0;
+      const dnisUnicos = (base0.dnisSet || []).filter(Boolean).length || 0;
+      const contactos = base0.contactos || 0;
+
+      const dnisPorDia = rangoDiasHabiles ? dnisUnicos / rangoDiasHabiles : 0;
 
       const porDniMailLibre = agg?.[0]?.porDniMailLibre || [];
       const regexEmail = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
@@ -753,8 +766,6 @@ export async function comparativo(req, res) {
 
       const tasaContactabilidad = gestiones ? (contactos * 100) / gestiones : 0;
 
-      const efectividadPorDni = { value: 0, total: dnisUnicos };
-
       const porHora = (agg?.[0]?.porHora || []).map((h) => {
         const tot = h.gestiones || 0;
         const cont = h.contactos || 0;
@@ -764,6 +775,7 @@ export async function comparativo(req, res) {
           tasaContacto: tot ? (cont * 100) / tot : 0,
         };
       });
+
       const bestPct = porHora.reduce(
         (a, b) => (b.tasaContacto > a.tasaContacto ? b : a),
         { tasaContacto: -1, hora: "--:--" }
@@ -778,7 +790,7 @@ export async function comparativo(req, res) {
         dnisUnicos,
         gestionesPorCaso: dnisUnicos ? gestiones / dnisUnicos : 0,
         tasaContactabilidad,
-        efectividadContacto: efectividadPorDni.value,
+        efectividadContacto: 0,
         dnisPorDiaHabil: dnisPorDia,
         ritmoEntreCasosMin: null,
         promedioMailsPorDni,
@@ -790,32 +802,17 @@ export async function comparativo(req, res) {
     const rangoDiasActual = daysHabilesEntre(d1, d2);
     const rangoDiasPrevio = daysHabilesEntre(prevStart, prevEnd);
 
-    function daysHabilesEntre(a, b) {
-      let c = 0;
-      const d = new Date(a);
-      while (d <= b) {
-        const wd = d.getUTCDay();
-        if (wd >= 1 && wd <= 5) c++;
-        d.setUTCDate(d.getUTCDate() + 1);
-      }
-      return Math.max(c, 1);
-    }
-
     const actual = fold(actAgg, rangoDiasActual);
     const previo = fold(prevAgg, rangoDiasPrevio);
 
-    const delta = (act, prev) => ({
-      actual: act,
-      previo: prev,
-      deltaAbs:
-        Number.isFinite(act) && Number.isFinite(prev) ? act - prev : null,
-      deltaPct:
-        Number.isFinite(prev) && prev !== 0 && Number.isFinite(act)
-          ? ((act - prev) * 100) / prev
-          : null,
-    });
-
-    const prevGestiones = previo.gestiones;
+    const delta = (act, prev) => {
+      const a = Number.isFinite(Number(act)) ? Number(act) : null;
+      const p = Number.isFinite(Number(prev)) ? Number(prev) : null;
+      const deltaAbs = a != null && p != null ? Number(a) - Number(p) : null;
+      const deltaPct =
+        p != null && p !== 0 && a != null ? ((a - p) * 100) / p : null;
+      return { actual: a, previo: p, deltaAbs, deltaPct };
+    };
 
     const out = {
       rango: {
@@ -829,40 +826,31 @@ export async function comparativo(req, res) {
         },
       },
       kpis: {
-        gestionesTotales: delta(
-          actual.gestiones,
-          Number(prevGestiones) || (prevGestiones === 0 ? null : null)
-        ),
-        dnisUnicos: delta(
-          actual.dnisUnicos,
-          previo.dnisUnicos || (previo.dnisUnicos === 0 ? null : null)
-        ),
+        gestionesTotales: delta(actual.gestiones, previo.gestiones),
+        dnisUnicos: delta(actual.dnisUnicos, previo.dnisUnicos),
         gestionesPorCaso: delta(
           actual.gestionesPorCaso,
-          previo.gestionesPorCaso ?? null
+          previo.gestionesPorCaso
         ),
         tasaContactabilidad: delta(
           actual.tasaContactabilidad,
-          previo.tasaContactabilidad ?? null
+          previo.tasaContactabilidad
         ),
         efectividadContacto: delta(
           actual.efectividadContacto,
-          previo.efectividadContacto ?? null
+          previo.efectividadContacto
         ),
-        dnisPorDiaHabil: delta(
-          actual.dnisPorDiaHabil,
-          previo.dnisPorDiaHabil ?? null
-        ),
+        dnisPorDiaHabil: delta(actual.dnisPorDiaHabil, previo.dnisPorDiaHabil),
         ritmoEntreCasosMin: delta(
           actual.ritmoEntreCasosMin,
-          previo.ritmoEntreCasosMin ?? null
+          previo.ritmoEntreCasosMin
         ),
         mailsPorDniMailLibre: delta(
           actual.promedioMailsPorDni,
-          previo.promedioMailsPorDni ?? null
+          previo.promedioMailsPorDni
         ),
       },
-      previoSinDatos: !prevGestiones || prevGestiones === 0,
+      previoSinDatos: !previo.gestiones,
     };
 
     return res.json({ ok: true, ...out });
@@ -871,12 +859,376 @@ export async function comparativo(req, res) {
   }
 }
 
-// --- NUEVO: /api/reportes-gestiones/analytics/resumen-dia
-export async function resumenDia(req, res) {
+const __cacheResumen = new Map(); // key -> { exp, data }
+const CACHE_TTL_MS = 45_000;
+
+function cacheGet(key) {
+  const hit = __cacheResumen.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.exp) {
+    __cacheResumen.delete(key);
+    return null;
+  }
+  return hit.data;
+}
+function cacheSet(key, data) {
+  __cacheResumen.set(key, { exp: Date.now() + CACHE_TTL_MS, data });
+}
+
+export async function analyticsResumen(req, res) {
   try {
-    const usuarioId = req?.user?.id || req?.usuario?._id || req?.userId || null;
+    const usuarioId = getUsuarioId(req);
     if (!usuarioId)
       return res.status(401).json({ error: "Token invalido o ausente." });
+
+    const owner = new mongoose.Types.ObjectId(usuarioId);
+
+    const {
+      desde,
+      hasta,
+      operador,
+      entidad,
+      tipoContacto,
+      estadoCuenta,
+      dni,
+      topN = 10,
+    } = req.query || {};
+
+    const topNNum = Math.max(1, Math.min(50, parseInt(topN, 10) || 10));
+
+    const d1 = diaInicioUTC(desde);
+    const d2 = diaInicioUTC(hasta);
+    const endOfDayUTC = (d) => new Date(d.getTime() + 86399999);
+
+    if (!d1 || !d2 || d2 < d1) {
+      return res.status(400).json({ error: "Rango de fechas invalido" });
+    }
+
+    const days = Math.floor((endOfDayUTC(d2) - d1) / 86400000) + 1;
+    const prevEnd = new Date(d1.getTime() - 86400000);
+    const prevStart = new Date(prevEnd.getTime() - (days - 1) * 86400000);
+
+    const dniFilter = buildDniFilter(dni);
+
+    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+    const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
+
+    const baseFiltros = {
+      propietario: owner,
+      borrado: { $ne: true },
+    };
+
+    if (dniFilter) baseFiltros.dni = dniFilter;
+    if (fUsuario) baseFiltros.usuario = fUsuario;
+    if (fEntidad) baseFiltros.entidad = fEntidad;
+    if (fTipo) baseFiltros.tipoContacto = fTipo;
+    if (fEstado) baseFiltros.estadoCuenta = fEstado;
+
+    const matchActual = {
+      ...baseFiltros,
+      fecha: { $gte: d1, $lte: endOfDayUTC(d2) },
+    };
+    const matchPrevio = {
+      ...baseFiltros,
+      fecha: { $gte: prevStart, $lte: endOfDayUTC(prevEnd) },
+    };
+
+    const cacheKey = JSON.stringify({
+      owner: String(owner),
+      d1: d1.toISOString().slice(0, 10),
+      d2: d2.toISOString().slice(0, 10),
+      prevStart: prevStart.toISOString().slice(0, 10),
+      prevEnd: prevEnd.toISOString().slice(0, 10),
+      operador: operador || null,
+      entidad: entidad || null,
+      tipoContacto: tipoContacto || null,
+      estadoCuenta: estadoCuenta || null,
+      dni: dni || null,
+      topN: topNNum,
+    });
+
+    const cached = cacheGet(cacheKey);
+    if (cached) return res.json(cached);
+
+    const RESULTADO_SAFE = {
+      $convert: {
+        input: "$resultadoGestion",
+        to: "string",
+        onError: "",
+        onNull: "",
+      },
+    };
+    const ESTADO_SAFE = {
+      $convert: {
+        input: "$estadoCuenta",
+        to: "string",
+        onError: "",
+        onNull: "",
+      },
+    };
+
+    const HORA_SAFE = {
+      $convert: {
+        input: "$hora",
+        to: "string",
+        onError: "00:00:00",
+        onNull: "00:00:00",
+      },
+    };
+
+    const buildPipelineResumen = (matchQ) => [
+      { $match: matchQ },
+      {
+        $project: {
+          dni: 1,
+          nombreDeudor: 1,
+          fecha: 1,
+          horaStr: HORA_SAFE,
+          usuario: 1,
+          entidad: 1,
+          tipoContacto: 1,
+          resultadoGestion: 1,
+          estadoCuenta: 1,
+          telMailMarcado: 1,
+          isContacto: {
+            $or: [
+              {
+                $regexMatch: { input: RESULTADO_SAFE, regex: /contactad[oa]/i },
+              },
+              { $regexMatch: { input: ESTADO_SAFE, regex: /contactad[oa]/i } },
+            ],
+          },
+          isMailLibre: {
+            $regexMatch: { input: RESULTADO_SAFE, regex: /mail\s*libre/i },
+          },
+          horaHH: { $substrBytes: [HORA_SAFE, 0, 2] },
+          diaISO: { $dateToString: { date: "$fecha", format: "%Y-%m-%d" } },
+        },
+      },
+      {
+        $facet: {
+          base: [
+            {
+              $group: {
+                _id: null,
+                gestiones: { $sum: 1 },
+                dnisSet: { $addToSet: "$dni" },
+                contactos: { $sum: { $cond: ["$isContacto", 1, 0] } },
+              },
+            },
+          ],
+          porHora: [
+            {
+              $group: {
+                _id: "$horaHH",
+                gestiones: { $sum: 1 },
+                contactos: { $sum: { $cond: ["$isContacto", 1, 0] } },
+              },
+            },
+            { $sort: { _id: 1 } },
+          ],
+          pieTipos: [
+            {
+              $match: {
+                tipoContacto: { $not: /proceso|batch|autom[aá]tico|ignorar/i },
+              },
+            },
+            { $group: { _id: "$tipoContacto", value: { $sum: 1 } } },
+            { $sort: { value: -1, _id: 1 } },
+          ],
+          topGestiones: [
+            { $group: { _id: "$dni", gestiones: { $sum: 1 } } },
+            { $sort: { gestiones: -1, _id: 1 } },
+            { $limit: topNNum },
+          ],
+          topDias: [
+            { $group: { _id: { dni: "$dni", dia: "$diaISO" } } },
+            { $group: { _id: "$_id.dni", diasTocados: { $sum: 1 } } },
+            { $sort: { diasTocados: -1, _id: 1 } },
+            { $limit: 10 },
+            { $project: { _id: 1, diasTocados: 1 } },
+          ],
+          porDniMailLibre: [
+            {
+              $match: {
+                isMailLibre: true,
+                telMailMarcado: { $type: "string", $ne: "" },
+              },
+            },
+            { $project: { dni: 1, mails: "$telMailMarcado" } },
+          ],
+        },
+      },
+    ];
+
+    const [actAgg, prevAgg] = await Promise.all([
+      ReporteGestion.aggregate(buildPipelineResumen(matchActual))
+        .allowDiskUse(true)
+        .collation({ locale: "es", strength: 1 }),
+      ReporteGestion.aggregate(buildPipelineResumen(matchPrevio))
+        .allowDiskUse(true)
+        .collation({ locale: "es", strength: 1 }),
+    ]);
+
+    function daysHabilesEntre(a, b) {
+      let c = 0;
+      const d = new Date(a);
+      while (d <= b) {
+        const wd = d.getUTCDay();
+        if (wd >= 1 && wd <= 5) c++;
+        d.setUTCDate(d.getUTCDate() + 1);
+      }
+      return Math.max(c, 1);
+    }
+
+    const foldKPIs = (agg, rangoDiasHabiles) => {
+      const base0 = agg?.[0]?.base?.[0] || {};
+      const gestiones = base0.gestiones || 0;
+      const dnisUnicos = (base0.dnisSet || []).filter(Boolean).length || 0;
+      const contactos = base0.contactos || 0;
+
+      const gestionesPorCaso = dnisUnicos ? gestiones / dnisUnicos : 0;
+      const tasaContactabilidad = gestiones ? (contactos * 100) / gestiones : 0;
+      const dnisPorDiaHabil = rangoDiasHabiles
+        ? dnisUnicos / rangoDiasHabiles
+        : 0;
+
+      const porDniMailLibre = agg?.[0]?.porDniMailLibre || [];
+      const regexEmail = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+      const mapa = new Map();
+      for (const r of porDniMailLibre) {
+        const mails = String(r.mails || "").match(regexEmail) || [];
+        if (!mails.length) continue;
+        const key = String(r.dni || "");
+        mapa.set(key, (mapa.get(key) || 0) + mails.length);
+      }
+      let promedioMailsPorDni = 0;
+      if (mapa.size) {
+        const sum = Array.from(mapa.values()).reduce((a, b) => a + b, 0);
+        promedioMailsPorDni = sum / mapa.size;
+      }
+
+      return {
+        gestiones,
+        dnisUnicos,
+        gestionesPorCaso,
+        tasaContactabilidad,
+        dnisPorDiaHabil,
+        mailsPorDniMailLibre: promedioMailsPorDni,
+      };
+    };
+
+    const rangoDiasActual = daysHabilesEntre(d1, d2);
+    const rangoDiasPrevio = daysHabilesEntre(prevStart, prevEnd);
+
+    const kpiAct = foldKPIs(actAgg, rangoDiasActual);
+    const kpiPrev = foldKPIs(prevAgg, rangoDiasPrevio);
+
+    const delta = (act, prev) => {
+      const a = Number.isFinite(Number(act)) ? Number(act) : null;
+      const p = Number.isFinite(Number(prev)) ? Number(prev) : null;
+      const deltaAbs = a != null && p != null ? a - p : null;
+      const deltaPct =
+        p != null && p !== 0 && a != null ? ((a - p) * 100) / p : null;
+      return { actual: a, previo: p, deltaAbs, deltaPct };
+    };
+
+    const seriesHoraFromAgg = (agg) => {
+      const porHora = agg?.[0]?.porHora || [];
+      return porHora.map((h) => {
+        const hh = String(h._id || "").padStart(2, "0");
+        const tot = h.gestiones || 0;
+        const cont = h.contactos || 0;
+        return {
+          hora: `${hh}:00`,
+          gestiones: tot,
+          tasaContacto: tot ? (cont * 100) / tot : 0,
+        };
+      });
+    };
+
+    const payload = {
+      ok: true,
+      rango: {
+        actual: {
+          desde: d1.toISOString().slice(0, 10),
+          hasta: d2.toISOString().slice(0, 10),
+        },
+        previo: {
+          desde: prevStart.toISOString().slice(0, 10),
+          hasta: prevEnd.toISOString().slice(0, 10),
+        },
+      },
+      filtros: {
+        operador: operador || null,
+        entidad: entidad || null,
+        tipoContacto: tipoContacto || null,
+        estadoCuenta: estadoCuenta || null,
+        dni: dni || null,
+        topN: topNNum,
+      },
+      actual: {
+        kpis: {
+          gestionesTotales: delta(kpiAct.gestiones, kpiPrev.gestiones),
+          dnisUnicos: delta(kpiAct.dnisUnicos, kpiPrev.dnisUnicos),
+          gestionesPorCaso: delta(
+            kpiAct.gestionesPorCaso,
+            kpiPrev.gestionesPorCaso
+          ),
+          tasaContactabilidad: delta(
+            kpiAct.tasaContactabilidad,
+            kpiPrev.tasaContactabilidad
+          ),
+          dnisPorDiaHabil: delta(
+            kpiAct.dnisPorDiaHabil,
+            kpiPrev.dnisPorDiaHabil
+          ),
+          mailsPorDniMailLibre: delta(
+            kpiAct.mailsPorDniMailLibre,
+            kpiPrev.mailsPorDniMailLibre
+          ),
+        },
+        seriesHora: seriesHoraFromAgg(actAgg),
+        pieTipos: (actAgg?.[0]?.pieTipos || []).map((x) => ({
+          name: String(x._id || "SIN_TIPO").trim() || "SIN_TIPO",
+          value: x.value || 0,
+        })),
+        topGestiones: actAgg?.[0]?.topGestiones || [],
+        topDias: actAgg?.[0]?.topDias || [],
+      },
+      previo: {
+        kpis: {
+          gestiones: kpiPrev.gestiones,
+          dnisUnicos: kpiPrev.dnisUnicos,
+          gestionesPorCaso: kpiPrev.gestionesPorCaso,
+          tasaContactabilidad: kpiPrev.tasaContactabilidad,
+          dnisPorDiaHabil: kpiPrev.dnisPorDiaHabil,
+          mailsPorDniMailLibre: kpiPrev.mailsPorDniMailLibre,
+        },
+      },
+      previoSinDatos: !kpiPrev.gestiones,
+    };
+
+    cacheSet(cacheKey, payload);
+    return res.json(payload);
+  } catch (e) {
+    console.error("❌ analyticsResumen ERROR:", e);
+    return res.status(500).json({
+      error: e?.message || "Error interno",
+      stack: process.env.NODE_ENV === "development" ? e?.stack : undefined,
+    });
+  }
+}
+
+export async function resumenDia(req, res) {
+  try {
+    const usuarioId = getUsuarioId(req);
+    if (!usuarioId)
+      return res.status(401).json({ error: "Token invalido o ausente." });
+
+    const owner = new mongoose.Types.ObjectId(usuarioId);
 
     const { fecha, operador, entidad, tipoContacto, estadoCuenta } =
       req.query || {};
@@ -887,44 +1239,47 @@ export async function resumenDia(req, res) {
 
     const d = new Date(fecha);
     if (isNaN(d)) return res.status(400).json({ error: "Fecha invalida" });
+
     const desde = new Date(
       Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
     );
     const hasta = new Date(desde.getTime() + 86399999);
 
-    const escapeRegex = (s = "") =>
-      String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const rxExact = (s) =>
-      new RegExp(`^${escapeRegex(String(s).trim())}$`, "i");
-
-    // 🔹 Match GLOBAL: ya no filtramos por propietario, solo por fecha + filtros
     const match = {
+      propietario: owner,
+      borrado: { $ne: true },
       fecha: { $gte: desde, $lte: hasta },
     };
-    if (operador) match.usuario = rxExact(operador);
-    if (entidad) match.entidad = rxExact(entidad);
-    if (tipoContacto) match.tipoContacto = rxExact(tipoContacto);
-    if (estadoCuenta) match.estadoCuenta = rxExact(estadoCuenta);
 
-    const horaNum = {
-      $toInt: {
-        $concat: [
-          { $substr: ["$hora", 0, 2] },
-          { $substr: ["$hora", 3, 2] },
-          { $substr: ["$hora", 6, 2] },
-        ],
+    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+    const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
+
+    if (fUsuario) match.usuario = fUsuario;
+    if (fEntidad) match.entidad = fEntidad;
+    if (fTipo) match.tipoContacto = fTipo;
+    if (fEstado) match.estadoCuenta = fEstado;
+
+    const HORA_SAFE = {
+      $convert: {
+        input: "$hora",
+        to: "string",
+        onError: "00:00:00",
+        onNull: "00:00:00",
       },
     };
 
     const rows = await ReporteGestion.aggregate([
       { $match: match },
+      { $project: { usuario: 1, dni: 1, horaSafe: HORA_SAFE } },
       {
         $group: {
           _id: "$usuario",
           dnisSet: { $addToSet: "$dni" },
           gestiones: { $sum: 1 },
-          minHora: { $min: "$hora" }, // ← usamos la cadena "HH:mm:ss"
-          maxHora: { $max: "$hora" },
+          minHora: { $min: "$horaSafe" },
+          maxHora: { $max: "$horaSafe" },
         },
       },
       {
@@ -933,28 +1288,40 @@ export async function resumenDia(req, res) {
           usuario: "$_id",
           dnisUnicos: { $size: "$dnisSet" },
           gestiones: 1,
-
-          // Mostrar HH:mm directo desde la cadena
-          primeraHora: { $substr: ["$minHora", 0, 5] },
-          ultimaHora: { $substr: ["$maxHora", 0, 5] },
-
-          // Para diferencia, pasamos HH:mm:ss a segundos
+          primeraHora: { $substrBytes: ["$minHora", 0, 5] },
+          ultimaHora: { $substrBytes: ["$maxHora", 0, 5] },
           minSecs: {
             $add: [
               {
-                $multiply: [{ $toInt: { $substr: ["$minHora", 0, 2] } }, 3600],
+                $multiply: [
+                  { $toInt: { $substrBytes: ["$minHora", 0, 2] } },
+                  3600,
+                ],
               },
-              { $multiply: [{ $toInt: { $substr: ["$minHora", 3, 2] } }, 60] },
-              { $toInt: { $substr: ["$minHora", 6, 2] } },
+              {
+                $multiply: [
+                  { $toInt: { $substrBytes: ["$minHora", 3, 2] } },
+                  60,
+                ],
+              },
+              { $toInt: { $substrBytes: ["$minHora", 6, 2] } },
             ],
           },
           maxSecs: {
             $add: [
               {
-                $multiply: [{ $toInt: { $substr: ["$maxHora", 0, 2] } }, 3600],
+                $multiply: [
+                  { $toInt: { $substrBytes: ["$maxHora", 0, 2] } },
+                  3600,
+                ],
               },
-              { $multiply: [{ $toInt: { $substr: ["$maxHora", 3, 2] } }, 60] },
-              { $toInt: { $substr: ["$maxHora", 6, 2] } },
+              {
+                $multiply: [
+                  { $toInt: { $substrBytes: ["$maxHora", 3, 2] } },
+                  60,
+                ],
+              },
+              { $toInt: { $substrBytes: ["$maxHora", 6, 2] } },
             ],
           },
         },
@@ -971,16 +1338,14 @@ export async function resumenDia(req, res) {
               },
               in: {
                 $concat: [
-                  // horas
                   {
                     $toString: {
                       $floor: { $divide: ["$minTrabajados", 3600] },
                     },
                   },
                   ":",
-                  // minutos dos digitos
                   {
-                    $substr: [
+                    $substrBytes: [
                       {
                         $concat: [
                           "00",
@@ -1018,12 +1383,13 @@ export async function resumenDia(req, res) {
   }
 }
 
-// --- NUEVO: /api/reportes-gestiones/analytics/calendario-mes
 export async function calendarioMes(req, res) {
   try {
-    const usuarioId = req?.user?.id || req?.usuario?._id || req?.userId || null;
+    const usuarioId = getUsuarioId(req);
     if (!usuarioId)
       return res.status(401).json({ error: "Token invalido o ausente." });
+
+    const owner = new mongoose.Types.ObjectId(usuarioId);
 
     const { mes, operador, entidad, tipoContacto, estadoCuenta } =
       req.query || {};
@@ -1035,32 +1401,34 @@ export async function calendarioMes(req, res) {
     const desde = new Date(Date.UTC(yy, mm - 1, 1));
     const hasta = new Date(Date.UTC(yy, mm, 0, 23, 59, 59, 999));
 
-    const escapeRegex = (s = "") =>
-      String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const rxExact = (s) =>
-      new RegExp(`^${escapeRegex(String(s).trim())}$`, "i");
-
-    // 🔹 Match GLOBAL: ya no filtramos por propietario, solo por fecha + filtros
     const match = {
+      propietario: owner,
+      borrado: { $ne: true },
       fecha: { $gte: desde, $lte: hasta },
     };
-    if (operador) match.usuario = rxExact(operador);
-    if (entidad) match.entidad = rxExact(entidad);
-    if (tipoContacto) match.tipoContacto = rxExact(tipoContacto);
-    if (estadoCuenta) match.estadoCuenta = rxExact(estadoCuenta);
 
-    const horaNum = {
-      $toInt: {
-        $concat: [
-          { $substr: ["$hora", 0, 2] },
-          { $substr: ["$hora", 3, 2] },
-          { $substr: ["$hora", 6, 2] },
-        ],
+    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+    const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
+
+    if (fUsuario) match.usuario = fUsuario;
+    if (fEntidad) match.entidad = fEntidad;
+    if (fTipo) match.tipoContacto = fTipo;
+    if (fEstado) match.estadoCuenta = fEstado;
+
+    const HORA_SAFE = {
+      $convert: {
+        input: "$hora",
+        to: "string",
+        onError: "00:00:00",
+        onNull: "00:00:00",
       },
     };
 
     let agg = await ReporteGestion.aggregate([
       { $match: match },
+      { $project: { fecha: 1, dni: 1, horaSafe: HORA_SAFE } },
       {
         $group: {
           _id: {
@@ -1068,8 +1436,8 @@ export async function calendarioMes(req, res) {
           },
           dnisSet: { $addToSet: "$dni" },
           gestiones: { $sum: 1 },
-          minHora: { $min: "$hora" }, // ← cadena
-          maxHora: { $max: "$hora" },
+          minHora: { $min: "$horaSafe" },
+          maxHora: { $max: "$horaSafe" },
         },
       },
       {
@@ -1078,28 +1446,40 @@ export async function calendarioMes(req, res) {
           fecha: "$_id.dia",
           dnisUnicos: { $size: "$dnisSet" },
           gestiones: 1,
-
-          // Mostrar HH:mm
-          inicio: { $substr: ["$minHora", 0, 5] },
-          fin: { $substr: ["$maxHora", 0, 5] },
-
-          // segundos para fichas/hora si lo necesitas despues
+          inicio: { $substrBytes: ["$minHora", 0, 5] },
+          fin: { $substrBytes: ["$maxHora", 0, 5] },
           minSecs: {
             $add: [
               {
-                $multiply: [{ $toInt: { $substr: ["$minHora", 0, 2] } }, 3600],
+                $multiply: [
+                  { $toInt: { $substrBytes: ["$minHora", 0, 2] } },
+                  3600,
+                ],
               },
-              { $multiply: [{ $toInt: { $substr: ["$minHora", 3, 2] } }, 60] },
-              { $toInt: { $substr: ["$minHora", 6, 2] } },
+              {
+                $multiply: [
+                  { $toInt: { $substrBytes: ["$minHora", 3, 2] } },
+                  60,
+                ],
+              },
+              { $toInt: { $substrBytes: ["$minHora", 6, 2] } },
             ],
           },
           maxSecs: {
             $add: [
               {
-                $multiply: [{ $toInt: { $substr: ["$maxHora", 0, 2] } }, 3600],
+                $multiply: [
+                  { $toInt: { $substrBytes: ["$maxHora", 0, 2] } },
+                  3600,
+                ],
               },
-              { $multiply: [{ $toInt: { $substr: ["$maxHora", 3, 2] } }, 60] },
-              { $toInt: { $substr: ["$maxHora", 6, 2] } },
+              {
+                $multiply: [
+                  { $toInt: { $substrBytes: ["$maxHora", 3, 2] } },
+                  60,
+                ],
+              },
+              { $toInt: { $substrBytes: ["$maxHora", 6, 2] } },
             ],
           },
         },
@@ -1121,10 +1501,7 @@ export async function calendarioMes(req, res) {
       { $sort: { fecha: 1 } },
     ]).collation({ locale: "es", strength: 1 });
 
-    // 🔹 Formatear correctamente las horas (placeholder por si querés tocar algo luego)
-    agg = agg.map((d) => ({
-      ...d,
-    }));
+    agg = agg.map((d) => ({ ...d }));
 
     return res.json({ ok: true, mes, dias: agg });
   } catch (e) {
@@ -1132,12 +1509,13 @@ export async function calendarioMes(req, res) {
   }
 }
 
-// --- NUEVO: /api/reportes-gestiones/analytics/calendario-matriz
 export async function calendarioMesMatriz(req, res) {
   try {
-    const usuarioId = req?.user?.id || req?.usuario?._id || req?.userId || null;
+    const usuarioId = getUsuarioId(req);
     if (!usuarioId)
       return res.status(401).json({ error: "Token invalido o ausente." });
+
+    const owner = new mongoose.Types.ObjectId(usuarioId);
 
     const { mes, operador, entidad, tipoContacto, estadoCuenta } =
       req.query || {};
@@ -1153,20 +1531,21 @@ export async function calendarioMesMatriz(req, res) {
     const d2 = new Date(Date.UTC(year, month + 1, 0));
     const endOfDay = (d) => new Date(d.getTime() + 86399999);
 
-    // 🔹 Base GLOBAL: ya no filtramos por propietario, solo por fecha
     const base = {
+      propietario: owner,
+      borrado: { $ne: true },
       fecha: { $gte: d1, $lte: endOfDay(d2) },
     };
 
-    const escapeRegex = (s = "") =>
-      String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const rxExact = (s) =>
-      new RegExp(`^${escapeRegex(String(s).trim())}$`, "i");
+    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+    const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
 
-    if (operador) base.usuario = rxExact(operador);
-    if (entidad) base.entidad = rxExact(entidad);
-    if (tipoContacto) base.tipoContacto = rxExact(tipoContacto);
-    if (estadoCuenta) base.estadoCuenta = rxExact(estadoCuenta);
+    if (fUsuario) base.usuario = fUsuario;
+    if (fEntidad) base.entidad = fEntidad;
+    if (fTipo) base.tipoContacto = fTipo;
+    if (fEstado) base.estadoCuenta = fEstado;
 
     const agg = await ReporteGestion.aggregate([
       { $match: base },
@@ -1194,14 +1573,12 @@ export async function calendarioMesMatriz(req, res) {
       { $sort: { usuario: 1, d: 1 } },
     ]).collation({ locale: "es", strength: 1 });
 
-    // 🔹 Crear cabecera de dias del mes
     const diasCabecera = [];
     for (let day = 1; day <= d2.getUTCDate(); day++) {
       const iso = `${mes}-${String(day).padStart(2, "0")}`;
       diasCabecera.push(iso);
     }
 
-    // 🔹 Pivot a { usuario, dias: { yyyy-mm-dd: cuentas } }
     const mapa = new Map();
     for (const r of agg) {
       if (!mapa.has(r.usuario))
@@ -1210,7 +1587,6 @@ export async function calendarioMesMatriz(req, res) {
     }
     const usuariosMatriz = Array.from(mapa.values());
 
-    // 🔹 Totales por dia (para vista de resumen general)
     const totalesPorDia = new Map();
     for (const u of usuariosMatriz) {
       for (const d of Object.keys(u.dias)) {
@@ -1228,15 +1604,12 @@ export async function calendarioMesMatriz(req, res) {
   }
 }
 
-// --- /api/reportes-gestiones/analytics/casos-nuevos (90 días, sin lookup) ---
 export async function casosNuevos(req, res) {
   try {
-    // --- Auth ---
-    const usuarioId = req?.user?.id || req?.usuario?._id || req?.userId || null;
+    const usuarioId = getUsuarioId(req);
     if (!usuarioId)
       return res.status(401).json({ error: "Token inválido o ausente." });
 
-    // --- Helpers de fecha (normalizamos a día UTC) ---
     const toDateOnlyUTC = (s) => {
       if (!s) return null;
       const d = new Date(s);
@@ -1247,7 +1620,6 @@ export async function casosNuevos(req, res) {
     };
     const endOfDayUTC = (d) => new Date(d.getTime() + 86399999);
 
-    // --- Params (acepta desde/hasta o fechaDesde/fechaHasta) ---
     const {
       desde,
       hasta,
@@ -1257,8 +1629,8 @@ export async function casosNuevos(req, res) {
       entidad,
       tipoContacto,
       estadoCuenta,
-      // opcional: días de ventana (default 90)
       minDias: minDiasStr,
+      dni,
     } = req.query || {};
 
     const d1 = toDateOnlyUTC(desde || fechaDesde);
@@ -1269,28 +1641,46 @@ export async function casosNuevos(req, res) {
 
     const MIN_DIAS = Number.isFinite(Number(minDiasStr))
       ? Math.max(0, Number(minDiasStr))
-      : 90; // 🎯 por defecto 90 días
+      : 90;
 
-    // 🔹 Ya no usamos ownerId / propietario, el cálculo es GLOBAL
+    const owner = new mongoose.Types.ObjectId(usuarioId);
 
-    // --- 1) DNI “recientes”: tuvieron al menos UNA gestión en [d1 - MIN_DIAS, d1)
-    const corteInicio = new Date(d1.getTime() - MIN_DIAS * 86400000); // d1 - 90 días
+    // filtros index-friendly (strings normalizados)
+    const usuarioFilter = inExactMultiStrings(operador, (s) => s.toLowerCase());
+    const entidadFilter = inExactMultiStrings(entidad, (s) => s.toUpperCase());
+    const tipoFilter = inExactMultiStrings(tipoContacto, (s) => String(s));
+    const estadoFilter = inExactMultiStrings(estadoCuenta, (s) => String(s));
+    const dniFilter = buildDniFilter(dni);
+
+    // 1) DNIs con actividad reciente antes del rango (ventana)
+    const corteInicio = new Date(d1.getTime() - MIN_DIAS * 86400000);
+
     const recientesDNIs = await ReporteGestion.distinct("dni", {
+      propietario: owner,
+      borrado: { $ne: true },
       fecha: { $gte: corteInicio, $lt: d1 },
-    }).collation({ locale: "es", strength: 1 }); // respeta normalización
+      ...(dniFilter ? { dni: dniFilter } : {}),
+      ...(entidadFilter ? { entidad: entidadFilter } : {}),
+      ...(tipoFilter ? { tipoContacto: tipoFilter } : {}),
+      ...(estadoFilter ? { estadoCuenta: estadoFilter } : {}),
+      ...(usuarioFilter ? { usuario: usuarioFilter } : {}),
+    }).collation({ locale: "es", strength: 1 });
 
     const recientesSet = new Set(recientesDNIs);
 
-    // --- 2) DNIs gestionados en el rango actual, con filtros “visibles” (operador/entidad/etc)
+    // 2) pares (operador,dni) del rango actual (ya filtrado)
     const baseMatch = {
+      propietario: owner,
+      borrado: { $ne: true },
       fecha: { $gte: d1, $lte: endOfDayUTC(d2) },
     };
-    if (operador) baseMatch.usuario = operador; // igualdad pura => index-friendly
-    if (entidad) baseMatch.entidad = entidad;
-    if (tipoContacto) baseMatch.tipoContacto = tipoContacto;
-    if (estadoCuenta) baseMatch.estadoCuenta = estadoCuenta;
 
-    // En vez de $lookup, traemos pares (operador, dni) y agregamos en Node
+    if (usuarioFilter) baseMatch.usuario = usuarioFilter;
+    if (entidadFilter) baseMatch.entidad = entidadFilter;
+    if (tipoFilter) baseMatch.tipoContacto = tipoFilter;
+    if (estadoFilter) baseMatch.estadoCuenta = estadoFilter;
+    if (dniFilter) baseMatch.dni = dniFilter;
+
     const pares = await ReporteGestion.aggregate([
       { $match: baseMatch },
       { $group: { _id: { operador: "$usuario", dni: "$dni" } } },
@@ -1300,24 +1690,19 @@ export async function casosNuevos(req, res) {
       .option({ maxTimeMS: 20000 })
       .collation({ locale: "es", strength: 1 });
 
-    // --- 3) Agregado en memoria: por operador, contá “casosDistintos” y “casosNuevos”
     const porOperador = new Map();
     for (const row of pares) {
       const op = String(row.operador || "").trim();
-      const dni = String(row.dni || "").trim();
-      if (!op || !dni) continue;
+      const d = String(row.dni || "").trim();
+      if (!op || !d) continue;
 
-      if (!porOperador.has(op)) {
+      if (!porOperador.has(op))
         porOperador.set(op, { casosDistintos: 0, casosNuevos: 0 });
-      }
       const acc = porOperador.get(op);
       acc.casosDistintos += 1;
-      if (!recientesSet.has(dni)) {
-        acc.casosNuevos += 1;
-      }
+      if (!recientesSet.has(d)) acc.casosNuevos += 1;
     }
 
-    // --- 4) Salida formateada por operador + totales
     const totalCasosOperador = Array.from(porOperador.entries())
       .map(([operador, vals]) => ({
         operador,
@@ -1353,6 +1738,7 @@ export async function casosNuevos(req, res) {
         entidad: entidad || null,
         tipoContacto: tipoContacto || null,
         estadoCuenta: estadoCuenta || null,
+        dni: dni || null,
         minDias: MIN_DIAS,
       },
     });
@@ -1367,5 +1753,66 @@ export async function casosNuevos(req, res) {
         .json({ error: "Timeout en cálculo de casos nuevos (maxTimeMS)." });
     }
     return res.status(500).json({ error: e.message || "Error interno." });
+  }
+}
+
+export async function ultimaActualizacion(req, res) {
+  try {
+    const usuarioId = getUsuarioId(req);
+    if (!usuarioId)
+      return res.status(401).json({ error: "Token invalido o ausente." });
+
+    const { operador, entidad, tipoContacto, estadoCuenta } = req.query || {};
+
+    const match = {
+      propietario: new mongoose.Types.ObjectId(usuarioId),
+      borrado: { $ne: true },
+    };
+
+    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+    const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
+
+    if (fUsuario) match.usuario = fUsuario;
+    if (fEntidad) match.entidad = fEntidad;
+    if (fTipo) match.tipoContacto = fTipo;
+    if (fEstado) match.estadoCuenta = fEstado;
+
+    const HORA_SAFE = {
+      $convert: {
+        input: "$hora",
+        to: "string",
+        onError: "00:00:00",
+        onNull: "00:00:00",
+      },
+    };
+
+    const [last] = await ReporteGestion.aggregate([
+      { $match: match },
+      { $sort: { fecha: -1, hora: -1, _id: -1 } },
+      { $limit: 1 },
+      {
+        $project: {
+          _id: 0,
+          fecha: {
+            $dateToString: {
+              date: "$fecha",
+              format: "%Y-%m-%d",
+              timezone: "UTC",
+            },
+          },
+          hora: { $substrBytes: [HORA_SAFE, 0, 5] },
+        },
+      },
+    ])
+      .allowDiskUse(false)
+      .collation({ locale: "es", strength: 1 });
+
+    if (!last) return res.json({ ok: true, fecha: null, hora: null });
+
+    return res.json({ ok: true, fecha: last.fecha, hora: last.hora });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
   }
 }
