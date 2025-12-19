@@ -1633,6 +1633,31 @@ export async function casosNuevos(req, res) {
       dni,
     } = req.query || {};
 
+    // ✅ NUEVO: si no hay operador seleccionado, no calculamos "casos nuevos"
+    // (evita que sin filtro operador explote en tiempo)
+    if (!operador || !String(operador).trim()) {
+      return res.json({
+        ok: true,
+        requireOperador: true,
+        message:
+          "Para ver 'Casos nuevos' debe seleccionar al menos un operador.",
+        totalCasosOperador: [],
+        totales: null,
+        params: {
+          desde: (desde || fechaDesde) || null,
+          hasta: (hasta || fechaHasta) || null,
+          operador: null,
+          entidad: entidad || null,
+          tipoContacto: tipoContacto || null,
+          estadoCuenta: estadoCuenta || null,
+          dni: dni || null,
+          minDias: Number.isFinite(Number(minDiasStr))
+            ? Math.max(0, Number(minDiasStr))
+            : 90,
+        },
+      });
+    }
+
     const d1 = toDateOnlyUTC(desde || fechaDesde);
     const d2 = toDateOnlyUTC(hasta || fechaHasta);
     if (!d1 || !d2 || d2 < d1) {
@@ -1729,6 +1754,7 @@ export async function casosNuevos(req, res) {
 
     return res.json({
       ok: true,
+      requireOperador: false,
       totalCasosOperador,
       totales,
       params: {
