@@ -9,8 +9,8 @@ const { Schema } = mongoose;
  * RESULTADO GESTION, ESTADO DE LA CUENTA, TEL-MAIL MARCADO,
  * OBSERVACION GESTION, ENTIDAD
  *
- * 🔑 Clave única de negocio (sin propietario):
- * DNI + FECHA + HORA + USUARIO + TIPO CONTACTO + RESULTADO GESTION + ESTADO DE LA CUENTA + ENTIDAD
+ * 🔑 Clave única de negocio (CON propietario):
+ * PROPIETARIO + DNI + FECHA + HORA + USUARIO + TIPO CONTACTO + RESULTADO GESTION + ESTADO DE LA CUENTA + ENTIDAD
  */
 
 /* =========================
@@ -33,7 +33,10 @@ function normalizarHoraStr(v) {
     const hh = Math.min(23, Math.max(0, Number(m[1] || 0)));
     const mm = Math.min(59, Math.max(0, Number(m[2] || 0)));
     const ss = Math.min(59, Math.max(0, Number(m[3] || 0)));
-    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(
+      2,
+      "0"
+    )}:${String(ss).padStart(2, "0")}`;
   }
   // Soporte "174412", "835", etc.
   if (/^\d{3,6}$/.test(s)) {
@@ -41,7 +44,10 @@ function normalizarHoraStr(v) {
     const hh = Math.min(23, Number(p.slice(0, 2)));
     const mm = Math.min(59, Number(p.slice(2, 4)));
     const ss = Math.min(59, Number(p.slice(4, 6)));
-    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(
+      2,
+      "0"
+    )}:${String(ss).padStart(2, "0")}`;
   }
   return "00:00:00";
 }
@@ -114,19 +120,13 @@ ReporteGestionSchema.index({ propietario: 1, resultadoGestion: 1, fecha: -1 });
 
 // Para búsquedas por DNI dentro del scope del propietario
 ReporteGestionSchema.index({ propietario: 1, dni: 1, fecha: -1 }); // consultas por DNI + rango
-ReporteGestionSchema.index({ propietario: 1, dni: 1 });            // fallback si no hay rango
+ReporteGestionSchema.index({ propietario: 1, dni: 1 }); // fallback si no hay rango
 
 // 🔥 Claves para el cálculo de “casos nuevos (90 días)” SIN $lookup
 // 1) Distinct dni en un rango de fechas → conviene tener fecha al frente
-ReporteGestionSchema.index(
-  { propietario: 1, fecha: 1, dni: 1 },
-  { name: "idx_prop_fecha_dni" }
-);
+ReporteGestionSchema.index({ propietario: 1, fecha: 1, dni: 1 }, { name: "idx_prop_fecha_dni" });
 // 2) También conservamos la variante inversa para otras consultas (ya existente arriba)
-ReporteGestionSchema.index(
-  { propietario: 1, dni: 1, fecha: -1 },
-  { name: "idx_prop_dni_fecha_desc" }
-);
+ReporteGestionSchema.index({ propietario: 1, dni: 1, fecha: -1 }, { name: "idx_prop_dni_fecha_desc" });
 
 // Ordenamiento típico para listados
 ReporteGestionSchema.index(
@@ -142,11 +142,12 @@ ReporteGestionSchema.index(
   { name: "previo_por_dni_usuario_fecha" }
 );
 
-// ✅ Clave ÚNICA de negocio (SIN propietario):
-// dni + fecha + hora + usuario + tipoContacto + resultadoGestion + estadoCuenta + entidad
+// ✅ Clave ÚNICA de negocio (CON propietario):
+// propietario + dni + fecha + hora + usuario + tipoContacto + resultadoGestion + estadoCuenta + entidad
 // (Si hora viene vacía, el setter la normaliza a "00:00:00")
 ReporteGestionSchema.index(
   {
+    propietario: 1, // ✅ clave multi-tenant
     dni: 1,
     fecha: 1,
     hora: 1,
@@ -158,7 +159,7 @@ ReporteGestionSchema.index(
   },
   {
     unique: true,
-    name: "uniq_dni_fecha_hora_usuario_tipo_result_estado_entidad",
+    name: "uniq_prop_dni_fecha_hora_usuario_tipo_result_estado_entidad",
     // Si quisieras ignorar borrados lógicos en la unicidad:
     // partialFilterExpression: { borrado: false },
   }

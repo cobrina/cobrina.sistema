@@ -17,6 +17,75 @@ function getUsuarioId(req) {
   );
 }
 
+/** Helper: rol del usuario desde el token (compat) */
+function getUsuarioRol(req) {
+  return (
+    req?.user?.rol ||
+    req?.user?.role ||
+    req?.usuario?.rol ||
+    req?.usuario?.role ||
+    null
+  );
+}
+
+/** Bloqueo: operadores no pueden acceder a Reportes */
+function ensureNoOperador(req, res) {
+  const rol = String(getUsuarioRol(req) || "").toLowerCase();
+  if (rol === "operador") {
+    res.status(403).json({
+      error: "Acceso denegado: operadores no tienen acceso a Reportes.",
+    });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Scope multi-tenant:
+ * - admin/super-admin => ven TODO (no filtra por propietario)
+ * - otros roles => por seguridad, filtra por propietario
+ * - opcional onlyMine=true => incluso admin/super ve solo lo suyo
+ */
+function ownerScope(req) {
+  const usuarioId = getUsuarioId(req);
+  const rol = String(getUsuarioRol(req) || "").toLowerCase();
+
+  const onlyMine =
+    String(req?.query?.onlyMine ?? req?.body?.onlyMine ?? "").toLowerCase() ===
+    "true";
+
+  if (!usuarioId) return {};
+
+  const isAdminLike = rol === "admin" || rol === "super-admin" || rol === "superadmin";
+
+  if (isAdminLike && !onlyMine) {
+    return {}; // ✅ ver todo
+  }
+
+  // ✅ fallback: ver solo lo propio
+  return { propietario: new mongoose.Types.ObjectId(usuarioId) };
+}
+
+/**
+ * Cancel “soft”:
+ * - Si el cliente cambia de pantalla / cancela fetch => se dispara "close"
+ * - No podemos abortar una query Mongo ya enviada, pero evitamos seguir
+ *   y devolvemos 499 si se cortó la conexión.
+ */
+function attachAbortFlag(req, res) {
+  req.__aborted = false;
+  res.on("close", () => {
+    req.__aborted = true;
+  });
+}
+function throwIfAborted(req) {
+  if (req?.aborted || req?.__aborted) {
+    const err = new Error("CLIENT_ABORTED");
+    err.code = "CLIENT_ABORTED";
+    throw err;
+  }
+}
+
 const escapeRegex = (s = "") =>
   String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -57,9 +126,7 @@ const inExactMultiStrings = (raw, mapFn = (x) => x) => {
 function diaInicioUTC(raw) {
   const d = toDateOnly(raw); // usa el util (puede devolver null)
   if (!d) return null;
-  return new Date(
-    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
-  );
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
 // Devuelve FIN de día UTC (23:59:59.999) a partir de un string de fecha
@@ -84,8 +151,9 @@ function buildDniFilter(raw) {
 }
 
 /** GET /api/reportes-gestiones/ping */
-export async function ping(_req, res) {
+export async function ping(req, res) {
   try {
+    attachAbortFlag(req, res);
     return res.json({ ok: true, ts: Date.now() });
   } catch (e) {
     return res.status(500).json({ error: e.message });
@@ -94,20 +162,22 @@ export async function ping(_req, res) {
 
 export async function cargar(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
     if (!usuarioId) {
       return res.status(401).json({ error: "Token invalido o ausente." });
     }
 
-    const {
-      filas = [],
-      fuenteArchivo = "",
-      reemplazarTodo = false,
-    } = req.body || {};
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
+
+    const { filas = [], fuenteArchivo = "", reemplazarTodo = false } = req.body || {};
     if (!Array.isArray(filas) || filas.length === 0) {
       return res.status(400).json({ error: "No hay filas para cargar." });
     }
 
+    // ✅ Seguridad: cargar siempre pertenece al usuario que cargó (propietario)
     // ✅ Si marcás reemplazarTodo, borra SOLO el universo de este propietario
     if (reemplazarTodo) {
       await ReporteGestion.deleteMany({
@@ -124,12 +194,8 @@ export async function cargar(req, res) {
       Entidad.find().select("nombre").lean(),
     ]);
 
-    const setUsers = new Set(
-      empleados.map((e) => String(e.username || "").toLowerCase())
-    );
-    const setEnts = new Set(
-      entidades.map((e) => String(e.nombre || "").toUpperCase())
-    );
+    const setUsers = new Set(empleados.map((e) => String(e.username || "").toLowerCase()));
+    const setEnts = new Set(entidades.map((e) => String(e.nombre || "").toUpperCase()));
 
     const errores = [];
     const seen = new Set();
@@ -165,9 +231,7 @@ export async function cargar(req, res) {
       }
 
       const tipoContacto = norm(f?.["TIPO CONTACTO"] ?? f?.tipoContacto);
-      const resultadoGestion = norm(
-        f?.["RESULTADO GESTION"] ?? f?.resultadoGestion
-      );
+      const resultadoGestion = norm(f?.["RESULTADO GESTION"] ?? f?.resultadoGestion);
       const estadoCuenta = norm(f?.["ESTADO DE LA CUENTA"] ?? f?.estadoCuenta);
 
       const horaNorm = normalizarHora(horaStr) || "00:00:00";
@@ -272,9 +336,7 @@ export async function cargar(req, res) {
     let duplicadosEnBD = 0;
 
     try {
-      const inserted = await ReporteGestion.insertMany(docs, {
-        ordered: false,
-      });
+      const inserted = await ReporteGestion.insertMany(docs, { ordered: false });
       insertados = Array.isArray(inserted) ? inserted.length : 0;
     } catch (e) {
       const writeErrors =
@@ -287,8 +349,7 @@ export async function cargar(req, res) {
       const isDup = (w, top = e) => {
         const code = w?.code ?? top?.code;
         const codeName = w?.codeName ?? top?.codeName;
-        const msg =
-          w?.errmsg || w?.message || w?.err?.message || top?.message || "";
+        const msg = w?.errmsg || w?.message || w?.err?.message || top?.message || "";
         return (
           Number(code) === 11000 ||
           String(codeName || "").toLowerCase() === "duplicatekey" ||
@@ -317,11 +378,7 @@ export async function cargar(req, res) {
           });
         } else {
           const msg =
-            w?.errmsg ||
-            w?.message ||
-            w?.err?.message ||
-            e?.message ||
-            "Error de insercion";
+            w?.errmsg || w?.message || w?.err?.message || e?.message || "Error de insercion";
           errores.push({
             fila: idx != null ? idx + 2 : "-",
             motivo: msg,
@@ -333,8 +390,7 @@ export async function cargar(req, res) {
       if (!writeErrors.length && /E11000/i.test(String(e?.message || ""))) {
         errores.push({
           fila: "-",
-          motivo:
-            "Gestion duplicada en BD (detectado por mensaje E11000 sin indice de fila)",
+          motivo: "Gestion duplicada en BD (detectado por mensaje E11000 sin indice de fila)",
           row: {},
         });
         duplicadosEnBD++;
@@ -355,15 +411,20 @@ export async function cargar(req, res) {
       errores,
     });
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
   }
 }
 
 export async function listar(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
+
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
 
     const {
       desde,
@@ -380,9 +441,9 @@ export async function listar(req, res) {
       fields = "min",
     } = req.query || {};
 
-    // ✅ Scope por propietario SIEMPRE
+    // ✅ Scope: admin/super ve todo; otros => solo su propietario
     const q = {
-      propietario: new mongoose.Types.ObjectId(usuarioId),
+      ...ownerScope(req),
       borrado: { $ne: true },
     };
 
@@ -453,8 +514,9 @@ export async function listar(req, res) {
       mailsDetectados: 1,
     };
 
-    const projectStage =
-      fields === "min" ? { $project: PROJ_MIN } : { $project: { __v: 0 } };
+    const projectStage = fields === "min" ? { $project: PROJ_MIN } : { $project: { __v: 0 } };
+
+    throwIfAborted(req);
 
     const [total, items] = await Promise.all([
       ReporteGestion.countDocuments(q),
@@ -466,8 +528,11 @@ export async function listar(req, res) {
         projectStage,
       ])
         .allowDiskUse(true)
+        .option({ maxTimeMS: 20000 })
         .collation({ locale: "es", strength: 2 }),
     ]);
+
+    throwIfAborted(req);
 
     return res.json({
       ok: true,
@@ -477,21 +542,27 @@ export async function listar(req, res) {
       items,
     });
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
   }
 }
 
 export async function limpiar(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
+
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
 
     const f = req.body?.filtros || {};
-    const { desde, hasta, operador, entidad, tipoContacto, estadoCuenta, dni } =
-      f;
+    const { desde, hasta, operador, entidad, tipoContacto, estadoCuenta, dni } = f;
 
-    // ✅ Scope por propietario SIEMPRE
+    // ✅ Seguridad: limpiar por defecto SOLO mi propietario
+    // (aunque seas admin/super). Si querés habilitar “borrar todo”, lo hacemos
+    // con un flag explícito, pero NO lo prendo solo por ser admin.
     const q = { propietario: new mongoose.Types.ObjectId(usuarioId) };
 
     if (desde || hasta) {
@@ -517,35 +588,48 @@ export async function limpiar(req, res) {
     const dniFilter = buildDniFilter(dni);
     if (dniFilter) q.dni = dniFilter;
 
+    throwIfAborted(req);
+
     const r = await ReporteGestion.deleteMany(q);
     return res.json({ ok: true, borrados: r.deletedCount || 0 });
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
   }
 }
 
 /** GET /api/reportes-gestiones/export/pdf (stub hasta implementar server-side) */
-export async function exportarPDF(_req, res) {
+export async function exportarPDF(req, res) {
   try {
-    return res
-      .status(501)
-      .json({ ok: false, message: "exportarPDF aun no implementado" });
+    attachAbortFlag(req, res);
+
+    const usuarioId = getUsuarioId(req);
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
+
+    if (!ensureNoOperador(req, res)) return;
+
+    return res.status(501).json({ ok: false, message: "exportarPDF aun no implementado" });
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
   }
 }
 
 export async function catalogos(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
+
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
 
     const { desde, hasta } = req.query || {};
 
-    // ✅ base por propietario
+    // ✅ base: admin/super => todo; otros => solo lo suyo
     const base = {
-      propietario: new mongoose.Types.ObjectId(usuarioId),
+      ...ownerScope(req),
       borrado: { $ne: true },
     };
 
@@ -559,20 +643,19 @@ export async function catalogos(req, res) {
       }
     }
 
+    throwIfAborted(req);
+
     const operadores = (
-      await Empleado.find({ isActive: true })
-        .select("username")
-        .sort({ username: 1 })
-        .lean()
+      await Empleado.find({ isActive: true }).select("username").sort({ username: 1 }).lean()
     ).map((e) => String(e.username || ""));
 
-    const entidades = (
-      await Entidad.find().select("nombre").sort({ numero: 1 }).lean()
-    ).map((x) => String(x.nombre || ""));
+    const entidades = (await Entidad.find().select("nombre").sort({ numero: 1 }).lean()).map((x) =>
+      String(x.nombre || "")
+    );
 
     const [tiposRaw, estadosRaw] = await Promise.all([
-      ReporteGestion.distinct("tipoContacto", base),
-      ReporteGestion.distinct("estadoCuenta", base),
+      ReporteGestion.distinct("tipoContacto", base).collation({ locale: "es", strength: 1 }),
+      ReporteGestion.distinct("estadoCuenta", base).collation({ locale: "es", strength: 1 }),
     ]);
 
     const normTxt = (x) => String(x || "").trim();
@@ -590,6 +673,7 @@ export async function catalogos(req, res) {
       estadosCuenta: ordenar(estadosRaw),
     });
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
   }
 }
@@ -597,15 +681,15 @@ export async function catalogos(req, res) {
 // controllers/reportesGestionesController.js
 export async function comparativo(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId) {
-      return res.status(401).json({ error: "Token invalido o ausente." });
-    }
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
 
-    const owner = new mongoose.Types.ObjectId(usuarioId);
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
 
-    const { desde, hasta, operador, entidad, tipoContacto, estadoCuenta, dni } =
-      req.query || {};
+    const { desde, hasta, operador, entidad, tipoContacto, estadoCuenta, dni } = req.query || {};
 
     const d1 = diaInicioUTC(desde);
     const d2 = diaInicioUTC(hasta);
@@ -619,36 +703,36 @@ export async function comparativo(req, res) {
     const prevEnd = new Date(d1.getTime() - 86400000);
     const prevStart = new Date(prevEnd.getTime() - (days - 1) * 86400000);
 
-    // ✅ Scope por propietario + borrado
-    const base = {
-      propietario: owner,
-      borrado: { $ne: true },
-    };
+    // ✅ Scope: admin/super => todo; otros => solo lo suyo
+    // ✅ Scope: admin/super => todo; otros => solo lo suyo
+const base = {
+  ...ownerScope(req),
+  borrado: { $ne: true },
+};
 
-    const addFilters = (q) => {
-      const out = { ...base };
-      if (q?.fecha) out.fecha = q.fecha;
+const addFilters = (q) => {
+  const out = { ...base };
+  if (q?.fecha) out.fecha = q.fecha;
 
-      const dniFilter = buildDniFilter(dni);
-      if (dniFilter) out.dni = dniFilter;
+  const dniFilter = buildDniFilter(dni);
+  if (dniFilter) out.dni = dniFilter;
 
-      const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
-      const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
-      const fTipo = rxExactMulti(tipoContacto);
-      const fEstado = rxExactMulti(estadoCuenta);
+  const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+  const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+  const fTipo = rxExactMulti(tipoContacto);
+  const fEstado = rxExactMulti(estadoCuenta);
 
-      if (fUsuario) out.usuario = fUsuario;
-      if (fEntidad) out.entidad = fEntidad;
-      if (fTipo) out.tipoContacto = fTipo;
-      if (fEstado) out.estadoCuenta = fEstado;
+  if (fUsuario) out.usuario = fUsuario;
+  if (fEntidad) out.entidad = fEntidad;
+  if (fTipo) out.tipoContacto = fTipo;
+  if (fEstado) out.estadoCuenta = fEstado;
 
-      return out;
-    };
+  return out;
+};
+
 
     const qActual = addFilters({ fecha: { $gte: d1, $lte: endOfDayUTC(d2) } });
-    const qPrevio = addFilters({
-      fecha: { $gte: prevStart, $lte: endOfDayUTC(prevEnd) },
-    });
+    const qPrevio = addFilters({ fecha: { $gte: prevStart, $lte: endOfDayUTC(prevEnd) } });
 
     const esContactoDoc = {
       $or: [
@@ -718,12 +802,16 @@ export async function comparativo(req, res) {
       },
     ];
 
+    throwIfAborted(req);
+
     const [actAgg, prevAgg] = await Promise.all([
       ReporteGestion.aggregate(pipelineKPIs(qActual))
         .allowDiskUse(true)
+        .option({ maxTimeMS: 20000 })
         .collation({ locale: "es", strength: 1 }),
       ReporteGestion.aggregate(pipelineKPIs(qPrevio))
         .allowDiskUse(true)
+        .option({ maxTimeMS: 20000 })
         .collation({ locale: "es", strength: 1 }),
     ]);
 
@@ -757,10 +845,7 @@ export async function comparativo(req, res) {
       }
       let promedioMailsPorDni = 0;
       if (mapaDniMails.size) {
-        const sum = Array.from(mapaDniMails.values()).reduce(
-          (a, b) => a + b,
-          0
-        );
+        const sum = Array.from(mapaDniMails.values()).reduce((a, b) => a + b, 0);
         promedioMailsPorDni = sum / mapaDniMails.size;
       }
 
@@ -809,8 +894,7 @@ export async function comparativo(req, res) {
       const a = Number.isFinite(Number(act)) ? Number(act) : null;
       const p = Number.isFinite(Number(prev)) ? Number(prev) : null;
       const deltaAbs = a != null && p != null ? Number(a) - Number(p) : null;
-      const deltaPct =
-        p != null && p !== 0 && a != null ? ((a - p) * 100) / p : null;
+      const deltaPct = p != null && p !== 0 && a != null ? ((a - p) * 100) / p : null;
       return { actual: a, previo: p, deltaAbs, deltaPct };
     };
 
@@ -828,33 +912,19 @@ export async function comparativo(req, res) {
       kpis: {
         gestionesTotales: delta(actual.gestiones, previo.gestiones),
         dnisUnicos: delta(actual.dnisUnicos, previo.dnisUnicos),
-        gestionesPorCaso: delta(
-          actual.gestionesPorCaso,
-          previo.gestionesPorCaso
-        ),
-        tasaContactabilidad: delta(
-          actual.tasaContactabilidad,
-          previo.tasaContactabilidad
-        ),
-        efectividadContacto: delta(
-          actual.efectividadContacto,
-          previo.efectividadContacto
-        ),
+        gestionesPorCaso: delta(actual.gestionesPorCaso, previo.gestionesPorCaso),
+        tasaContactabilidad: delta(actual.tasaContactabilidad, previo.tasaContactabilidad),
+        efectividadContacto: delta(actual.efectividadContacto, previo.efectividadContacto),
         dnisPorDiaHabil: delta(actual.dnisPorDiaHabil, previo.dnisPorDiaHabil),
-        ritmoEntreCasosMin: delta(
-          actual.ritmoEntreCasosMin,
-          previo.ritmoEntreCasosMin
-        ),
-        mailsPorDniMailLibre: delta(
-          actual.promedioMailsPorDni,
-          previo.promedioMailsPorDni
-        ),
+        ritmoEntreCasosMin: delta(actual.ritmoEntreCasosMin, previo.ritmoEntreCasosMin),
+        mailsPorDniMailLibre: delta(actual.promedioMailsPorDni, previo.promedioMailsPorDni),
       },
       previoSinDatos: !previo.gestiones,
     };
 
     return res.json({ ok: true, ...out });
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
   }
 }
@@ -877,15 +947,20 @@ function cacheSet(key, data) {
 
 export async function analyticsResumen(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
 
-    const owner = new mongoose.Types.ObjectId(usuarioId);
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
 
+    // ✅ ahora acepta rango actual y rango previo explícito
     const {
       desde,
       hasta,
+      prevDesde,
+      prevHasta,
       operador,
       entidad,
       tipoContacto,
@@ -898,45 +973,60 @@ export async function analyticsResumen(req, res) {
 
     const d1 = diaInicioUTC(desde);
     const d2 = diaInicioUTC(hasta);
+    const p1 = prevDesde ? diaInicioUTC(prevDesde) : null;
+    const p2 = prevHasta ? diaInicioUTC(prevHasta) : null;
+
     const endOfDayUTC = (d) => new Date(d.getTime() + 86399999);
 
     if (!d1 || !d2 || d2 < d1) {
       return res.status(400).json({ error: "Rango de fechas invalido" });
     }
 
+    // ✅ si no mandan previo, mantiene el comportamiento anterior
     const days = Math.floor((endOfDayUTC(d2) - d1) / 86400000) + 1;
-    const prevEnd = new Date(d1.getTime() - 86400000);
-    const prevStart = new Date(prevEnd.getTime() - (days - 1) * 86400000);
+    const prevEndFallback = new Date(d1.getTime() - 86400000);
+    const prevStartFallback = new Date(prevEndFallback.getTime() - (days - 1) * 86400000);
+
+    const prevStart = p1 && p2 ? p1 : prevStartFallback;
+    const prevEnd = p1 && p2 ? p2 : prevEndFallback;
 
     const dniFilter = buildDniFilter(dni);
 
-    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
-    const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+    // ✅ más index-friendly para usuario y entidad (ya están normalizados en BD)
+    const fUsuario = inExactMultiStrings(operador, (s) => s.toLowerCase());
+    const fEntidad = inExactMultiStrings(entidad, (s) => s.toUpperCase());
+
+    // (estos dos suelen venir “tal cual”, no garantizamos normalización)
     const fTipo = rxExactMulti(tipoContacto);
     const fEstado = rxExactMulti(estadoCuenta);
 
-    const baseFiltros = {
-      propietario: owner,
-      borrado: { $ne: true },
-    };
+   // ✅ Scope: admin/super => todo; otros => solo lo suyo
+const baseFiltros = {
+  ...ownerScope(req),
+  borrado: { $ne: true },
+};
 
-    if (dniFilter) baseFiltros.dni = dniFilter;
-    if (fUsuario) baseFiltros.usuario = fUsuario;
-    if (fEntidad) baseFiltros.entidad = fEntidad;
-    if (fTipo) baseFiltros.tipoContacto = fTipo;
-    if (fEstado) baseFiltros.estadoCuenta = fEstado;
+if (dniFilter) baseFiltros.dni = dniFilter;
+if (fUsuario) baseFiltros.usuario = fUsuario;
+if (fEntidad) baseFiltros.entidad = fEntidad;
+if (fTipo) baseFiltros.tipoContacto = fTipo;
+if (fEstado) baseFiltros.estadoCuenta = fEstado;
 
-    const matchActual = {
-      ...baseFiltros,
-      fecha: { $gte: d1, $lte: endOfDayUTC(d2) },
-    };
-    const matchPrevio = {
-      ...baseFiltros,
-      fecha: { $gte: prevStart, $lte: endOfDayUTC(prevEnd) },
-    };
+const matchActual = {
+  ...baseFiltros,
+  fecha: { $gte: d1, $lte: endOfDayUTC(d2) },
+};
 
+const matchPrevio = {
+  ...baseFiltros,
+  fecha: { $gte: prevStart, $lte: endOfDayUTC(prevEnd) },
+};
+
+
+    // ✅ cacheKey ya NO incluye owner fijo (porque admin/super ve todo)
+    // (igual conserva filtros, rangos, etc.)
     const cacheKey = JSON.stringify({
-      owner: String(owner),
+      scope: String(req?.query?.onlyMine || req?.body?.onlyMine || "false"),
       d1: d1.toISOString().slice(0, 10),
       d2: d2.toISOString().slice(0, 10),
       prevStart: prevStart.toISOString().slice(0, 10),
@@ -953,29 +1043,13 @@ export async function analyticsResumen(req, res) {
     if (cached) return res.json(cached);
 
     const RESULTADO_SAFE = {
-      $convert: {
-        input: "$resultadoGestion",
-        to: "string",
-        onError: "",
-        onNull: "",
-      },
+      $convert: { input: "$resultadoGestion", to: "string", onError: "", onNull: "" },
     };
     const ESTADO_SAFE = {
-      $convert: {
-        input: "$estadoCuenta",
-        to: "string",
-        onError: "",
-        onNull: "",
-      },
+      $convert: { input: "$estadoCuenta", to: "string", onError: "", onNull: "" },
     };
-
     const HORA_SAFE = {
-      $convert: {
-        input: "$hora",
-        to: "string",
-        onError: "00:00:00",
-        onNull: "00:00:00",
-      },
+      $convert: { input: "$hora", to: "string", onError: "00:00:00", onNull: "00:00:00" },
     };
 
     const buildPipelineResumen = (matchQ) => [
@@ -994,15 +1068,11 @@ export async function analyticsResumen(req, res) {
           telMailMarcado: 1,
           isContacto: {
             $or: [
-              {
-                $regexMatch: { input: RESULTADO_SAFE, regex: /contactad[oa]/i },
-              },
+              { $regexMatch: { input: RESULTADO_SAFE, regex: /contactad[oa]/i } },
               { $regexMatch: { input: ESTADO_SAFE, regex: /contactad[oa]/i } },
             ],
           },
-          isMailLibre: {
-            $regexMatch: { input: RESULTADO_SAFE, regex: /mail\s*libre/i },
-          },
+          isMailLibre: { $regexMatch: { input: RESULTADO_SAFE, regex: /mail\s*libre/i } },
           horaHH: { $substrBytes: [HORA_SAFE, 0, 2] },
           diaISO: { $dateToString: { date: "$fecha", format: "%Y-%m-%d" } },
         },
@@ -1030,11 +1100,7 @@ export async function analyticsResumen(req, res) {
             { $sort: { _id: 1 } },
           ],
           pieTipos: [
-            {
-              $match: {
-                tipoContacto: { $not: /proceso|batch|autom[aá]tico|ignorar/i },
-              },
-            },
+            { $match: { tipoContacto: { $not: /proceso|batch|autom[aá]tico|ignorar/i } } },
             { $group: { _id: "$tipoContacto", value: { $sum: 1 } } },
             { $sort: { value: -1, _id: 1 } },
           ],
@@ -1051,24 +1117,23 @@ export async function analyticsResumen(req, res) {
             { $project: { _id: 1, diasTocados: 1 } },
           ],
           porDniMailLibre: [
-            {
-              $match: {
-                isMailLibre: true,
-                telMailMarcado: { $type: "string", $ne: "" },
-              },
-            },
+            { $match: { isMailLibre: true, telMailMarcado: { $type: "string", $ne: "" } } },
             { $project: { dni: 1, mails: "$telMailMarcado" } },
           ],
         },
       },
     ];
 
+    throwIfAborted(req);
+
     const [actAgg, prevAgg] = await Promise.all([
       ReporteGestion.aggregate(buildPipelineResumen(matchActual))
         .allowDiskUse(true)
+        .option({ maxTimeMS: 25000 })
         .collation({ locale: "es", strength: 1 }),
       ReporteGestion.aggregate(buildPipelineResumen(matchPrevio))
         .allowDiskUse(true)
+        .option({ maxTimeMS: 25000 })
         .collation({ locale: "es", strength: 1 }),
     ]);
 
@@ -1091,9 +1156,7 @@ export async function analyticsResumen(req, res) {
 
       const gestionesPorCaso = dnisUnicos ? gestiones / dnisUnicos : 0;
       const tasaContactabilidad = gestiones ? (contactos * 100) / gestiones : 0;
-      const dnisPorDiaHabil = rangoDiasHabiles
-        ? dnisUnicos / rangoDiasHabiles
-        : 0;
+      const dnisPorDiaHabil = rangoDiasHabiles ? dnisUnicos / rangoDiasHabiles : 0;
 
       const porDniMailLibre = agg?.[0]?.porDniMailLibre || [];
       const regexEmail = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
@@ -1130,8 +1193,7 @@ export async function analyticsResumen(req, res) {
       const a = Number.isFinite(Number(act)) ? Number(act) : null;
       const p = Number.isFinite(Number(prev)) ? Number(prev) : null;
       const deltaAbs = a != null && p != null ? a - p : null;
-      const deltaPct =
-        p != null && p !== 0 && a != null ? ((a - p) * 100) / p : null;
+      const deltaPct = p != null && p !== 0 && a != null ? ((a - p) * 100) / p : null;
       return { actual: a, previo: p, deltaAbs, deltaPct };
     };
 
@@ -1168,27 +1230,17 @@ export async function analyticsResumen(req, res) {
         estadoCuenta: estadoCuenta || null,
         dni: dni || null,
         topN: topNNum,
+        prevDesde: prevDesde || null,
+        prevHasta: prevHasta || null,
       },
       actual: {
         kpis: {
           gestionesTotales: delta(kpiAct.gestiones, kpiPrev.gestiones),
           dnisUnicos: delta(kpiAct.dnisUnicos, kpiPrev.dnisUnicos),
-          gestionesPorCaso: delta(
-            kpiAct.gestionesPorCaso,
-            kpiPrev.gestionesPorCaso
-          ),
-          tasaContactabilidad: delta(
-            kpiAct.tasaContactabilidad,
-            kpiPrev.tasaContactabilidad
-          ),
-          dnisPorDiaHabil: delta(
-            kpiAct.dnisPorDiaHabil,
-            kpiPrev.dnisPorDiaHabil
-          ),
-          mailsPorDniMailLibre: delta(
-            kpiAct.mailsPorDniMailLibre,
-            kpiPrev.mailsPorDniMailLibre
-          ),
+          gestionesPorCaso: delta(kpiAct.gestionesPorCaso, kpiPrev.gestionesPorCaso),
+          tasaContactabilidad: delta(kpiAct.tasaContactabilidad, kpiPrev.tasaContactabilidad),
+          dnisPorDiaHabil: delta(kpiAct.dnisPorDiaHabil, kpiPrev.dnisPorDiaHabil),
+          mailsPorDniMailLibre: delta(kpiAct.mailsPorDniMailLibre, kpiPrev.mailsPorDniMailLibre),
         },
         seriesHora: seriesHoraFromAgg(actAgg),
         pieTipos: (actAgg?.[0]?.pieTipos || []).map((x) => ({
@@ -1214,6 +1266,7 @@ export async function analyticsResumen(req, res) {
     cacheSet(cacheKey, payload);
     return res.json(payload);
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     console.error("❌ analyticsResumen ERROR:", e);
     return res.status(500).json({
       error: e?.message || "Error interno",
@@ -1224,54 +1277,109 @@ export async function analyticsResumen(req, res) {
 
 export async function resumenDia(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
 
-    const owner = new mongoose.Types.ObjectId(usuarioId);
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
 
-    const { fecha, operador, entidad, tipoContacto, estadoCuenta } =
-      req.query || {};
-    if (!fecha)
-      return res
-        .status(400)
-        .json({ error: "Falta parametro fecha (YYYY-MM-DD)" });
+    const {
+      fecha,
+      operador,
+      entidad,
+      tipoContacto,
+      estadoCuenta,
+      dni,
+      minDias = 90, // ✅ ventana para “casos nuevos” en asistencia
+    } = req.query || {};
+
+    if (!fecha) {
+      return res.status(400).json({ error: "Falta parametro fecha (YYYY-MM-DD)" });
+    }
 
     const d = new Date(fecha);
     if (isNaN(d)) return res.status(400).json({ error: "Fecha invalida" });
 
-    const desde = new Date(
-      Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
-    );
+    const desde = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
     const hasta = new Date(desde.getTime() + 86399999);
 
-    const match = {
-      propietario: owner,
+    const MIN_DIAS = Number.isFinite(Number(minDias)) ? Math.max(0, Number(minDias)) : 90;
+    const corteInicio = new Date(desde.getTime() - MIN_DIAS * 86400000);
+
+    // ✅ Scope: admin/super => todo; otros => solo lo suyo
+    const matchBase = {
+      ...ownerScope(req),
       borrado: { $ne: true },
+    };
+
+    const matchDia = {
+      ...matchBase,
       fecha: { $gte: desde, $lte: hasta },
     };
+
+    const dniFilter = buildDniFilter(dni);
+    if (dniFilter) matchDia.dni = dniFilter;
 
     const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
     const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
     const fTipo = rxExactMulti(tipoContacto);
     const fEstado = rxExactMulti(estadoCuenta);
 
-    if (fUsuario) match.usuario = fUsuario;
-    if (fEntidad) match.entidad = fEntidad;
-    if (fTipo) match.tipoContacto = fTipo;
-    if (fEstado) match.estadoCuenta = fEstado;
+    if (fUsuario) matchDia.usuario = fUsuario;
+    if (fEntidad) matchDia.entidad = fEntidad;
+    if (fTipo) matchDia.tipoContacto = fTipo;
+    if (fEstado) matchDia.estadoCuenta = fEstado;
+
+    // Para “casos nuevos” necesitamos también el mismo filtro pero en ventana previa
+    const matchPrev = {
+      ...matchBase,
+      fecha: { $gte: corteInicio, $lt: desde },
+    };
+    if (dniFilter) matchPrev.dni = dniFilter;
+    if (fUsuario) matchPrev.usuario = fUsuario;
+    if (fEntidad) matchPrev.entidad = fEntidad;
+    if (fTipo) matchPrev.tipoContacto = fTipo;
+    if (fEstado) matchPrev.estadoCuenta = fEstado;
 
     const HORA_SAFE = {
-      $convert: {
-        input: "$hora",
-        to: "string",
-        onError: "00:00:00",
-        onNull: "00:00:00",
-      },
+      $convert: { input: "$hora", to: "string", onError: "00:00:00", onNull: "00:00:00" },
     };
 
-    const rows = await ReporteGestion.aggregate([
-      { $match: match },
+    throwIfAborted(req);
+
+    // 1) pares (usuario,dni) del día
+    const paresDia = await ReporteGestion.aggregate([
+      { $match: matchDia },
+      { $project: { usuario: 1, dni: 1, horaSafe: HORA_SAFE } },
+      { $group: { _id: { usuario: "$usuario", dni: "$dni" } } },
+      { $project: { _id: 0, usuario: "$_id.usuario", dni: "$_id.dni" } },
+    ])
+      .allowDiskUse(true)
+      .option({ maxTimeMS: 20000 })
+      .collation({ locale: "es", strength: 1 });
+
+    throwIfAborted(req);
+
+    // 2) pares (usuario,dni) en ventana previa (para saber si ya existían)
+    const paresPrev = await ReporteGestion.aggregate([
+      { $match: matchPrev },
+      { $group: { _id: { usuario: "$usuario", dni: "$dni" } } },
+      { $project: { _id: 0, k: { $concat: ["$_id.usuario", "|", "$_id.dni"] } } },
+    ])
+      .allowDiskUse(true)
+      .option({ maxTimeMS: 20000 })
+      .collation({ locale: "es", strength: 1 });
+
+    const prevSet = new Set((paresPrev || []).map((x) => String(x.k || "")));
+
+    // 3) Ahora sí: resumen por usuario (como tenías) + casos nuevos
+    const matchResumen = { ...matchDia };
+    // reutilizamos matchDia que ya tiene filtros y scope
+
+    const rowsRaw = await ReporteGestion.aggregate([
+      { $match: matchResumen },
       { $project: { usuario: 1, dni: 1, horaSafe: HORA_SAFE } },
       {
         $group: {
@@ -1292,35 +1400,15 @@ export async function resumenDia(req, res) {
           ultimaHora: { $substrBytes: ["$maxHora", 0, 5] },
           minSecs: {
             $add: [
-              {
-                $multiply: [
-                  { $toInt: { $substrBytes: ["$minHora", 0, 2] } },
-                  3600,
-                ],
-              },
-              {
-                $multiply: [
-                  { $toInt: { $substrBytes: ["$minHora", 3, 2] } },
-                  60,
-                ],
-              },
+              { $multiply: [{ $toInt: { $substrBytes: ["$minHora", 0, 2] } }, 3600] },
+              { $multiply: [{ $toInt: { $substrBytes: ["$minHora", 3, 2] } }, 60] },
               { $toInt: { $substrBytes: ["$minHora", 6, 2] } },
             ],
           },
           maxSecs: {
             $add: [
-              {
-                $multiply: [
-                  { $toInt: { $substrBytes: ["$maxHora", 0, 2] } },
-                  3600,
-                ],
-              },
-              {
-                $multiply: [
-                  { $toInt: { $substrBytes: ["$maxHora", 3, 2] } },
-                  60,
-                ],
-              },
+              { $multiply: [{ $toInt: { $substrBytes: ["$maxHora", 0, 2] } }, 3600] },
+              { $multiply: [{ $toInt: { $substrBytes: ["$maxHora", 3, 2] } }, 60] },
               { $toInt: { $substrBytes: ["$maxHora", 6, 2] } },
             ],
           },
@@ -1328,40 +1416,20 @@ export async function resumenDia(req, res) {
       },
       {
         $addFields: {
-          minTrabajados: {
-            $max: [0, { $subtract: ["$maxSecs", "$minSecs"] }],
-          },
+          minTrabajados: { $max: [0, { $subtract: ["$maxSecs", "$minSecs"] }] },
           horasTrabajadasHHMM: {
             $let: {
-              vars: {
-                totalMin: { $floor: { $divide: ["$minTrabajados", 60] } },
-              },
+              vars: { totalMin: { $floor: { $divide: ["$minTrabajados", 60] } } },
               in: {
                 $concat: [
-                  {
-                    $toString: {
-                      $floor: { $divide: ["$minTrabajados", 3600] },
-                    },
-                  },
+                  { $toString: { $floor: { $divide: ["$minTrabajados", 3600] } } },
                   ":",
                   {
                     $substrBytes: [
-                      {
-                        $concat: [
-                          "00",
-                          { $toString: { $mod: ["$$totalMin", 60] } },
-                        ],
-                      },
+                      { $concat: ["00", { $toString: { $mod: ["$$totalMin", 60] } }] },
                       {
                         $subtract: [
-                          {
-                            $strLenCP: {
-                              $concat: [
-                                "00",
-                                { $toString: { $mod: ["$$totalMin", 60] } },
-                              ],
-                            },
-                          },
+                          { $strLenCP: { $concat: ["00", { $toString: { $mod: ["$$totalMin", 60] } }] } },
                           2,
                         ],
                       },
@@ -1375,24 +1443,47 @@ export async function resumenDia(req, res) {
         },
       },
       { $sort: { usuario: 1 } },
-    ]).collation({ locale: "es", strength: 1 });
+    ])
+      .allowDiskUse(true)
+      .option({ maxTimeMS: 20000 })
+      .collation({ locale: "es", strength: 1 });
+
+    // casos nuevos por usuario en el día (según ventana previa)
+    const casosNuevosPorUsuario = new Map();
+    for (const p of paresDia) {
+      const u = String(p.usuario || "");
+      const dnin = String(p.dni || "");
+      if (!u || !dnin) continue;
+      const k = `${u}|${dnin}`;
+      if (!prevSet.has(k)) {
+        casosNuevosPorUsuario.set(u, (casosNuevosPorUsuario.get(u) || 0) + 1);
+      }
+    }
+
+    const rows = (rowsRaw || []).map((r) => ({
+      ...r,
+      casosNuevos: casosNuevosPorUsuario.get(String(r.usuario || "")) || 0,
+      minDias: MIN_DIAS,
+    }));
 
     return res.json({ ok: true, fecha, rows });
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
   }
 }
 
 export async function calendarioMes(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
 
-    const owner = new mongoose.Types.ObjectId(usuarioId);
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
 
-    const { mes, operador, entidad, tipoContacto, estadoCuenta } =
-      req.query || {};
+    const { mes, operador, entidad, tipoContacto, estadoCuenta } = req.query || {};
     if (!mes || !/^\d{4}-\d{2}$/.test(mes)) {
       return res.status(400).json({ error: "Falta parametro mes (YYYY-MM)" });
     }
@@ -1402,7 +1493,7 @@ export async function calendarioMes(req, res) {
     const hasta = new Date(Date.UTC(yy, mm, 0, 23, 59, 59, 999));
 
     const match = {
-      propietario: owner,
+      ...ownerScope(req),
       borrado: { $ne: true },
       fecha: { $gte: desde, $lte: hasta },
     };
@@ -1418,22 +1509,17 @@ export async function calendarioMes(req, res) {
     if (fEstado) match.estadoCuenta = fEstado;
 
     const HORA_SAFE = {
-      $convert: {
-        input: "$hora",
-        to: "string",
-        onError: "00:00:00",
-        onNull: "00:00:00",
-      },
+      $convert: { input: "$hora", to: "string", onError: "00:00:00", onNull: "00:00:00" },
     };
+
+    throwIfAborted(req);
 
     let agg = await ReporteGestion.aggregate([
       { $match: match },
       { $project: { fecha: 1, dni: 1, horaSafe: HORA_SAFE } },
       {
         $group: {
-          _id: {
-            dia: { $dateToString: { date: "$fecha", format: "%Y-%m-%d" } },
-          },
+          _id: { dia: { $dateToString: { date: "$fecha", format: "%Y-%m-%d" } } },
           dnisSet: { $addToSet: "$dni" },
           gestiones: { $sum: 1 },
           minHora: { $min: "$horaSafe" },
@@ -1450,35 +1536,15 @@ export async function calendarioMes(req, res) {
           fin: { $substrBytes: ["$maxHora", 0, 5] },
           minSecs: {
             $add: [
-              {
-                $multiply: [
-                  { $toInt: { $substrBytes: ["$minHora", 0, 2] } },
-                  3600,
-                ],
-              },
-              {
-                $multiply: [
-                  { $toInt: { $substrBytes: ["$minHora", 3, 2] } },
-                  60,
-                ],
-              },
+              { $multiply: [{ $toInt: { $substrBytes: ["$minHora", 0, 2] } }, 3600] },
+              { $multiply: [{ $toInt: { $substrBytes: ["$minHora", 3, 2] } }, 60] },
               { $toInt: { $substrBytes: ["$minHora", 6, 2] } },
             ],
           },
           maxSecs: {
             $add: [
-              {
-                $multiply: [
-                  { $toInt: { $substrBytes: ["$maxHora", 0, 2] } },
-                  3600,
-                ],
-              },
-              {
-                $multiply: [
-                  { $toInt: { $substrBytes: ["$maxHora", 3, 2] } },
-                  60,
-                ],
-              },
+              { $multiply: [{ $toInt: { $substrBytes: ["$maxHora", 0, 2] } }, 3600] },
+              { $multiply: [{ $toInt: { $substrBytes: ["$maxHora", 3, 2] } }, 60] },
               { $toInt: { $substrBytes: ["$maxHora", 6, 2] } },
             ],
           },
@@ -1490,39 +1556,40 @@ export async function calendarioMes(req, res) {
           fichasPorHora: {
             $cond: [
               { $gt: ["$minTrabajados", 0] },
-              {
-                $divide: ["$dnisUnicos", { $divide: ["$minTrabajados", 3600] }],
-              },
+              { $divide: ["$dnisUnicos", { $divide: ["$minTrabajados", 3600] }] },
               0,
             ],
           },
         },
       },
       { $sort: { fecha: 1 } },
-    ]).collation({ locale: "es", strength: 1 });
+    ])
+      .allowDiskUse(true)
+      .option({ maxTimeMS: 20000 })
+      .collation({ locale: "es", strength: 1 });
 
-    agg = agg.map((d) => ({ ...d }));
+agg = agg.map((d) => ({ ...d }));
 
     return res.json({ ok: true, mes, dias: agg });
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
   }
 }
 
 export async function calendarioMesMatriz(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
 
-    const owner = new mongoose.Types.ObjectId(usuarioId);
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
 
-    const { mes, operador, entidad, tipoContacto, estadoCuenta } =
-      req.query || {};
+    const { mes, operador, entidad, tipoContacto, estadoCuenta } = req.query || {};
     if (!/^\d{4}-\d{2}$/.test(mes || "")) {
-      return res
-        .status(400)
-        .json({ error: "Parametro 'mes' invalido (yyyy-mm)." });
+      return res.status(400).json({ error: "Parametro 'mes' invalido (yyyy-mm)." });
     }
 
     const year = Number(mes.slice(0, 4));
@@ -1532,7 +1599,7 @@ export async function calendarioMesMatriz(req, res) {
     const endOfDay = (d) => new Date(d.getTime() + 86399999);
 
     const base = {
-      propietario: owner,
+      ...ownerScope(req),
       borrado: { $ne: true },
       fecha: { $gte: d1, $lte: endOfDay(d2) },
     };
@@ -1546,6 +1613,8 @@ export async function calendarioMesMatriz(req, res) {
     if (fEntidad) base.entidad = fEntidad;
     if (fTipo) base.tipoContacto = fTipo;
     if (fEstado) base.estadoCuenta = fEstado;
+
+    throwIfAborted(req);
 
     const agg = await ReporteGestion.aggregate([
       { $match: base },
@@ -1571,7 +1640,10 @@ export async function calendarioMesMatriz(req, res) {
         },
       },
       { $sort: { usuario: 1, d: 1 } },
-    ]).collation({ locale: "es", strength: 1 });
+    ])
+      .allowDiskUse(true)
+      .option({ maxTimeMS: 20000 })
+      .collation({ locale: "es", strength: 1 });
 
     const diasCabecera = [];
     for (let day = 1; day <= d2.getUTCDate(); day++) {
@@ -1581,8 +1653,7 @@ export async function calendarioMesMatriz(req, res) {
 
     const mapa = new Map();
     for (const r of agg) {
-      if (!mapa.has(r.usuario))
-        mapa.set(r.usuario, { usuario: r.usuario, dias: {} });
+      if (!mapa.has(r.usuario)) mapa.set(r.usuario, { usuario: r.usuario, dias: {} });
       mapa.get(r.usuario).dias[r.d] = r.cuentas;
     }
     const usuariosMatriz = Array.from(mapa.values());
@@ -1593,30 +1664,30 @@ export async function calendarioMesMatriz(req, res) {
         totalesPorDia.set(d, (totalesPorDia.get(d) || 0) + u.dias[d]);
       }
     }
-    const dias = diasCabecera.map((d) => ({
-      dia: d,
-      cuentas: totalesPorDia.get(d) || 0,
-    }));
+    const dias = diasCabecera.map((d) => ({ dia: d, cuentas: totalesPorDia.get(d) || 0 }));
 
     return res.json({ ok: true, dias, usuariosMatriz, diasCabecera });
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
   }
 }
 
 export async function casosNuevos(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token inválido o ausente." });
+    if (!usuarioId) return res.status(401).json({ error: "Token inválido o ausente." });
+
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
 
     const toDateOnlyUTC = (s) => {
       if (!s) return null;
       const d = new Date(s);
       if (isNaN(d)) return null;
-      return new Date(
-        Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
-      );
+      return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
     };
     const endOfDayUTC = (d) => new Date(d.getTime() + 86399999);
 
@@ -1633,44 +1704,22 @@ export async function casosNuevos(req, res) {
       dni,
     } = req.query || {};
 
-    // ✅ NUEVO: si no hay operador seleccionado, no calculamos "casos nuevos"
-    // (evita que sin filtro operador explote en tiempo)
-    if (!operador || !String(operador).trim()) {
-      return res.json({
-        ok: true,
-        requireOperador: true,
-        message:
-          "Para ver 'Casos nuevos' debe seleccionar al menos un operador.",
-        totalCasosOperador: [],
-        totales: null,
-        params: {
-          desde: (desde || fechaDesde) || null,
-          hasta: (hasta || fechaHasta) || null,
-          operador: null,
-          entidad: entidad || null,
-          tipoContacto: tipoContacto || null,
-          estadoCuenta: estadoCuenta || null,
-          dni: dni || null,
-          minDias: Number.isFinite(Number(minDiasStr))
-            ? Math.max(0, Number(minDiasStr))
-            : 90,
-        },
-      });
-    }
-
     const d1 = toDateOnlyUTC(desde || fechaDesde);
     const d2 = toDateOnlyUTC(hasta || fechaHasta);
     if (!d1 || !d2 || d2 < d1) {
       return res.status(400).json({ error: "Rango de fechas inválido." });
     }
 
-    const MIN_DIAS = Number.isFinite(Number(minDiasStr))
-      ? Math.max(0, Number(minDiasStr))
-      : 90;
+    const MIN_DIAS = Number.isFinite(Number(minDiasStr)) ? Math.max(0, Number(minDiasStr)) : 90;
 
-    const owner = new mongoose.Types.ObjectId(usuarioId);
+    // ✅ Scope: admin/super => todo; otros => solo lo suyo
+    const baseTenant = {
+      ...ownerScope(req),
+      borrado: { $ne: true },
+    };
 
     // filtros index-friendly (strings normalizados)
+    // 🔥 OJO: ahora operador es OPCIONAL. Si viene vacío => trae por todos.
     const usuarioFilter = inExactMultiStrings(operador, (s) => s.toLowerCase());
     const entidadFilter = inExactMultiStrings(entidad, (s) => s.toUpperCase());
     const tipoFilter = inExactMultiStrings(tipoContacto, (s) => String(s));
@@ -1680,9 +1729,10 @@ export async function casosNuevos(req, res) {
     // 1) DNIs con actividad reciente antes del rango (ventana)
     const corteInicio = new Date(d1.getTime() - MIN_DIAS * 86400000);
 
+    throwIfAborted(req);
+
     const recientesDNIs = await ReporteGestion.distinct("dni", {
-      propietario: owner,
-      borrado: { $ne: true },
+      ...baseTenant,
       fecha: { $gte: corteInicio, $lt: d1 },
       ...(dniFilter ? { dni: dniFilter } : {}),
       ...(entidadFilter ? { entidad: entidadFilter } : {}),
@@ -1695,8 +1745,7 @@ export async function casosNuevos(req, res) {
 
     // 2) pares (operador,dni) del rango actual (ya filtrado)
     const baseMatch = {
-      propietario: owner,
-      borrado: { $ne: true },
+      ...baseTenant,
       fecha: { $gte: d1, $lte: endOfDayUTC(d2) },
     };
 
@@ -1718,28 +1767,23 @@ export async function casosNuevos(req, res) {
     const porOperador = new Map();
     for (const row of pares) {
       const op = String(row.operador || "").trim();
-      const d = String(row.dni || "").trim();
-      if (!op || !d) continue;
+      const dnin = String(row.dni || "").trim();
+      if (!op || !dnin) continue;
 
-      if (!porOperador.has(op))
-        porOperador.set(op, { casosDistintos: 0, casosNuevos: 0 });
+      if (!porOperador.has(op)) porOperador.set(op, { casosDistintos: 0, casosNuevos: 0 });
       const acc = porOperador.get(op);
       acc.casosDistintos += 1;
-      if (!recientesSet.has(d)) acc.casosNuevos += 1;
+      if (!recientesSet.has(dnin)) acc.casosNuevos += 1;
     }
 
     const totalCasosOperador = Array.from(porOperador.entries())
-      .map(([operador, vals]) => ({
-        operador,
+      .map(([operadorName, vals]) => ({
+        operador: operadorName,
         casosDistintos: vals.casosDistintos,
         casosNuevos: vals.casosNuevos,
-        pctNuevos: vals.casosDistintos
-          ? (vals.casosNuevos * 100) / vals.casosDistintos
-          : 0,
+        pctNuevos: vals.casosDistintos ? (vals.casosNuevos * 100) / vals.casosDistintos : 0,
       }))
-      .sort((a, b) =>
-        a.operador.localeCompare(b.operador, "es", { sensitivity: "base" })
-      );
+      .sort((a, b) => a.operador.localeCompare(b.operador, "es", { sensitivity: "base" }));
 
     const totales = totalCasosOperador.reduce(
       (a, x) => ({
@@ -1748,12 +1792,11 @@ export async function casosNuevos(req, res) {
       }),
       { casosNuevos: 0, casosDistintos: 0 }
     );
-    totales.pctNuevos = totales.casosDistintos
-      ? (totales.casosNuevos * 100) / totales.casosDistintos
-      : 0;
+    totales.pctNuevos = totales.casosDistintos ? (totales.casosNuevos * 100) / totales.casosDistintos : 0;
 
     return res.json({
       ok: true,
+      // ✅ ahora SIEMPRE se puede usar en asistencia sin seleccionar operador
       requireOperador: false,
       totalCasosOperador,
       totales,
@@ -1769,29 +1812,29 @@ export async function casosNuevos(req, res) {
       },
     });
   } catch (e) {
-    if (
-      String(e?.message || "")
-        .toLowerCase()
-        .includes("exceeded time limit")
-    ) {
-      return res
-        .status(504)
-        .json({ error: "Timeout en cálculo de casos nuevos (maxTimeMS)." });
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
+    if (String(e?.message || "").toLowerCase().includes("exceeded time limit")) {
+      return res.status(504).json({ error: "Timeout en cálculo de casos nuevos (maxTimeMS)." });
     }
     return res.status(500).json({ error: e.message || "Error interno." });
   }
 }
 
+
 export async function ultimaActualizacion(req, res) {
   try {
+    attachAbortFlag(req, res);
+
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
+
+    // ✅ Operadores NO pueden acceder
+    if (!ensureNoOperador(req, res)) return;
 
     const { operador, entidad, tipoContacto, estadoCuenta } = req.query || {};
 
     const match = {
-      propietario: new mongoose.Types.ObjectId(usuarioId),
+      ...ownerScope(req),
       borrado: { $ne: true },
     };
 
@@ -1806,13 +1849,10 @@ export async function ultimaActualizacion(req, res) {
     if (fEstado) match.estadoCuenta = fEstado;
 
     const HORA_SAFE = {
-      $convert: {
-        input: "$hora",
-        to: "string",
-        onError: "00:00:00",
-        onNull: "00:00:00",
-      },
+      $convert: { input: "$hora", to: "string", onError: "00:00:00", onNull: "00:00:00" },
     };
+
+    throwIfAborted(req);
 
     const [last] = await ReporteGestion.aggregate([
       { $match: match },
@@ -1822,23 +1862,21 @@ export async function ultimaActualizacion(req, res) {
         $project: {
           _id: 0,
           fecha: {
-            $dateToString: {
-              date: "$fecha",
-              format: "%Y-%m-%d",
-              timezone: "UTC",
-            },
+            $dateToString: { date: "$fecha", format: "%Y-%m-%d", timezone: "UTC" },
           },
           hora: { $substrBytes: [HORA_SAFE, 0, 5] },
         },
       },
     ])
       .allowDiskUse(false)
+      .option({ maxTimeMS: 10000 })
       .collation({ locale: "es", strength: 1 });
 
     if (!last) return res.json({ ok: true, fecha: null, hora: null });
 
     return res.json({ ok: true, fecha: last.fecha, hora: last.hora });
   } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
   }
 }
