@@ -22,6 +22,7 @@ import reportesGestionesRoutes from "./routes/reportesGestiones.js"; // ✅ NUEV
 
 // 👇 Modelo para manejar índices de la colección de reportes
 import ReporteGestion from "./models/ReporteGestion.js"; // ✅ NUEVO
+import auditoriasRoutes from "./routes/auditorias.js";
 
 dotenv.config();
 
@@ -106,6 +107,7 @@ app.use("/entidades", entidadRoutes);
 app.use("/api/stickies", stickiesRoutes);
 app.use("/api/tips", tipsRoutes); // Tips de Cobranza
 app.use("/api/reportes-gestiones", reportesGestionesRoutes); // ✅ NUEVA RUTA
+app.use("/api/auditorias", auditoriasRoutes);
 
 // 🔵 Ruta de prueba
 app.get("/", (req, res) => {
