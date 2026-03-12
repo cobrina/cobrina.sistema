@@ -27,7 +27,13 @@ function getUsuarioId(req) {
 }
 
 function getUsuarioRol(req) {
-  return req?.user?.rol || req?.user?.role || req?.usuario?.rol || req?.usuario?.role || null;
+  return (
+    req?.user?.rol ||
+    req?.user?.role ||
+    req?.usuario?.rol ||
+    req?.usuario?.role ||
+    null
+  );
 }
 
 function getUsuarioUsername(req) {
@@ -37,7 +43,9 @@ function getUsuarioUsername(req) {
 function ensureNoOperador(req, res) {
   const rol = String(getUsuarioRol(req) || "").toLowerCase();
   if (rol === "operador" || rol === "operador-vip") {
-    res.status(403).json({ error: "Acceso denegado: operadores no tienen acceso a Auditorías." });
+    res.status(403).json({
+      error: "Acceso denegado: operadores no tienen acceso a Auditorías.",
+    });
     return false;
   }
   return true;
@@ -46,10 +54,13 @@ function ensureNoOperador(req, res) {
 function ownerScope(req) {
   const usuarioId = getUsuarioId(req);
   const rol = String(getUsuarioRol(req) || "").toLowerCase();
-  const onlyMine = String(req?.query?.onlyMine ?? req?.body?.onlyMine ?? "").toLowerCase() === "true";
+  const onlyMine =
+    String(req?.query?.onlyMine ?? req?.body?.onlyMine ?? "").toLowerCase() ===
+    "true";
 
   if (!usuarioId) return {};
-  const isAdminLike = rol === "admin" || rol === "super-admin" || rol === "superadmin";
+  const isAdminLike =
+    rol === "admin" || rol === "super-admin" || rol === "superadmin";
 
   if (isAdminLike && !onlyMine) return {}; // ver todo
   return { propietario: new mongoose.Types.ObjectId(usuarioId) };
@@ -58,7 +69,9 @@ function ownerScope(req) {
 function diaInicioUTC(raw) {
   const d = toDateOnly(raw);
   if (!d) return null;
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  return new Date(
+    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
+  );
 }
 function diaFinUTC(raw) {
   const d0 = diaInicioUTC(raw);
@@ -67,26 +80,51 @@ function diaFinUTC(raw) {
 }
 
 /* ============================================================
-   Duración (segundos)
+   Duración (minutos) + compatibilidad con segundos viejos
    ============================================================ */
-function parseDuracionSegundos(it = {}) {
-  // Acepta variantes para no pelearse con el front:
-  // duracionSegundos | duracion | duracionSeconds | segundos
-  const raw =
+function round2(n) {
+  return Number(Number(n || 0).toFixed(2));
+}
+
+function parseDuracionMinutos(it = {}) {
+  // ✅ NUEVO formato preferido
+  const rawMin = it?.duracionMinutos ?? it?.duracionMin ?? it?.minutos;
+
+  if (rawMin != null && rawMin !== "") {
+    const n = Number(String(rawMin).replace(",", "."));
+    if (!Number.isFinite(n)) return 0;
+    return Math.max(0, Math.min(480, round2(n))); // 0..8hs
+  }
+
+  // ✅ Compatibilidad con lo viejo en segundos
+  const rawSeg =
     it?.duracionSegundos ??
-    it?.duracion ??
     it?.duracionSeconds ??
     it?.segundos ??
     it?.duracion_s ??
     it?.duracionEnSegundos;
 
-  if (raw == null || raw === "") return 0;
+  if (rawSeg == null || rawSeg === "") return 0;
 
-  const n = Number(String(raw).replace(",", "."));
-  if (!Number.isFinite(n)) return 0;
+  const sec = Number(String(rawSeg).replace(",", "."));
+  if (!Number.isFinite(sec)) return 0;
 
-  // clamp razonable: 0..8hs
-  return Math.max(0, Math.min(8 * 60 * 60, Math.round(n)));
+  return Math.max(0, Math.min(480, round2(sec / 60)));
+}
+
+function parseDuracionSegundosCompat(it = {}) {
+  const mins = parseDuracionMinutos(it);
+  return Math.round(mins * 60);
+}
+
+function getDuracionMinutosSalida(it = {}) {
+  const mins = Number(it?.duracionMinutos);
+  if (Number.isFinite(mins) && mins > 0) return round2(mins);
+
+  const seg = Number(it?.duracionSegundos);
+  if (Number.isFinite(seg) && seg > 0) return round2(seg / 60);
+
+  return 0;
 }
 
 function isLlamada(tipoInteraccion = "") {
@@ -98,8 +136,16 @@ function isLlamada(tipoInteraccion = "") {
    ============================================================ */
 const CRITERIOS = [
   // Presentación (3)
-  { id: 1, grupo: "presentacion", label: "Se presenta cordial y correctamente" },
-  { id: 2, grupo: "presentacion", label: "Solicita por titular o encargado de pago" },
+  {
+    id: 1,
+    grupo: "presentacion",
+    label: "Se presenta cordial y correctamente",
+  },
+  {
+    id: 2,
+    grupo: "presentacion",
+    label: "Solicita por titular o encargado de pago",
+  },
   { id: 3, grupo: "presentacion", label: "Expone motivo del llamado" },
 
   // Negociación (7)
@@ -107,26 +153,54 @@ const CRITERIOS = [
   { id: 5, grupo: "negociacion", label: "Consulta motivos de atraso" },
   { id: 6, grupo: "negociacion", label: "Negocia el saldo a abonar" },
   { id: 7, grupo: "negociacion", label: "Argumenta ante historial de gestion" },
-  { id: 8, grupo: "negociacion", label: "Refuta argumentos frente a negativa de pago" },
+  {
+    id: 8,
+    grupo: "negociacion",
+    label: "Refuta argumentos frente a negativa de pago",
+  },
   { id: 9, grupo: "negociacion", label: "Informa consecuencias de atraso" },
   { id: 10, grupo: "negociacion", label: "Brinda información relevante" },
 
   // Cierre (6)
-  { id: 11, grupo: "cierre", label: "Comprometió al titular o encargado de pago" },
-  { id: 12, grupo: "cierre", label: "Solicita teléfonos alternativos / implementa otro medio" },
+  {
+    id: 11,
+    grupo: "cierre",
+    label: "Comprometió al titular o encargado de pago",
+  },
+  {
+    id: 12,
+    grupo: "cierre",
+    label: "Solicita teléfonos alternativos / implementa otro medio",
+  },
   { id: 13, grupo: "cierre", label: "Informa saldo deudor negociado" },
-  { id: 14, grupo: "cierre", label: "Fecha de pago o de nueva comunicación (Acuerdo/Contacto)" },
-  { id: 15, grupo: "cierre", label: "Holdeo correcto (Promesa o fecha de nueva comunicación)" },
+  {
+    id: 14,
+    grupo: "cierre",
+    label: "Fecha de pago o de nueva comunicación (Acuerdo/Contacto)",
+  },
+  {
+    id: 15,
+    grupo: "cierre",
+    label: "Holdeo correcto (Promesa o fecha de nueva comunicación)",
+  },
   { id: 16, grupo: "cierre", label: "Informa y/o confirma medios de pago" },
 
   // Calidad de Gestión (8)
   { id: 17, grupo: "calidad", label: "Formalidad" },
-  { id: 18, grupo: "calidad", label: "Transmite urgencia con seguridad y firmeza" },
+  {
+    id: 18,
+    grupo: "calidad",
+    label: "Transmite urgencia con seguridad y firmeza",
+  },
   { id: 19, grupo: "calidad", label: "Aplica gestion MORA TARDIA" },
   { id: 20, grupo: "calidad", label: "Manejo de conflicto" },
   { id: 21, grupo: "calidad", label: "Analiza el comportamiento del titular" },
   { id: 22, grupo: "calidad", label: "Resolución de conflicto" },
-  { id: 23, grupo: "calidad", label: "Observaciones correctas y completas (Mango)" },
+  {
+    id: 23,
+    grupo: "calidad",
+    label: "Observaciones correctas y completas (Mango)",
+  },
   { id: 24, grupo: "calidad", label: "Cierre de gestión (Mango)" },
 ];
 
@@ -144,7 +218,11 @@ const UMBRAL_BAJO = 6.5;
 const UMBRAL_ALTO = 7.5;
 
 function uniqNums(arr = []) {
-  return [...new Set((arr || []).map((n) => Number(n)).filter((n) => Number.isFinite(n)))];
+  return [
+    ...new Set(
+      (arr || []).map((n) => Number(n)).filter((n) => Number.isFinite(n))
+    ),
+  ];
 }
 
 function normalizarFallos(item = {}) {
@@ -171,6 +249,30 @@ function normalizarFallos(item = {}) {
   return fallos;
 }
 
+function parseComentariosCriterio(it = {}) {
+  const raw =
+    it?.comentariosCriterio ??
+    it?.comentariosPorCriterio ??
+    it?.comentarios ??
+    {};
+
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+
+  const out = {};
+
+  for (const [key, value] of Object.entries(raw)) {
+    const criterioId = Number(key);
+    if (!CRITERIOS_BY_ID.has(criterioId)) continue;
+
+    const txt = String(value ?? "").trim();
+    if (!txt) continue;
+
+    out[String(criterioId)] = txt.slice(0, 1000);
+  }
+
+  return out;
+}
+
 function calcScoresFromFallos(fallosIds = []) {
   const fallos = new Set(fallosIds);
 
@@ -184,8 +286,12 @@ function calcScoresFromFallos(fallosIds = []) {
   }
 
   const scoreBloques = {
-    presentacion: totales.presentacion ? (okCount.presentacion / totales.presentacion) * 10 : 0,
-    negociacion: totales.negociacion ? (okCount.negociacion / totales.negociacion) * 10 : 0,
+    presentacion: totales.presentacion
+      ? (okCount.presentacion / totales.presentacion) * 10
+      : 0,
+    negociacion: totales.negociacion
+      ? (okCount.negociacion / totales.negociacion) * 10
+      : 0,
     cierre: totales.cierre ? (okCount.cierre / totales.cierre) * 10 : 0,
     calidad: totales.calidad ? (okCount.calidad / totales.calidad) * 10 : 0,
   };
@@ -208,6 +314,33 @@ function semaforo(scoreFinal) {
   return "medio";
 }
 
+function normalizarItemSalida(it = {}) {
+  const comentarios =
+    it?.comentariosCriterio instanceof Map
+      ? Object.fromEntries(it.comentariosCriterio)
+      : it?.comentariosCriterio || {};
+
+  return {
+    ...it,
+    duracionMinutos: getDuracionMinutosSalida(it),
+    comentariosCriterio: comentarios,
+  };
+}
+
+function normalizarAuditoriaSalida(doc) {
+  if (!doc) return doc;
+
+  const base =
+    typeof doc?.toObject === "function" ? doc.toObject() : { ...doc };
+
+  return {
+    ...base,
+    items: Array.isArray(base.items)
+      ? base.items.map(normalizarItemSalida)
+      : [],
+  };
+}
+
 /* ============================================================
    Endpoints
    ============================================================ */
@@ -219,7 +352,8 @@ export async function catalogos(req, res) {
   try {
     attachAbortFlag(req, res);
 
-    if (!getUsuarioId(req)) return res.status(401).json({ error: "Token inválido o ausente." });
+    if (!getUsuarioId(req))
+      return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
     throwIfAborted(req);
@@ -234,9 +368,22 @@ export async function catalogos(req, res) {
         .lean()
     ).map((x) => String(x.username || ""));
 
-    const motivos = ["aleatorio", "prueba", "bajo-rendimiento", "caso-nuevo", "reclamo-conflicto", "pedido-cliente", "otro"];
+    const motivos = [
+      "aleatorio",
+      "prueba",
+      "bajo-rendimiento",
+      "caso-nuevo",
+      "reclamo-conflicto",
+      "pedido-cliente",
+      "otro",
+    ];
 
-    const tiposInteraccion = ["LLAMADA_ENTRANTE", "LLAMADA_SALIENTE", "MENSAJE_ENTRANTE", "MENSAJE_SALIENTE"];
+    const tiposInteraccion = [
+      "LLAMADA_ENTRANTE",
+      "LLAMADA_SALIENTE",
+      "MENSAJE_ENTRANTE",
+      "MENSAJE_SALIENTE",
+    ];
 
     return res.json({
       ok: true,
@@ -260,43 +407,73 @@ export async function crear(req, res) {
     attachAbortFlag(req, res);
 
     const usuarioId = getUsuarioId(req);
-    const auditorUsername = String(getUsuarioUsername(req) || "").toLowerCase().trim();
+    const auditorUsername = String(getUsuarioUsername(req) || "")
+      .toLowerCase()
+      .trim();
 
-    if (!usuarioId) return res.status(401).json({ error: "Token inválido o ausente." });
+    if (!usuarioId)
+      return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
     const body = req.body || {};
-    const operadorUsername = String(body.operadorUsername || "").toLowerCase().trim();
+    const operadorUsername = String(body.operadorUsername || "")
+      .toLowerCase()
+      .trim();
 
-    if (!operadorUsername) return res.status(400).json({ error: "operadorUsername es obligatorio." });
-    if (!auditorUsername) return res.status(400).json({ error: "No se pudo determinar auditorUsername desde el token." });
+    if (!operadorUsername)
+      return res
+        .status(400)
+        .json({ error: "operadorUsername es obligatorio." });
+    if (!auditorUsername)
+      return res.status(400).json({
+        error: "No se pudo determinar auditorUsername desde el token.",
+      });
 
-    const op = await Empleado.findOne({ username: operadorUsername }).select("isActive role username").lean();
+    const op = await Empleado.findOne({ username: operadorUsername })
+      .select("isActive role username")
+      .lean();
     if (!op) return res.status(400).json({ error: "Operador no existe." });
-    if (op.isActive === false) return res.status(400).json({ error: "Operador inactivo." });
+    if (op.isActive === false)
+      return res.status(400).json({ error: "Operador inactivo." });
 
     const itemsIn = Array.isArray(body.items) ? body.items : [];
-    if (itemsIn.length < 1) return res.status(400).json({ error: "Debe incluir al menos 1 audio/item." });
-    if (itemsIn.length > 5) return res.status(400).json({ error: "Máximo 5 audios/items por auditoría." });
+    if (itemsIn.length < 1)
+      return res
+        .status(400)
+        .json({ error: "Debe incluir al menos 1 audio/item." });
+    if (itemsIn.length > 5)
+      return res
+        .status(400)
+        .json({ error: "Máximo 5 audios/items por auditoría." });
 
     const items = itemsIn.map((it, idx) => {
       const telefono = String(it.telefono || "").trim();
-      if (!telefono) throw new Error(`Cada item debe incluir telefono. (item #${idx + 1})`);
+      if (!telefono)
+        throw new Error(`Cada item debe incluir telefono. (item #${idx + 1})`);
 
       const dni = String(it.dni || "").trim();
-      const cartera = String(it.cartera || "").trim().toUpperCase();
+      const cartera = String(it.cartera || "")
+        .trim()
+        .toUpperCase();
 
       const fechaAudio = it.fechaAudio ? toDateOnly(it.fechaAudio) : null;
       const horaAprox = it.horaAprox ? normalizarHora(it.horaAprox) : "";
 
-      const tipoInteraccion = String(it.tipoInteraccion || "LLAMADA_SALIENTE").trim().toUpperCase();
+      const tipoInteraccion = String(it.tipoInteraccion || "LLAMADA_SALIENTE")
+        .trim()
+        .toUpperCase();
       const referencia = String(it.referencia || "").trim();
 
-      const duracionSegundos = parseDuracionSegundos(it);
-      if (isLlamada(tipoInteraccion) && duracionSegundos <= 0) {
-        throw new Error(`Falta duración (segundos) para llamada en item #${idx + 1}.`);
+      const duracionMinutos = parseDuracionMinutos(it);
+      const duracionSegundos = parseDuracionSegundosCompat(it);
+
+      if (isLlamada(tipoInteraccion) && duracionMinutos <= 0) {
+        throw new Error(
+          `Falta duración (minutos) para llamada en item #${idx + 1}.`
+        );
       }
 
+      const comentariosCriterio = parseComentariosCriterio(it);
       const fallosIds = normalizarFallos(it);
       const { scoreBloques, scoreAudio } = calcScoresFromFallos(fallosIds);
 
@@ -308,7 +485,9 @@ export async function crear(req, res) {
         horaAprox,
         tipoInteraccion,
         referencia,
+        duracionMinutos,
         duracionSegundos,
+        comentariosCriterio,
         fallosIds,
         scoreAudio,
         scoreBloques,
@@ -316,10 +495,16 @@ export async function crear(req, res) {
     });
 
     const scoreFinal = Number(
-      (items.reduce((acc, x) => acc + (Number(x.scoreAudio) || 0), 0) / items.length).toFixed(6)
+      (
+        items.reduce((acc, x) => acc + (Number(x.scoreAudio) || 0), 0) /
+        items.length
+      ).toFixed(6)
     );
 
-    const avg = (k) => items.reduce((acc, x) => acc + (Number(x.scoreBloques?.[k]) || 0), 0) / items.length;
+    const avg = (k) =>
+      items.reduce((acc, x) => acc + (Number(x.scoreBloques?.[k]) || 0), 0) /
+      items.length;
+
     const scoreBloques = {
       presentacion: Number(avg("presentacion").toFixed(6)),
       negociacion: Number(avg("negociacion").toFixed(6)),
@@ -331,8 +516,12 @@ export async function crear(req, res) {
       propietario: new mongoose.Types.ObjectId(usuarioId),
       operadorUsername,
       auditorUsername,
-      fechaAuditoria: body.fechaAuditoria ? toDateOnly(body.fechaAuditoria) : new Date(),
-      motivosSeleccion: Array.isArray(body.motivosSeleccion) ? body.motivosSeleccion : [],
+      fechaAuditoria: body.fechaAuditoria
+        ? toDateOnly(body.fechaAuditoria)
+        : new Date(),
+      motivosSeleccion: Array.isArray(body.motivosSeleccion)
+        ? body.motivosSeleccion
+        : [],
       // ❌ feedbackInformado / requiereCoaching removidos
       observacionesGenerales: String(body.observacionesGenerales || "").trim(),
       puntosPositivos: String(body.puntosPositivos || "").trim(),
@@ -344,7 +533,9 @@ export async function crear(req, res) {
       borrado: false,
     });
 
-    return res.status(201).json({ ok: true, item: doc });
+    return res
+      .status(201)
+      .json({ ok: true, item: normalizarAuditoriaSalida(doc) });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
@@ -356,10 +547,19 @@ export async function listar(req, res) {
     attachAbortFlag(req, res);
 
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId) return res.status(401).json({ error: "Token inválido o ausente." });
+    if (!usuarioId)
+      return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
-    const { desde, hasta, operador, auditor, semaforo: sem, page = 1, limit = 50 } = req.query || {};
+    const {
+      desde,
+      hasta,
+      operador,
+      auditor,
+      semaforo: sem,
+      page = 1,
+      limit = 50,
+    } = req.query || {};
 
     const base = { ...ownerScope(req), borrado: { $ne: true } };
 
@@ -399,7 +599,7 @@ export async function listar(req, res) {
       page: p,
       limit: lim,
       total,
-      items,
+      items: Array.isArray(items) ? items.map(normalizarAuditoriaSalida) : [],
     });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
@@ -412,7 +612,8 @@ export async function detalle(req, res) {
     attachAbortFlag(req, res);
 
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId) return res.status(401).json({ error: "Token inválido o ausente." });
+    if (!usuarioId)
+      return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
     const { id } = req.params;
@@ -423,9 +624,10 @@ export async function detalle(req, res) {
       borrado: { $ne: true },
     }).lean();
 
-    if (!doc) return res.status(404).json({ error: "Auditoría no encontrada." });
+    if (!doc)
+      return res.status(404).json({ error: "Auditoría no encontrada." });
 
-    return res.json({ ok: true, item: doc });
+    return res.json({ ok: true, item: normalizarAuditoriaSalida(doc) });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
@@ -437,7 +639,8 @@ export async function editar(req, res) {
     attachAbortFlag(req, res);
 
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId) return res.status(401).json({ error: "Token inválido o ausente." });
+    if (!usuarioId)
+      return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
     const { id } = req.params;
@@ -449,41 +652,80 @@ export async function editar(req, res) {
       borrado: { $ne: true },
     });
 
-    if (!existing) return res.status(404).json({ error: "Auditoría no encontrada." });
+    if (!existing)
+      return res.status(404).json({ error: "Auditoría no encontrada." });
 
-    if (body.operadorUsername) existing.operadorUsername = String(body.operadorUsername).toLowerCase().trim();
-    if (body.fechaAuditoria) existing.fechaAuditoria = toDateOnly(body.fechaAuditoria) || existing.fechaAuditoria;
+    if (body.operadorUsername) {
+      const operadorUsername = String(body.operadorUsername)
+        .toLowerCase()
+        .trim();
 
-    existing.motivosSeleccion = Array.isArray(body.motivosSeleccion) ? body.motivosSeleccion : existing.motivosSeleccion;
+      const op = await Empleado.findOne({ username: operadorUsername })
+        .select("isActive role username")
+        .lean();
+
+      if (!op) return res.status(400).json({ error: "Operador no existe." });
+      if (op.isActive === false)
+        return res.status(400).json({ error: "Operador inactivo." });
+
+      existing.operadorUsername = operadorUsername;
+    }
+
+    if (body.fechaAuditoria) {
+      existing.fechaAuditoria =
+        toDateOnly(body.fechaAuditoria) || existing.fechaAuditoria;
+    }
+
+    existing.motivosSeleccion = Array.isArray(body.motivosSeleccion)
+      ? body.motivosSeleccion
+      : existing.motivosSeleccion;
 
     // ❌ feedbackInformado / requiereCoaching removidos
 
-    existing.observacionesGenerales = String(body.observacionesGenerales || "").trim();
+    existing.observacionesGenerales = String(
+      body.observacionesGenerales || ""
+    ).trim();
     existing.puntosPositivos = String(body.puntosPositivos || "").trim();
     existing.puntosAMejorar = String(body.puntosAMejorar || "").trim();
 
     const itemsIn = Array.isArray(body.items) ? body.items : [];
-    if (itemsIn.length < 1) return res.status(400).json({ error: "Debe incluir al menos 1 audio/item." });
-    if (itemsIn.length > 5) return res.status(400).json({ error: "Máximo 5 audios/items por auditoría." });
+    if (itemsIn.length < 1)
+      return res
+        .status(400)
+        .json({ error: "Debe incluir al menos 1 audio/item." });
+    if (itemsIn.length > 5)
+      return res
+        .status(400)
+        .json({ error: "Máximo 5 audios/items por auditoría." });
 
     const items = itemsIn.map((it, idx) => {
       const telefono = String(it.telefono || "").trim();
-      if (!telefono) throw new Error(`Cada item debe incluir telefono. (item #${idx + 1})`);
+      if (!telefono)
+        throw new Error(`Cada item debe incluir telefono. (item #${idx + 1})`);
 
       const dni = String(it.dni || "").trim();
-      const cartera = String(it.cartera || "").trim().toUpperCase();
+      const cartera = String(it.cartera || "")
+        .trim()
+        .toUpperCase();
 
       const fechaAudio = it.fechaAudio ? toDateOnly(it.fechaAudio) : null;
       const horaAprox = it.horaAprox ? normalizarHora(it.horaAprox) : "";
 
-      const tipoInteraccion = String(it.tipoInteraccion || "LLAMADA_SALIENTE").trim().toUpperCase();
+      const tipoInteraccion = String(it.tipoInteraccion || "LLAMADA_SALIENTE")
+        .trim()
+        .toUpperCase();
       const referencia = String(it.referencia || "").trim();
 
-      const duracionSegundos = parseDuracionSegundos(it);
-      if (isLlamada(tipoInteraccion) && duracionSegundos <= 0) {
-        throw new Error(`Falta duración (segundos) para llamada en item #${idx + 1}.`);
+      const duracionMinutos = parseDuracionMinutos(it);
+      const duracionSegundos = parseDuracionSegundosCompat(it);
+
+      if (isLlamada(tipoInteraccion) && duracionMinutos <= 0) {
+        throw new Error(
+          `Falta duración (minutos) para llamada en item #${idx + 1}.`
+        );
       }
 
+      const comentariosCriterio = parseComentariosCriterio(it);
       const fallosIds = normalizarFallos(it);
       const { scoreBloques, scoreAudio } = calcScoresFromFallos(fallosIds);
 
@@ -495,7 +737,9 @@ export async function editar(req, res) {
         horaAprox,
         tipoInteraccion,
         referencia,
+        duracionMinutos,
         duracionSegundos,
+        comentariosCriterio,
         fallosIds,
         scoreAudio,
         scoreBloques,
@@ -503,10 +747,16 @@ export async function editar(req, res) {
     });
 
     const scoreFinal = Number(
-      (items.reduce((acc, x) => acc + (Number(x.scoreAudio) || 0), 0) / items.length).toFixed(6)
+      (
+        items.reduce((acc, x) => acc + (Number(x.scoreAudio) || 0), 0) /
+        items.length
+      ).toFixed(6)
     );
 
-    const avg = (k) => items.reduce((acc, x) => acc + (Number(x.scoreBloques?.[k]) || 0), 0) / items.length;
+    const avg = (k) =>
+      items.reduce((acc, x) => acc + (Number(x.scoreBloques?.[k]) || 0), 0) /
+      items.length;
+
     const scoreBloques = {
       presentacion: Number(avg("presentacion").toFixed(6)),
       negociacion: Number(avg("negociacion").toFixed(6)),
@@ -521,7 +771,7 @@ export async function editar(req, res) {
 
     await existing.save();
 
-    return res.json({ ok: true, item: existing });
+    return res.json({ ok: true, item: normalizarAuditoriaSalida(existing) });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
@@ -533,7 +783,8 @@ export async function borrar(req, res) {
     attachAbortFlag(req, res);
 
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId) return res.status(401).json({ error: "Token inválido o ausente." });
+    if (!usuarioId)
+      return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
     const { id } = req.params;
@@ -544,7 +795,8 @@ export async function borrar(req, res) {
       borrado: { $ne: true },
     });
 
-    if (!doc) return res.status(404).json({ error: "Auditoría no encontrada." });
+    if (!doc)
+      return res.status(404).json({ error: "Auditoría no encontrada." });
 
     doc.borrado = true;
     await doc.save();
@@ -562,7 +814,8 @@ export async function analyticsResumen(req, res) {
     attachAbortFlag(req, res);
 
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId) return res.status(401).json({ error: "Token inválido o ausente." });
+    if (!usuarioId)
+      return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
     const { desde, hasta, operador } = req.query || {};
@@ -579,7 +832,9 @@ export async function analyticsResumen(req, res) {
       }
     }
 
-    if (operador) match.operadorUsername = String(operador).toLowerCase().trim();
+    if (operador) {
+      match.operadorUsername = String(operador).toLowerCase().trim();
+    }
 
     throwIfAborted(req);
 
@@ -607,8 +862,21 @@ export async function analyticsResumen(req, res) {
 
     const porOperador = await AuditoriaContactoDirecto.aggregate([
       { $match: match },
-      { $group: { _id: "$operadorUsername", auditorias: { $sum: 1 }, avgFinal: { $avg: "$scoreFinal" } } },
-      { $project: { _id: 0, operadorUsername: "$_id", auditorias: 1, avgFinal: 1 } },
+      {
+        $group: {
+          _id: "$operadorUsername",
+          auditorias: { $sum: 1 },
+          avgFinal: { $avg: "$scoreFinal" },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          operadorUsername: "$_id",
+          auditorias: 1,
+          avgFinal: 1,
+        },
+      },
       { $sort: { avgFinal: 1 } },
     ]);
 

@@ -14,31 +14,47 @@ const ItemAudioSchema = new Schema(
     telefono: { type: String, required: true, trim: true, maxlength: 60 },
     dni: { type: String, default: "", trim: true, maxlength: 40 },
 
-    // En planilla: "Cartera" (en tu operativa puede ser Entidad/Cartera)
     cartera: { type: String, default: "", trim: true, maxlength: 120 },
 
-    // ✅ NUEVO: duración en segundos (para LLAMADAS se valida en controller)
+    // ✅ NUEVO PRINCIPAL: duración en minutos
+    duracionMinutos: { type: Number, default: 0, min: 0, max: 480 }, // 0..8hs
+
+    // ✅ Compatibilidad temporal con auditorías viejas / front viejo
     duracionSegundos: { type: Number, default: 0, min: 0, max: 28800 }, // 0..8hs
 
-    // Opcionales
     fechaAudio: { type: Date, default: null },
     horaAprox: { type: String, default: "", trim: true, maxlength: 20 },
 
-    // "llamada entrante/saliente" + "mensaje entrante/saliente"
     tipoInteraccion: {
       type: String,
       default: "LLAMADA_SALIENTE",
-      enum: ["LLAMADA_ENTRANTE", "LLAMADA_SALIENTE", "MENSAJE_ENTRANTE", "MENSAJE_SALIENTE","EMAIL_ENTRANTE", "EMAIL_SALIENTE"],
+      enum: [
+        "LLAMADA_ENTRANTE",
+        "LLAMADA_SALIENTE",
+        "MENSAJE_ENTRANTE",
+        "MENSAJE_SALIENTE",
+        "EMAIL_ENTRANTE",
+        "EMAIL_SALIENTE",
+      ],
       index: true,
     },
 
-    // Texto libre para ubicar rápido (ID llamada, nota, etc.)
     referencia: { type: String, default: "", trim: true, maxlength: 300 },
 
-    // Guardamos SOLO fallos (IDs 1..24) para que sea liviano
+    // ✅ NUEVO: comentario libre por criterio/fila
+    // Ej:
+    // {
+    //   "1": "Se presentó bien",
+    //   "8": "No refutó objeción del titular"
+    // }
+    comentariosCriterio: {
+      type: Map,
+      of: { type: String, trim: true, maxlength: 1000 },
+      default: {},
+    },
+
     fallosIds: { type: [Number], default: [] },
 
-    // Scores calculados (0..10)
     scoreAudio: { type: Number, default: 0, min: 0, max: 10 },
     scoreBloques: {
       presentacion: { type: Number, default: 0, min: 0, max: 10 },
