@@ -4,6 +4,7 @@ import {
   crearCuota,
   editarCuota,
   eliminarCuota,
+  eliminarCuotasSeleccionadas,
   filtrarCuotas,
   importarExcel,
   exportarExcel,
@@ -104,6 +105,7 @@ router.post("/", ...superYOps, crearCuota);
 
 // ⚠️ RUTA FIJA ANTES QUE LAS PARAMÉTRICAS
 router.delete("/vaciar", ...soloSuper, eliminarTodasLasCuotas);
+router.post("/eliminar-seleccion", ...soloSuper, eliminarCuotasSeleccionadas);
 
 // Rutas con :id limitadas a ObjectId
 router.put("/:id([0-9a-fA-F]{24})",    ...superYOps, editarCuota);

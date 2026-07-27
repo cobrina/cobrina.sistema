@@ -7,6 +7,19 @@ const PagoSchema = new Schema(
   {
     fecha: { type: Date, required: true },
     monto: { type: Number, required: true, min: 0 },
+    // "manual": cargado por la cuotera/admin desde la fila.
+    // "importado": incorporado desde el Excel de pagos.
+    // Es opcional y compatible con pagos históricos (se interpretan como manuales).
+    origen: {
+      type: String,
+      enum: ["manual", "importado"],
+      default: "manual",
+    },
+    registradoPor: {
+      type: Schema.Types.ObjectId,
+      ref: "Empleado",
+      default: null,
+    },
   },
   { _id: true }
 );

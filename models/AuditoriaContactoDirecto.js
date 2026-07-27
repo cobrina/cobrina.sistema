@@ -54,6 +54,8 @@ const ItemAudioSchema = new Schema(
     },
 
     fallosIds: { type: [Number], default: [] },
+    // Criterios cumplidos de forma parcial: valen 0,5 en el cálculo.
+    parcialesIds: { type: [Number], default: [] },
 
     scoreAudio: { type: Number, default: 0, min: 0, max: 10 },
     scoreBloques: {

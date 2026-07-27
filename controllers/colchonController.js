@@ -336,6 +336,41 @@ export const eliminarCuota = async (req, res) => {
   }
 };
 
+export const eliminarCuotasSeleccionadas = async (req, res) => {
+  try {
+    if (!esSuper(req)) {
+      return res.status(403).json({ error: "No autorizado" });
+    }
+
+    const ids = Array.from(
+      new Set(
+        (Array.isArray(req.body?.ids) ? req.body.ids : [])
+          .map((id) => String(id || "").trim())
+          .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      )
+    );
+
+    if (ids.length === 0) {
+      return res.status(400).json({ error: "Seleccioná al menos una cuota válida." });
+    }
+
+    if (ids.length > 500) {
+      return res.status(400).json({
+        error: "Por seguridad, solo se pueden eliminar hasta 500 cuotas por vez.",
+      });
+    }
+
+    const resultado = await Colchon.deleteMany({ _id: { $in: ids } });
+    return res.json({
+      message: "Cuotas seleccionadas eliminadas correctamente",
+      eliminadas: Number(resultado.deletedCount || 0),
+    });
+  } catch (error) {
+    console.error("❌ Error al eliminar cuotas seleccionadas:", error);
+    return res.status(500).json({ error: "Error al eliminar cuotas seleccionadas" });
+  }
+};
+
 // Helper para castear a ObjectId cuando corresponde (aggregate NO castea automáticamente)
 const toObjId = (v) =>
   mongoose.Types.ObjectId.isValid(v) ? new mongoose.Types.ObjectId(v) : v;
@@ -352,7 +387,7 @@ export const filtrarCuotas = async (req, res) => {
       diaDesde,
       diaHasta,
       page = 1,
-      limit = 10,
+      limit = 50,
       sortBy = "vencimiento",
       sortDirection = "asc",
       sinGestion,
@@ -361,33 +396,30 @@ export const filtrarCuotas = async (req, res) => {
 
     const rol = req.user.role || req.user.rol;
 
-    // 🔐 Acceso
     if (esAdmin(req)) {
       return res.status(403).json({ error: "Sin acceso al módulo Colchón" });
     }
 
-    // ---------- Filtros base ----------
     const filtrosBase = [];
 
-    // Por operador (seguridad) — importante castear a ObjectId para aggregate
     if (esOperativo(req)) {
       filtrosBase.push({ empleadoId: toObjId(req.user.id) });
     } else if (usuarioId) {
       filtrosBase.push({ empleadoId: toObjId(usuarioId) });
     }
 
-    // DNI exacto
     if (dni) {
       const dniParsed = parseInt(dni, 10);
-      if (!isNaN(dniParsed)) filtrosBase.push({ dni: dniParsed });
+      if (!Number.isNaN(dniParsed)) filtrosBase.push({ dni: dniParsed });
     }
 
-    // Nombre parcial
     if (nombre) {
-      filtrosBase.push({ nombre: new RegExp(nombre, "i") });
+      const nombreSeguro = String(nombre)
+        .trim()
+        .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (nombreSeguro) filtrosBase.push({ nombre: new RegExp(nombreSeguro, "i") });
     }
 
-    // Entidad/SubCesión (ObjectId válidos)
     if (entidad && mongoose.Types.ObjectId.isValid(entidad)) {
       filtrosBase.push({ entidadId: new mongoose.Types.ObjectId(entidad) });
     }
@@ -395,16 +427,12 @@ export const filtrarCuotas = async (req, res) => {
       filtrosBase.push({ subCesionId: new mongoose.Types.ObjectId(subCesion) });
     }
 
-    // Día de vencimiento
     if (diaDesde !== undefined || diaHasta !== undefined) {
       const desde = Math.max(1, Math.min(parseInt(diaDesde || 1, 10), 31));
       const hasta = Math.max(1, Math.min(parseInt(diaHasta || 31, 10), 31));
-      if (desde <= hasta) {
-        filtrosBase.push({ vencimiento: { $gte: desde, $lte: hasta } });
-      }
+      if (desde <= hasta) filtrosBase.push({ vencimiento: { $gte: desde, $lte: hasta } });
     }
 
-    // Sin gestión
     if (sinGestion === "true") {
       filtrosBase.push({
         $or: [
@@ -415,43 +443,19 @@ export const filtrarCuotas = async (req, res) => {
       });
     }
 
-    // Con pagos informados no vistos
     if (conPagosNoVistos === "true") {
       filtrosBase.push({ "pagosInformados.visto": false });
     }
 
     const baseMatch = filtrosBase.length ? { $and: filtrosBase } : {};
-
-    // ---------- Sort ----------
     const pageNumber = Math.max(1, parseInt(page, 10) || 1);
-    const pageLimit = Math.max(1, parseInt(limit, 10) || 10);
+    const pageLimit = Math.min(Math.max(1, parseInt(limit, 10) || 50), 200);
     const skip = (pageNumber - 1) * pageLimit;
     const sortDir = sortDirection === "desc" ? -1 : 1;
 
-    // Alias de campos de sort admitidos
-    const sortFieldMap = {
-      vencimiento: "vencimiento",
-      dni: "dni",
-      nombre: "nombre",
-      cuotaNumero: "cuotaNumero",
-      importeCuota: "importeCuota",
-      empleadoId: "empleado.username", // sort por username
-      entidadId: "entidad.nombre",     // sort por nombre de entidad
-      subCesionId: "subcesion.nombre", // sort por nombre de subcesión
-      saldoPendiente: "saldoPendiente",
-    };
-    const sortFieldKey = (sortBy || "vencimiento").trim();
-    const sortField = sortFieldMap[sortFieldKey] || "vencimiento";
-    const sortStage = { $sort: { [sortField]: sortDir, _id: 1 } }; // _id como desempate estable
-
-    // ---------- Pipeline común ----------
-    const basePipeline = [
-      { $match: baseMatch },
-
-      // Estado final = "A cuota" si hay pagos; si no, estadoOriginal/estado
+    const derivedStages = [
       {
         $addFields: {
-          _pagCount: { $size: { $ifNull: ["$pagos", []] } },
           estadoFinal: {
             $cond: [
               { $gt: [{ $size: { $ifNull: ["$pagos", []] } }, 0] },
@@ -459,10 +463,22 @@ export const filtrarCuotas = async (req, res) => {
               { $ifNull: ["$estadoOriginal", "$estado"] },
             ],
           },
+          pagadoTotal: {
+            $sum: {
+              $map: {
+                input: { $ifNull: ["$pagos", []] },
+                as: "pago",
+                in: { $ifNull: ["$$pago.monto", 0] },
+              },
+            },
+          },
         },
       },
+    ];
 
-      // Lookups para poder ordenar por nombres y devolver info lista
+    if (estado) derivedStages.push({ $match: { estadoFinal: estado } });
+
+    const lookupStages = [
       {
         $lookup: {
           from: "empleados",
@@ -473,7 +489,6 @@ export const filtrarCuotas = async (req, res) => {
         },
       },
       { $unwind: { path: "$empleado", preserveNullAndEmptyArrays: true } },
-
       {
         $lookup: {
           from: "entidads",
@@ -484,7 +499,6 @@ export const filtrarCuotas = async (req, res) => {
         },
       },
       { $unwind: { path: "$entidad", preserveNullAndEmptyArrays: true } },
-
       {
         $lookup: {
           from: "subcesions",
@@ -497,25 +511,44 @@ export const filtrarCuotas = async (req, res) => {
       { $unwind: { path: "$subcesion", preserveNullAndEmptyArrays: true } },
     ];
 
-    // Si viene filtro por estado, aplicarlo sobre estadoFinal
-    if (estado) {
-      basePipeline.push({ $match: { estadoFinal: estado } });
-    }
+    const sortFieldMap = {
+      vencimiento: "vencimiento",
+      dni: "dni",
+      nombre: "nombre",
+      cuotaNumero: "cuotaNumero",
+      importeCuota: "importeCuota",
+      saldoPendiente: "saldoPendiente",
+      estado: "estadoFinal",
+      pagado: "pagadoTotal",
+      ultimaGestion: "ultimaGestion",
+      empleadoId: "empleado.username",
+      entidadId: "entidad.nombre",
+      cartera: "subcesion.nombre",
+      subCesionId: "subcesion.nombre",
+    };
 
-    // ---------- Conteo total filtrado ----------
-    const conteoPipeline = [...basePipeline, { $count: "count" }];
+    const sortField = sortFieldMap[String(sortBy || "").trim()] || "vencimiento";
+    const necesitaLookupAntesDeOrdenar = [
+      "empleado.username",
+      "entidad.nombre",
+      "subcesion.nombre",
+    ].includes(sortField);
+    const sortStage = { $sort: { [sortField]: sortDir, _id: 1 } };
 
-    const conteoRes = await Colchon.aggregate(conteoPipeline);
-    const totalFiltrado = conteoRes?.[0]?.count || 0;
+    const pipelineConteo = [
+      { $match: baseMatch },
+      ...derivedStages,
+      { $count: "count" },
+    ];
 
-    // ---------- Data paginada ----------
-    const dataPipeline = [
-      ...basePipeline,
+    const pipelineDatos = [
+      { $match: baseMatch },
+      ...derivedStages,
+      ...(necesitaLookupAntesDeOrdenar ? lookupStages : []),
       sortStage,
       { $skip: skip },
       { $limit: pageLimit },
-
-      // Proyección final para reducir payload
+      ...(!necesitaLookupAntesDeOrdenar ? lookupStages : []),
       {
         $project: {
           _id: 1,
@@ -530,13 +563,15 @@ export const filtrarCuotas = async (req, res) => {
           turno: 1,
           vecesTocada: 1,
           fechaUltimaTocada: 1,
+          ultimaGestion: 1,
           usuarioUltimoTocado: 1,
-          pagos: 1, // necesario para estadoFinal
+          pagos: 1,
           pagosInformados: 1,
           estadoOriginal: 1,
           estado: "$estadoFinal",
-
-          // embebidos simplificados
+          pagadoTotal: 1,
+          observaciones: 1,
+          observacionesOperador: 1,
           empleadoId: { _id: "$empleado._id", username: "$empleado.username" },
           entidadId: {
             _id: "$entidad._id",
@@ -548,9 +583,20 @@ export const filtrarCuotas = async (req, res) => {
       },
     ];
 
-    const resultadosAgg = await Colchon.aggregate(dataPipeline);
+    const filtroGeneral =
+      rol === "operador" || rol === "operador-vip"
+        ? { empleadoId: toObjId(req.user.id) }
+        : usuarioId
+        ? { empleadoId: toObjId(usuarioId) }
+        : {};
 
-    // Calcular alertaDeuda en JS (barato porque ya viene paginado)
+    const [conteoRes, resultadosAgg, totalGeneral] = await Promise.all([
+      Colchon.aggregate(pipelineConteo).allowDiskUse(true),
+      Colchon.aggregate(pipelineDatos).allowDiskUse(true),
+      Colchon.countDocuments(filtroGeneral),
+    ]);
+
+    const totalFiltrado = conteoRes?.[0]?.count || 0;
     const resultados = resultadosAgg.map((cuota) => {
       const cuotasAdeudadas =
         Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
@@ -567,28 +613,19 @@ export const filtrarCuotas = async (req, res) => {
       };
     });
 
-    // ---------- totalGeneral (por rol) ----------
-    const filtroGeneral =
-      (rol === "operador" || rol === "operador-vip")
-        ? { empleadoId: toObjId(req.user.id) }
-        : usuarioId
-        ? { empleadoId: toObjId(usuarioId) }
-        : {};
-
-    const totalGeneral = await Colchon.countDocuments(filtroGeneral);
-
-    // ---------- Respuesta ----------
-    res.json({
+    return res.json({
       resultados,
       totalFiltrado,
       totalGeneral,
+      page: pageNumber,
+      limit: pageLimit,
+      pages: Math.max(1, Math.ceil(totalFiltrado / pageLimit)),
     });
   } catch (error) {
     console.error("❌ Error al filtrar cuotas:", error);
-    res.status(500).json({ error: "Error al filtrar cuotas" });
+    return res.status(500).json({ error: "Error al filtrar cuotas" });
   }
 };
-
 
 
 // Importar desde Excel
@@ -903,116 +940,189 @@ export const exportarExcel = async (req, res) => {
       usuarioId,
       diaDesde,
       diaHasta,
+      conPagosNoVistos,
     } = req.query;
 
-    const rol = req.user.role || req.user.rol;
-    const filtros = [];
-
-    // 🔐 Filtro por rol
     if (esAdmin(req)) {
       return res.status(403).json({ error: "Sin acceso a exportación" });
     }
+
+    const filtros = [];
     if (esOperativo(req)) {
       filtros.push({ empleadoId: req.user.id });
     } else if (usuarioId) {
       filtros.push({ empleadoId: usuarioId });
     }
 
-    // 🎯 Filtros opcionales
     if (dni) {
-      const dniParsed = parseInt(dni);
-      if (!isNaN(dniParsed)) filtros.push({ dni: dniParsed });
+      const dniParsed = parseInt(dni, 10);
+      if (!Number.isNaN(dniParsed)) filtros.push({ dni: dniParsed });
     }
 
     if (nombre) {
-      filtros.push({ nombre: new RegExp(nombre, "i") });
+      const nombreSeguro = String(nombre)
+        .trim()
+        .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (nombreSeguro) filtros.push({ nombre: new RegExp(nombreSeguro, "i") });
     }
 
-    if (entidad) filtros.push({ entidadId: entidad });
-    if (subCesion) filtros.push({ subCesionId: subCesion });
+    if (entidad && mongoose.Types.ObjectId.isValid(entidad)) {
+      filtros.push({ entidadId: entidad });
+    }
+    if (subCesion && mongoose.Types.ObjectId.isValid(subCesion)) {
+      filtros.push({ subCesionId: subCesion });
+    }
 
-    // 📆 Filtro por día del mes
-    if (diaDesde || diaHasta) {
-      const desde = Math.max(1, Math.min(parseInt(diaDesde) || 1, 31));
-      const hasta = Math.max(1, Math.min(parseInt(diaHasta) || 31, 31));
-      if (desde <= hasta) {
-        filtros.push({ vencimiento: { $gte: desde, $lte: hasta } });
-      }
+    if (diaDesde !== undefined || diaHasta !== undefined) {
+      const desde = Math.max(1, Math.min(parseInt(diaDesde || 1, 10), 31));
+      const hasta = Math.max(1, Math.min(parseInt(diaHasta || 31, 10), 31));
+      if (desde <= hasta) filtros.push({ vencimiento: { $gte: desde, $lte: hasta } });
+    }
+
+    if (conPagosNoVistos === "true") {
+      filtros.push({ "pagosInformados.visto": false });
     }
 
     const query = filtros.length ? { $and: filtros } : {};
 
-    // 🗃️ Buscar cuotas
     let cuotas = await Colchon.find(query)
       .populate("empleadoId", "username")
       .populate("entidadId", "numero nombre")
       .populate("subCesionId", "nombre")
       .lean();
 
-    // 🧠 Calcular estado final
-    cuotas = cuotas.map((cuota) => {
-      const estadoBase = cuota.estadoOriginal || cuota.estado;
-      const estadoFinal = cuota.pagos?.length > 0 ? "A cuota" : estadoBase;
-      return {
-        ...cuota,
-        estado: estadoFinal,
-      };
-    });
+    const sumar = (lista) =>
+      (Array.isArray(lista) ? lista : []).reduce(
+        (total, item) => total + Number(item?.monto || 0),
+        0
+      );
+    const informadosValidos = (cuota) =>
+      (Array.isArray(cuota.pagosInformados) ? cuota.pagosInformados : []).filter(
+        (pago) => !pago?.erroneo
+      );
+    const abreviarTurno = (value) => {
+      const texto = String(value || "").trim().toLowerCase();
+      if (!texto) return "";
+      if (texto === "m" || texto === "tm" || texto.includes("mañana") || texto.includes("manana")) return "TM";
+      if (texto === "t" || texto === "tt" || texto.includes("tarde")) return "TT";
+      if (texto === "r" || texto === "tr" || texto.includes("residual")) return "TR";
+      return String(value).trim();
+    };
 
-    // 🎯 Filtro final por estado
-    if (estado) {
-      cuotas = cuotas.filter((c) => c.estado === estado);
-    }
+    cuotas = cuotas
+      .map((cuota) => {
+        const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
+        const estadoFinal = cuota.pagos?.length > 0 ? "A cuota" : estadoBase;
+        const pagadoReal = sumar(cuota.pagos);
+        const informado = sumar(informadosValidos(cuota));
+        return {
+          ...cuota,
+          estado: estadoFinal,
+          pagadoReal,
+          informado,
+          cobradoTotal: pagadoReal + informado,
+        };
+      })
+      .filter((cuota) => !estado || cuota.estado === estado);
 
-    // 🧾 Crear Excel
-    const { default: ExcelJS } = await import("exceljs");
     const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet("Colchón");
+    workbook.creator = "COBRINA";
+    workbook.created = new Date();
 
+    const info = workbook.addWorksheet("Información");
+    const partesFecha = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/Argentina/Buenos_Aires",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date());
+    const valoresFecha = Object.fromEntries(partesFecha.map((parte) => [parte.type, parte.value]));
+    const mesesArchivo = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+    const mesArchivo = mesesArchivo[Number(valoresFecha.month) - 1];
+    const fechaArchivo = `${valoresFecha.day}-${mesArchivo}-${valoresFecha.year}`;
+    const fechaVisible = `${valoresFecha.day}/${mesArchivo}/${valoresFecha.year}`;
+
+    const filtrosAplicados = [
+      nombre ? `Nombre: ${nombre}` : "",
+      dni ? `DNI: ${dni}` : "",
+      estado ? `Estado: ${estado}` : "",
+      diaDesde || diaHasta ? `Vencimiento: día ${diaDesde || 1} al ${diaHasta || 31}` : "",
+      entidad ? "Entidad seleccionada" : "",
+      subCesion ? "Subcesión seleccionada" : "",
+      usuarioId ? "Operador seleccionado" : "",
+      conPagosNoVistos === "true" ? "Pagos informados no vistos" : "",
+    ].filter(Boolean);
+
+    info.addRow(["Exportación del Colchón de Cuotas"]);
+    info.addRow(["Fecha", fechaVisible]);
+    info.addRow(["Registros exportados", cuotas.length]);
+    info.addRow(["Filtros", filtrosAplicados.length ? filtrosAplicados.join(" · ") : "Sin filtros"]);
+    info.getColumn(1).width = 24;
+    info.getColumn(2).width = 90;
+    info.getRow(1).font = { bold: true, color: { argb: "FF29154F" }, size: 14 };
+
+    const worksheet = workbook.addWorksheet("Colchón");
     worksheet.columns = [
       { header: "Estado", key: "estado", width: 15 },
-      { header: "Entidad", key: "entidad", width: 25 },
-      { header: "SubCesión", key: "subCesion", width: 25 },
-      { header: "DNI", key: "dni", width: 15 },
-      { header: "Titular", key: "nombre", width: 25 },
+      { header: "Entidad", key: "entidad", width: 28 },
+      { header: "Subcesión", key: "subCesion", width: 24 },
+      { header: "DNI", key: "dni", width: 14 },
+      { header: "Nombre y apellido", key: "nombre", width: 30 },
       { header: "Operador", key: "operador", width: 20 },
-      { header: "Turno", key: "turno", width: 10 },
+      { header: "Turno", key: "turno", width: 9 },
       { header: "Vencimiento", key: "vencimiento", width: 12 },
-      { header: "C/Cuotas", key: "cuotaNumero", width: 12 },
-      { header: "$ Cuota", key: "importeCuota", width: 12 },
-      { header: "$ DEBE", key: "saldoPendiente", width: 12 },
+      { header: "C/Cuotas", key: "cuotaNumero", width: 11 },
+      { header: "$ C/Cuota", key: "importeCuota", width: 15 },
+      { header: "$ Pagado real", key: "pagadoReal", width: 16 },
+      { header: "$ Informado", key: "informado", width: 16 },
+      { header: "$ Cobrado total", key: "cobradoTotal", width: 17 },
+      { header: "$ Debe", key: "saldoPendiente", width: 16 },
       { header: "Teléfono", key: "telefono", width: 20 },
-      { header: "Gestiones", key: "gestiones", width: 30 }, // 🟡 Nuevo campo
+      { header: "Observaciones", key: "observaciones", width: 35 },
+      { header: "Observaciones operador", key: "observacionesOperador", width: 35 },
     ];
 
     cuotas.forEach((cuota) => {
-      const vecesTocada = cuota?.vecesTocada || 0;
-      const ultimaFecha = cuota?.fechaUltimaTocada
-        ? new Date(cuota.fechaUltimaTocada).toLocaleDateString("es-AR")
-        : "—";
-      const nombreUltimo = cuota?.usuarioUltimoTocado?.username || "—";
-
       worksheet.addRow({
         estado: cuota.estado,
         entidad: cuota.entidadId
-          ? `${cuota.entidadId.numero} - ${cuota.entidadId.nombre}`
+          ? `${cuota.entidadId.numero ?? ""} - ${cuota.entidadId.nombre ?? ""}`.replace(/^ - | - $/g, "")
           : "—",
         subCesion: cuota.subCesionId?.nombre || "—",
         dni: cuota.dni,
         nombre: cuota.nombre,
-        operador:
-          typeof cuota.empleadoId === "object"
-            ? cuota.empleadoId.username
-            : "—",
-        turno: cuota.turno || "",
-        cartera: cuota.cartera || "",
+        operador: cuota.empleadoId?.username || "—",
+        turno: abreviarTurno(cuota.turno),
         vencimiento: cuota.vencimiento || "",
-        cuotaNumero: cuota.cuotaNumero || "",
-        importeCuota: cuota.importeCuota || 0,
-        saldoPendiente: cuota.saldoPendiente || 0,
+        cuotaNumero: cuota.cuotaNumero || 0,
+        importeCuota: Number(cuota.importeCuota || 0),
+        pagadoReal: Number(cuota.pagadoReal || 0),
+        informado: Number(cuota.informado || 0),
+        cobradoTotal: Number(cuota.cobradoTotal || 0),
+        saldoPendiente: Number(cuota.saldoPendiente || 0),
         telefono: cuota.telefono || "",
-        gestiones: `${vecesTocada}`,
+        observaciones: cuota.observaciones || "",
+        observacionesOperador: cuota.observacionesOperador || "",
       });
+    });
+
+    const header = worksheet.getRow(1);
+    header.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    header.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF29154F" } };
+    header.alignment = { vertical: "middle", horizontal: "center" };
+    header.height = 24;
+    worksheet.views = [{ state: "frozen", ySplit: 1 }];
+    worksheet.autoFilter = { from: "A1", to: "Q1" };
+    ["J", "K", "L", "M", "N"].forEach((columna) => {
+      worksheet.getColumn(columna).numFmt = '$#,##0.00;[Red]-$#,##0.00';
+    });
+    worksheet.eachRow((row, rowNumber) => {
+      if (rowNumber > 1) {
+        row.alignment = { vertical: "top", wrapText: true };
+        if (rowNumber % 2 === 0) {
+          row.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF9F5FC" } };
+        }
+      }
     });
 
     res.setHeader(
@@ -1021,7 +1131,7 @@ export const exportarExcel = async (req, res) => {
     );
     res.setHeader(
       "Content-Disposition",
-      "attachment; filename=colchon-exportado.xlsx"
+      `attachment; filename="colchon-${fechaArchivo}.xlsx"`
     );
 
     await workbook.xlsx.write(res);
@@ -1064,7 +1174,12 @@ export const agregarPago = async (req, res) => {
     if (!cuota) return res.status(404).json({ error: "Cuota no encontrada" });
 
     // 💸 Pago real
-    cuota.pagos.push({ monto: montoNum, fecha: fechaObj });
+    cuota.pagos.push({
+      monto: montoNum,
+      fecha: fechaObj,
+      origen: "manual",
+      registradoPor: req.user.id,
+    });
 
     // 🔄 Recalcular respetando el estado base
     const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
@@ -1133,7 +1248,12 @@ export const informarPago = async (req, res) => {
 
     if (rol === "super-admin") {
       // 💸 Impacto real
-      cuota.pagos.push({ monto: montoNum, fecha: fechaObj });
+      cuota.pagos.push({
+        monto: montoNum,
+        fecha: fechaObj,
+        origen: "manual",
+        registradoPor: req.user.id,
+      });
 
       const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
       cuota.estado = estadoBase;
@@ -1819,7 +1939,12 @@ export const importarPagosDesdeExcel = async (req, res) => {
           resultados.duplicados++;
         } else {
           // 💰 Agregar pago nuevo (fecha en 00:00 local)
-          cuota.pagos.push({ fecha: fechaPago, monto });
+          cuota.pagos.push({
+            fecha: fechaPago,
+            monto,
+            origen: "importado",
+            registradoPor: req.user.id,
+          });
 
           // ✅ Actualizar deuda y estado
           const estadoBase = cuota.estadoOriginal || cuota.estado;
@@ -1967,9 +2092,7 @@ export const exportarPagos = async (req, res) => {
           entidad,
           subcesion,
           monto: pago.monto,
-          fecha: pago.fecha
-            ? new Date(pago.fecha).toLocaleDateString("es-AR")
-            : "",
+          fecha: pago.fecha ? formatearFecha(pago.fecha) : "",
         });
       });
     });
@@ -2040,12 +2163,11 @@ export const obtenerEstadisticasColchon = async (req, res) => {
       usuarioId,
       diaDesde,
       diaHasta,
+      conPagosNoVistos,
     } = req.query;
 
-    const rol = req.user.role || req.user.rol;
     const filtrosBase = [];
 
-    // Filtro por usuario (seguridad)
     if (esAdmin(req)) {
       return res.status(403).json({ error: "Sin acceso a estadísticas" });
     }
@@ -2055,246 +2177,393 @@ export const obtenerEstadisticasColchon = async (req, res) => {
       filtrosBase.push({ empleadoId: usuarioId });
     }
 
-    // Filtros opcionales
     if (dni) {
-      const dniParsed = parseInt(dni);
-      if (!isNaN(dniParsed)) filtrosBase.push({ dni: dniParsed });
+      const dniParsed = parseInt(dni, 10);
+      if (!Number.isNaN(dniParsed)) filtrosBase.push({ dni: dniParsed });
     }
 
     if (nombre) {
-      filtrosBase.push({ nombre: new RegExp(nombre, "i") });
+      const nombreSeguro = String(nombre)
+        .trim()
+        .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (nombreSeguro) filtrosBase.push({ nombre: new RegExp(nombreSeguro, "i") });
     }
 
-    if (entidad) filtrosBase.push({ entidadId: entidad });
-    if (subCesion) filtrosBase.push({ subCesionId: subCesion });
+    if (entidad && mongoose.Types.ObjectId.isValid(entidad)) {
+      filtrosBase.push({ entidadId: entidad });
+    }
+    if (subCesion && mongoose.Types.ObjectId.isValid(subCesion)) {
+      filtrosBase.push({ subCesionId: subCesion });
+    }
 
     if (diaDesde !== undefined || diaHasta !== undefined) {
-      const desde = Math.max(1, Math.min(parseInt(diaDesde) || 1, 31));
-      const hasta = Math.max(1, Math.min(parseInt(diaHasta) || 31, 31));
-      if (desde <= hasta) {
-        filtrosBase.push({ vencimiento: { $gte: desde, $lte: hasta } });
-      }
+      const desde = Math.max(1, Math.min(parseInt(diaDesde || 1, 10), 31));
+      const hasta = Math.max(1, Math.min(parseInt(diaHasta || 31, 10), 31));
+      if (desde <= hasta) filtrosBase.push({ vencimiento: { $gte: desde, $lte: hasta } });
+    }
+
+    if (conPagosNoVistos === "true") {
+      filtrosBase.push({ "pagosInformados.visto": false });
     }
 
     const baseQuery = filtrosBase.length ? { $and: filtrosBase } : {};
 
     const cuotasBrutas = await Colchon.find(baseQuery)
       .populate("empleadoId", "username")
-      .populate("entidadId", "nombre")
+      .populate("entidadId", "nombre numero")
+      .populate("subCesionId", "nombre")
+      .populate("pagosInformados.operadorId", "username")
       .lean();
 
-    const hoy = new Date();
-    const mesActual = hoy.getMonth();
-    const anioActual = hoy.getFullYear();
+    const partesHoyArgentina = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/Argentina/Buenos_Aires",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date());
+    const hoyArgentina = Object.fromEntries(
+      partesHoyArgentina.map((parte) => [parte.type, parte.value])
+    );
+    const mesActual = Number(hoyArgentina.month) - 1;
+    const anioActual = Number(hoyArgentina.year);
+    const diaActual = Number(hoyArgentina.day);
+
+    const sumar = (lista) =>
+      (Array.isArray(lista) ? lista : []).reduce(
+        (total, item) => total + Number(item?.monto || 0),
+        0
+      );
+
+    // En la cuotera hay dos conceptos distintos:
+    // - pagos[]: dinero que la cuotera/super-admin confirmó y cargó en la cuota.
+    // - pagosInformados[]: aviso del operador, todavía pendiente de control.
+    // Para las estadísticas sólo se considera dinero confirmado. Dentro de pagos[]
+    // distinguimos lo importado por Excel de lo cargado manualmente por la cuotera.
+    const clasificarPagosConfirmados = (cuota) => {
+      const confirmados = Array.isArray(cuota.pagos) ? cuota.pagos : [];
+      const importados = confirmados.filter((pago) => pago?.origen === "importado");
+      // Compatibilidad: los pagos históricos no tenían origen; se consideran manuales,
+      // que coincide con el uso habitual de RDC (carga de la cuotera desde Colchón).
+      const informadosCuotera = confirmados.filter(
+        (pago) => pago?.origen !== "importado"
+      );
+      return { confirmados, importados, informadosCuotera };
+    };
+
+    const avisosOperadorValidos = (cuota) =>
+      (Array.isArray(cuota.pagosInformados) ? cuota.pagosInformados : []).filter(
+        (pago) => !pago?.erroneo
+      );
+
+    const esMesActual = (fecha) => {
+      const valor = new Date(fecha);
+      if (Number.isNaN(valor.getTime())) return false;
+      return (
+        valor.getUTCMonth() === mesActual &&
+        valor.getUTCFullYear() === anioActual
+      );
+    };
 
     let totalCuotas = 0;
     let totalImporte = 0;
     let totalSaldo = 0;
-    let cuotasPagadas = 0;
-    let totalPagadoCuotas = 0;
+    let cuotasConCobros = 0;
+    let totalPagadoReal = 0;
+    let totalInformado = 0;
+    let totalAvisadoOperadores = 0;
+    let cantidadAvisosOperadores = 0;
+    let saldoNoVencido = 0;
+    let saldoVencido = 0;
+    let saldoNoVencidoCuotera = 0;
+    let saldoVencidoCuotera = 0;
+    let cuotasNoVencidas = 0;
+    let cuotasVencidas = 0;
 
     const estadoStats = {};
     const pagosPorDia = {};
     const rankingEntidad = {};
     const rankingCartera = {};
-    const rankingOperadores = {}; // ← ahora tendrá totales + porEstado
+    const rankingOperadoresMes = {};
+    const rankingOperadoresAcumulado = {};
 
     const cuotasFiltradas = cuotasBrutas.map((cuota) => {
-      const estadoBase = cuota.estadoOriginal || cuota.estado;
+      const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
       const estadoFinal = cuota.pagos?.length > 0 ? "A cuota" : estadoBase;
-      return {
-        ...cuota,
-        estado: estadoFinal,
-        alertaDeuda: estadoFinal === "A cuota" && cuota.saldoPendiente > 0,
-      };
+      return { ...cuota, estado: estadoFinal };
     });
 
     const cuotas = estado
-      ? cuotasFiltradas.filter((c) => c.estado === estado)
+      ? cuotasFiltradas.filter((cuota) => cuota.estado === estado)
       : cuotasFiltradas;
 
     for (const cuota of cuotas) {
-      totalCuotas += 1;
-      totalImporte += cuota.importeCuota || 0;
-      totalSaldo += cuota.saldoPendiente || 0;
+      const importe = Number(cuota.importeCuota || 0);
+      const saldo = Number(cuota.saldoPendiente || 0);
+      const { confirmados, importados, informadosCuotera } =
+        clasificarPagosConfirmados(cuota);
+      const avisosOperador = avisosOperadorValidos(cuota);
 
-      const pagos = cuota.pagos || [];
-      const pagado = pagos.reduce((sum, p) => sum + p.monto, 0);
-
-      const pagosMesActual = pagos.filter((p) => {
-        const f = new Date(p.fecha);
-        return f.getMonth() === mesActual && f.getFullYear() === anioActual;
-      });
-      const pagadoMesActual = pagosMesActual.reduce(
-        (sum, p) => sum + p.monto,
-        0
+      const pagadoReal = sumar(importados);
+      const informado = sumar(informadosCuotera);
+      const cobradoConsiderado = pagadoReal + informado;
+      const pagadoRealMes = sumar(importados.filter((pago) => esMesActual(pago.fecha)));
+      const informadoMes = sumar(
+        informadosCuotera.filter((pago) => esMesActual(pago.fecha))
       );
+
+      totalCuotas += 1;
+      totalImporte += importe;
+      totalSaldo += saldo;
+      totalPagadoReal += pagadoReal;
+      totalInformado += informado;
+      totalAvisadoOperadores += sumar(avisosOperador);
+      cantidadAvisosOperadores += avisosOperador.length;
+      if (cobradoConsiderado > 0) cuotasConCobros += 1;
+
+      const vencimiento = Number(cuota.vencimiento || 0);
+      if (vencimiento >= diaActual) {
+        cuotasNoVencidas += 1;
+        saldoNoVencidoCuotera += saldo;
+        saldoNoVencido += saldo;
+      } else {
+        cuotasVencidas += 1;
+        saldoVencidoCuotera += saldo;
+        saldoVencido += saldo;
+      }
 
       const estadoVisual = cuota.estado || "Desconocido";
       estadoStats[estadoVisual] = (estadoStats[estadoVisual] || 0) + 1;
 
-      if (cuota.pagos?.length > 0) {
-        cuotasPagadas += 1;
-      }
-      totalPagadoCuotas += pagado;
-
-      for (const pago of pagosMesActual) {
-        const dia = new Date(pago.fecha).getDate();
-
+      for (const pago of confirmados) {
+        if (!esMesActual(pago.fecha)) continue;
+        const dia = new Date(pago.fecha).getUTCDate();
         if (!pagosPorDia[dia]) {
-          pagosPorDia[dia] = { cantidadPagos: 0, totalPagado: 0 };
+          pagosPorDia[dia] = {
+            cantidadPagos: 0,
+            totalPagado: 0,
+            real: 0,
+            informado: 0,
+          };
         }
-
+        const monto = Number(pago.monto || 0);
         pagosPorDia[dia].cantidadPagos += 1;
-        pagosPorDia[dia].totalPagado += pago.monto;
+        pagosPorDia[dia].totalPagado += monto;
+        if (pago?.origen === "importado") pagosPorDia[dia].real += monto;
+        else pagosPorDia[dia].informado += monto;
       }
 
       const entidadNom = cuota.entidadId?.nombre || "Sin entidad";
       if (!rankingEntidad[entidadNom]) {
-        rankingEntidad[entidadNom] = { asignado: 0, cobrado: 0, pagos: 0 };
-      }
-      rankingEntidad[entidadNom].asignado += cuota.importeCuota || 0;
-      rankingEntidad[entidadNom].cobrado += pagado;
-      rankingEntidad[entidadNom].pagos += pagos.length;
-
-      const carteraNom = cuota.cartera || "Sin subcesión";
-      if (!rankingCartera[carteraNom]) {
-        rankingCartera[carteraNom] = { asignado: 0, cobrado: 0, pagos: 0 };
-      }
-      rankingCartera[carteraNom].asignado += cuota.importeCuota || 0;
-      rankingCartera[carteraNom].cobrado += pagado;
-      rankingCartera[carteraNom].pagos += pagos.length;
-
-      // ====== RANKING POR OPERADOR (con desglose por estado) ======
-      const operador = cuota.empleadoId?.username || "Sin asignar";
-      const estadoFinal = cuota.estado || "Desconocido";
-
-      if (!rankingOperadores[operador]) {
-        rankingOperadores[operador] = {
-          total: { asignado: 0, pagado: 0, porcentaje: 0 },
-          porEstado: {}, // { "A cuota": {cantidad, asignado, pagado, porcentaje}, ... }
-        };
-      }
-
-      // Totales por operador (pagado = del mes actual)
-      rankingOperadores[operador].total.asignado += cuota.importeCuota || 0;
-      rankingOperadores[operador].total.pagado += pagadoMesActual;
-
-      // Desglose por estado
-      if (!rankingOperadores[operador].porEstado[estadoFinal]) {
-        rankingOperadores[operador].porEstado[estadoFinal] = {
-          cantidad: 0,
+        rankingEntidad[entidadNom] = {
           asignado: 0,
-          pagado: 0,
-          porcentaje: 0,
+          cobradoReal: 0,
+          informado: 0,
+          cobrado: 0,
+          pagos: 0,
         };
       }
-      const nodoEstado = rankingOperadores[operador].porEstado[estadoFinal];
-      nodoEstado.cantidad += 1;
-      nodoEstado.asignado += cuota.importeCuota || 0;
-      nodoEstado.pagado += pagadoMesActual;
-    }
+      rankingEntidad[entidadNom].asignado += importe;
+      rankingEntidad[entidadNom].cobradoReal += pagadoReal;
+      rankingEntidad[entidadNom].informado += informado;
+      rankingEntidad[entidadNom].cobrado += cobradoConsiderado;
+      rankingEntidad[entidadNom].pagos += confirmados.length;
 
-    // Convertir rankings a arrays
-    const rankingEntidadArray = Object.entries(rankingEntidad).map(
-      ([entidadNom, val]) => ({
-        entidad: entidadNom,
-        asignado: val.asignado,
-        cobrado: val.cobrado,
-        porcentaje: val.asignado
-          ? Math.round((val.cobrado / val.asignado) * 100)
-          : 0,
-        pagos: val.pagos,
-      })
-    );
+      const carteraNom = cuota.subCesionId?.nombre || cuota.cartera || "Sin subcesión";
+      if (!rankingCartera[carteraNom]) {
+        rankingCartera[carteraNom] = {
+          asignado: 0,
+          cobradoReal: 0,
+          informado: 0,
+          cobrado: 0,
+          pagos: 0,
+        };
+      }
+      rankingCartera[carteraNom].asignado += importe;
+      rankingCartera[carteraNom].cobradoReal += pagadoReal;
+      rankingCartera[carteraNom].informado += informado;
+      rankingCartera[carteraNom].cobrado += cobradoConsiderado;
+      rankingCartera[carteraNom].pagos += confirmados.length;
 
-    const rankingCarteraArray = Object.entries(rankingCartera).map(
-      ([carteraNom, val]) => ({
-        cartera: carteraNom,
-        asignado: val.asignado,
-        cobrado: val.cobrado,
-        porcentaje: val.asignado
-          ? Math.round((val.cobrado / val.asignado) * 100)
-          : 0,
-        pagos: val.pagos,
-      })
-    );
-
-    // Ranking de operadores con desglose por estado
-    const ESTADOS_ORDEN = [
-      "A cuota",
-      "Cuota 30",
-      "Cuota 60",
-      "Cuota 90",
-      "Caída",
-    ];
-    const rankingOperadoresArray = Object.entries(rankingOperadores).map(
-      ([operador, val]) => {
-        const totalAsignado = val.total.asignado || 0;
-        const totalPagado = val.total.pagado || 0;
-        const totalPorcentaje = totalAsignado
-          ? Math.round((totalPagado / totalAsignado) * 100)
-          : 0;
-
-        const estados = {};
-        ESTADOS_ORDEN.forEach((e) => {
-          const nodo = val.porEstado[e] || {
+      const sumarAlRankingOperador = (
+        ranking,
+        nombreOperador,
+        pagoImportado,
+        pagoInformado
+      ) => {
+        const nombreOperadorSeguro = nombreOperador || "Sin asignar";
+        if (!ranking[nombreOperadorSeguro]) {
+          ranking[nombreOperadorSeguro] = {
+            total: {
+              cantidad: 0,
+              asignado: 0,
+              pagadoReal: 0,
+              informado: 0,
+              pagado: 0,
+            },
+            porEstado: {},
+          };
+        }
+        if (!ranking[nombreOperadorSeguro].porEstado[estadoVisual]) {
+          ranking[nombreOperadorSeguro].porEstado[estadoVisual] = {
             cantidad: 0,
             asignado: 0,
+            pagadoReal: 0,
+            informado: 0,
             pagado: 0,
-            porcentaje: 0,
           };
-          const asign = nodo.asignado || 0;
-          const pag = nodo.pagado || 0;
-          estados[e] = {
+        }
+
+        const nodoOperador = ranking[nombreOperadorSeguro];
+        nodoOperador.total.cantidad += 1;
+        nodoOperador.total.asignado += importe;
+        nodoOperador.total.pagadoReal += pagoImportado;
+        nodoOperador.total.informado += pagoInformado;
+        nodoOperador.total.pagado += pagoImportado + pagoInformado;
+
+        const nodoEstado = nodoOperador.porEstado[estadoVisual];
+        nodoEstado.cantidad += 1;
+        nodoEstado.asignado += importe;
+        nodoEstado.pagadoReal += pagoImportado;
+        nodoEstado.informado += pagoInformado;
+        nodoEstado.pagado += pagoImportado + pagoInformado;
+      };
+
+      // La cuotera carga el pago para el caso asignado; por eso el monto se
+      // acredita al operador dueño de la cuota, no al usuario administrador.
+      // Se devuelven dos vistas: mes actual y acumulado del conjunto filtrado.
+      const operadorAsignado = cuota.empleadoId?.username || "Sin asignar";
+      sumarAlRankingOperador(
+        rankingOperadoresMes,
+        operadorAsignado,
+        pagadoRealMes,
+        informadoMes
+      );
+      sumarAlRankingOperador(
+        rankingOperadoresAcumulado,
+        operadorAsignado,
+        pagadoReal,
+        informado
+      );
+    }
+
+    const prepararRanking = (objeto, campo) =>
+      Object.entries(objeto).map(([nombreItem, valores]) => ({
+        [campo]: nombreItem,
+        asignado: valores.asignado,
+        cobradoReal: valores.cobradoReal,
+        informado: valores.informado,
+        cobrado: valores.cobrado,
+        porcentaje: valores.asignado
+          ? Math.round((valores.cobrado / valores.asignado) * 100)
+          : 0,
+        pagos: valores.pagos,
+      }));
+
+    const rankingEntidadArray = prepararRanking(rankingEntidad, "entidad");
+    const rankingCarteraArray = prepararRanking(rankingCartera, "cartera");
+
+    const ESTADOS_ORDEN = ["A cuota", "Cuota 30", "Cuota 60", "Cuota 90", "Caída"];
+    const prepararRankingOperadores = (ranking) =>
+      Object.entries(ranking).map(([operador, valores]) => {
+        const totalAsignado = valores.total.asignado || 0;
+        const totalPagado = valores.total.pagado || 0;
+        const estados = {};
+
+        ESTADOS_ORDEN.forEach((nombreEstado) => {
+          const nodo = valores.porEstado[nombreEstado] || {
+            cantidad: 0,
+            asignado: 0,
+            pagadoReal: 0,
+            informado: 0,
+            pagado: 0,
+          };
+          estados[nombreEstado] = {
             cantidad: nodo.cantidad || 0,
-            asignado: asign,
-            pagado: pag,
-            porcentaje: asign ? Math.round((pag / asign) * 100) : 0,
+            asignado: nodo.asignado || 0,
+            pagadoReal: nodo.pagadoReal || 0,
+            informado: nodo.informado || 0,
+            pagado: nodo.pagado || 0,
+            porcentaje: nodo.asignado
+              ? Math.round((nodo.pagado / nodo.asignado) * 100)
+              : 0,
           };
         });
 
         return {
           operador,
+          cantidad: valores.total.cantidad || 0,
           asignado: totalAsignado,
+          pagadoReal: valores.total.pagadoReal || 0,
+          informado: valores.total.informado || 0,
           pagado: totalPagado,
-          porcentaje: totalPorcentaje,
-          estados, // { "A cuota": {...}, "Cuota 30": {...}, ... }
+          porcentaje: totalAsignado
+            ? Math.round((totalPagado / totalAsignado) * 100)
+            : 0,
+          estados,
         };
-      }
+      });
+
+    const rankingOperadoresMesArray = prepararRankingOperadores(
+      rankingOperadoresMes
+    );
+    const rankingOperadoresAcumuladoArray = prepararRankingOperadores(
+      rankingOperadoresAcumulado
     );
 
-    // Ordenamientos
     rankingEntidadArray.sort(
       (a, b) => b.porcentaje - a.porcentaje || b.cobrado - a.cobrado
     );
     rankingCarteraArray.sort(
       (a, b) => b.porcentaje - a.porcentaje || b.cobrado - a.cobrado
     );
-    rankingOperadoresArray.sort(
-      (a, b) =>
-        (b.porcentaje ?? 0) - (a.porcentaje ?? 0) ||
-        (b.pagado ?? 0) - (a.pagado ?? 0)
+    rankingOperadoresMesArray.sort(
+      (a, b) => b.pagado - a.pagado || b.porcentaje - a.porcentaje
+    );
+    rankingOperadoresAcumuladoArray.sort(
+      (a, b) => b.pagado - a.pagado || b.porcentaje - a.porcentaje
     );
 
-    // Respuesta
-    res.json({
-      totalCuotas: totalCuotas || 0,
-      totalImporte: totalImporte || 0,
-      totalSaldo: totalSaldo || 0,
+    const totalCobrado = totalPagadoReal + totalInformado;
+
+    return res.json({
+      totalCuotas,
+      totalImporte,
+      totalSaldo,
+      porcentajeCobrado: totalImporte
+        ? Math.round((totalCobrado / totalImporte) * 100)
+        : 0,
       cuotasPagadas: {
-        cantidad: cuotasPagadas || 0,
-        totalPagado: totalPagadoCuotas || 0,
+        cantidad: cuotasConCobros,
+        totalPagado: totalCobrado,
+        pagadoReal: totalPagadoReal,
+        informado: totalInformado,
       },
-      estadoStats: estadoStats || {},
-      pagosPorDia: pagosPorDia || {},
-      rankingEntidad: rankingEntidadArray || [],
-      rankingCartera: rankingCarteraArray || [],
-      rankingOperadores: rankingOperadoresArray || [],
+      avisosOperadores: {
+        cantidad: cantidadAvisosOperadores,
+        monto: totalAvisadoOperadores,
+      },
+      porVencimiento: {
+        diaActual,
+        cuotasNoVencidas,
+        saldoNoVencido,
+        saldoNoVencidoCuotera,
+        cuotasVencidas,
+        saldoVencido,
+        saldoVencidoCuotera,
+      },
+      estadoStats,
+      pagosPorDia,
+      rankingEntidad: rankingEntidadArray,
+      rankingCartera: rankingCarteraArray,
+      // Compatibilidad: rankingOperadores queda como vista acumulada.
+      rankingOperadores: rankingOperadoresAcumuladoArray,
+      rankingOperadoresMes: rankingOperadoresMesArray,
+      rankingOperadoresAcumulado: rankingOperadoresAcumuladoArray,
+      periodoRanking: { mes: mesActual + 1, anio: anioActual },
     });
   } catch (error) {
     console.error("❌ Error en obtenerEstadisticasColchon:", error);
-    res
+    return res
       .status(500)
       .json({ error: "Error al obtener estadísticas del colchón" });
   }

@@ -25,6 +25,7 @@ const loginLimiter = rateLimit({
   message: { error: "Demasiados intentos fallidos. Probá en 15 minutos." },
   standardHeaders: true,
   legacyHeaders: false,
+  skipSuccessfulRequests: true,
 });
 
 // 🟢 POST /auth/login

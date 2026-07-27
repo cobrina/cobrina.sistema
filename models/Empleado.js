@@ -56,6 +56,36 @@ const EmpleadoSchema = new mongoose.Schema(
       default: Date.now,
       index: true,
     },
+    horarioLaboral: {
+      dias: {
+        type: [Number],
+        default: [1, 2, 3, 4, 5],
+        validate: {
+          validator(values) {
+            return Array.isArray(values) && values.every((dia) => dia >= 0 && dia <= 6);
+          },
+          message: "Los días laborales deben estar entre 0 y 6",
+        },
+      },
+      entrada: {
+        type: String,
+        trim: true,
+        default: "",
+        match: [/^$|^([01]\d|2[0-3]):[0-5]\d$/, "Hora de entrada inválida"],
+      },
+      salida: {
+        type: String,
+        trim: true,
+        default: "",
+        match: [/^$|^([01]\d|2[0-3]):[0-5]\d$/, "Hora de salida inválida"],
+      },
+      toleranciaMinutos: {
+        type: Number,
+        min: 0,
+        max: 180,
+        default: 10,
+      },
+    },
   },
   {
     timestamps: true,

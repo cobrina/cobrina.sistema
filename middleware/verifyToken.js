@@ -1,20 +1,12 @@
-// middleware/verifyToken.js
 import jwt from "jsonwebtoken";
-import dotenv from "dotenv";
-import Empleado from "../models/Empleado.js"; // ⬅️ IMPORTANTE: traemos el modelo
-dotenv.config();
+import Empleado from "../models/Empleado.js";
 
 const verifyToken = async (req, res, next) => {
   try {
-    // 1) Obtener token (header Bearer o cookie "token")
-    const authHeader = req.headers.authorization || "";
-    let token = null;
-
-    if (authHeader.startsWith("Bearer ")) {
-      token = authHeader.slice(7).trim();
-    } else if (req.cookies && req.cookies.token) {
-      token = req.cookies.token;
-    }
+    const authHeader = String(req.headers.authorization || "");
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7).trim()
+      : req.cookies?.token || "";
 
     if (!token) {
       return res
@@ -22,37 +14,33 @@ const verifyToken = async (req, res, next) => {
         .json({ error: "Token no proporcionado o formato inválido" });
     }
 
-    // 2) Verificar firma y claims básicos
     const decoded = jwt.verify(token, process.env.JWT_SECRET, {
       algorithms: ["HS256"],
-      // audience: process.env.JWT_AUD,
-      // issuer: process.env.JWT_ISS,
-      // clockTolerance: 5,
     });
 
-    // 3) Sanitizar payload
-    const { id, username } = decoded || {};
-    let { role } = decoded || {};
-    if (!id || !username || !role) {
-      return res
-        .status(401)
-        .json({ error: "Token inválido (payload incompleto)" });
+    const id = decoded?.id;
+    const usernameToken = decoded?.username;
+    if (!id || !usernameToken || !decoded?.role) {
+      return res.status(401).json({ error: "Token inválido" });
     }
 
-    // 4) ⛔ Chequear en DB que el usuario siga ACTIVO (y traer rol real)
-    const emp = await Empleado.findById(id).select("isActive role");
-    if (!emp) {
+    const empleado = await Empleado.findById(id)
+      .select("isActive role username")
+      .lean();
+
+    if (!empleado) {
       return res.status(401).json({ error: "Usuario no existe" });
     }
-    if (emp.isActive === false) {
+    if (empleado.isActive === false) {
       return res.status(403).json({ error: "Usuario inactivo" });
     }
 
-    // 5) Opcional (recomendado): usar el rol actual de la DB por si cambió
-    role = emp.role;
-
-    req.user = { id, username, role };
-    req.userId = id; // compat
+    req.user = {
+      id: String(empleado._id),
+      username: empleado.username || usernameToken,
+      role: String(empleado.role || decoded.role).trim().toLowerCase(),
+    };
+    req.userId = req.user.id;
 
     return next();
   } catch (error) {

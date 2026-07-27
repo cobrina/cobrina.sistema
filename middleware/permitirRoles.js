@@ -1,39 +1,19 @@
-// middleware/permitirRoles.js
-import Empleado from "../models/Empleado.js";
-
+// verifyToken ya valida en MongoDB que el usuario exista, esté activo y tenga su rol actual.
+// Este middleware solo comprueba permisos; evita una segunda consulta y una escritura por request.
 export default function permitirRoles(...rolesPermitidos) {
-  return async (req, res, next) => {
-    try {
-      const userId = req.user?.id;
-      if (!userId) {
-        return res.status(401).json({ error: "Token inválido o usuario no autenticado" });
-      }
+  return (req, res, next) => {
+    const rolUsuario = String(req.user?.role || "").trim().toLowerCase();
 
-      // ✅ Revalidar estado activo y rol
-      const emp = await Empleado.findById(userId).select("isActive role");
-      if (!emp) return res.status(401).json({ error: "Usuario no existe" });
-      if (emp.isActive === false) {
-        return res.status(403).json({ error: "Usuario inactivo" });
-      }
-
-      const rolUsuario = emp.role; // usar el rol real de la DB
-      if (!rolesPermitidos.includes(rolUsuario)) {
-        return res.status(403).json({
-          error: `Acceso denegado: necesitas uno de estos roles: ${rolesPermitidos.join(", ")}`,
-        });
-      }
-
-      // ⏱️ Actualizar última actividad
-      emp.ultimaActividad = new Date();
-      await emp.save();
-
-      // Alinear el rol en req.user por si cambió
-      req.user.role = rolUsuario;
-
-      next();
-    } catch (error) {
-      console.error("❌ Error en permitirRoles:", error);
-      return res.status(500).json({ error: "Error interno al validar permisos" });
+    if (!req.user?.id || !rolUsuario) {
+      return res
+        .status(401)
+        .json({ error: "Token inválido o usuario no autenticado" });
     }
+
+    if (!rolesPermitidos.includes(rolUsuario)) {
+      return res.status(403).json({ error: "No tenés permiso para realizar esta acción" });
+    }
+
+    return next();
   };
 }

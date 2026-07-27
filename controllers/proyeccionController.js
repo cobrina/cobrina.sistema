@@ -78,6 +78,69 @@ const crearFechaLocal = (fechaStr, finDelDia = false) => {
   );
 };
 
+
+const escapeRegexSafe = (value = "") => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const construirQueryProyeccionesAdmin = (source = {}, { ids = [] } = {}) => {
+  const filtros = [];
+  const {
+    estado,
+    concepto,
+    entidadId,
+    subCesionId,
+    tipoFecha = "fechaPromesa",
+    fechaDesde,
+    fechaHasta,
+    desde,
+    hasta,
+    buscar,
+    usuarioId,
+    mes,
+    anio,
+    promesaHoy,
+    llamadoHoy,
+    sinGestion,
+  } = source || {};
+
+  const normalizedIds = (Array.isArray(ids) ? ids : String(ids || "").split(","))
+    .map((value) => String(value || "").trim())
+    .filter((value) => mongoose.isValidObjectId(value));
+  if (normalizedIds.length) filtros.push({ _id: { $in: normalizedIds } });
+  if (usuarioId && mongoose.isValidObjectId(usuarioId)) filtros.push({ empleadoId: usuarioId });
+  if (estado) filtros.push({ estado });
+  if (concepto) filtros.push({ concepto });
+  if (entidadId && mongoose.isValidObjectId(entidadId)) filtros.push({ entidadId });
+  if (subCesionId && mongoose.isValidObjectId(subCesionId)) filtros.push({ subCesionId });
+  if (mes) filtros.push({ mes: Number(mes) });
+  if (anio) filtros.push({ anio: Number(anio) });
+
+  if (sinGestion === true || sinGestion === "true") {
+    filtros.push({ $or: [{ vecesTocada: { $exists: false } }, { vecesTocada: null }, { vecesTocada: { $lte: 0 } }] });
+  }
+  const hoy = new Date();
+  hoy.setHours(0, 0, 0, 0);
+  const manana = new Date(hoy);
+  manana.setDate(hoy.getDate() + 1);
+  if (promesaHoy === true || promesaHoy === "true") filtros.push({ fechaPromesa: { $gte: hoy, $lt: manana } });
+  if (llamadoHoy === true || llamadoHoy === "true") filtros.push({ fechaProximoLlamado: { $gte: hoy, $lt: manana } });
+
+  const start = fechaDesde || desde;
+  const end = fechaHasta || hasta;
+  if (start && end && !Number.isNaN(Date.parse(start)) && !Number.isNaN(Date.parse(end))) {
+    const field = ({ fechaPromesa: "fechaPromesa", creado: "creado", modificado: "ultimaModificacion" }[tipoFecha]) || "fechaPromesa";
+    filtros.push({ [field]: { $gte: crearFechaLocal(start), $lte: crearFechaLocal(end, true) } });
+  }
+  if (buscar) {
+    const value = String(buscar).trim();
+    const regex = new RegExp(escapeRegexSafe(value), "i");
+    const possibleDni = Number.parseInt(value, 10);
+    const conditions = [{ nombreTitular: regex }, { concepto: regex }, { estado: regex }];
+    if (!Number.isNaN(possibleDni)) conditions.push({ dni: possibleDni });
+    filtros.push({ $or: conditions });
+  }
+  return filtros.length ? { $and: filtros } : {};
+};
+
 function parseExcelDate(v) {
   if (v === undefined || v === null || v === "") return null;
 
@@ -1907,6 +1970,29 @@ export const importarPagosMasivo = async (req, res) => {
   }
 };
 
+
+export const eliminarProyeccionesMasivo = async (req, res) => {
+  try {
+    if (!esSuper(req)) return res.status(403).json({ error: "Solo super-admin puede eliminar proyecciones masivamente" });
+    const confirmacion = String(req.body?.confirmacion || "").trim();
+    if (confirmacion !== "ELIMINAR PROYECCIONES") {
+      return res.status(400).json({ error: "Confirmación inválida" });
+    }
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const filtros = req.body?.filtros || {};
+    if (!ids.length && !Object.values(filtros).some((value) => value !== "" && value != null && value !== false)) {
+      return res.status(400).json({ error: "Debés seleccionar filas o aplicar al menos un filtro" });
+    }
+    if (ids.length > 1000) return res.status(400).json({ error: "Máximo 1000 proyecciones seleccionadas por operación" });
+    const query = construirQueryProyeccionesAdmin(filtros, { ids });
+    const result = await Proyeccion.deleteMany(query);
+    return res.json({ ok: true, eliminadas: Number(result.deletedCount || 0) });
+  } catch (error) {
+    console.error("eliminarProyeccionesMasivo:", error);
+    return res.status(500).json({ error: "No se pudieron eliminar las proyecciones" });
+  }
+};
+
 export const exportarProyeccionesExcel = async (req, res) => {
   try {
     const {
@@ -1923,6 +2009,7 @@ export const exportarProyeccionesExcel = async (req, res) => {
       fechaHasta,
       desde,
       hasta,
+      ids,
     } = req.query;
 
     if (esAdmin(req)) {
@@ -1956,6 +2043,8 @@ export const exportarProyeccionesExcel = async (req, res) => {
 
     // Filtros base (según rol)
     const filtros = [];
+    const idsSeleccionados = String(ids || "").split(",").map((value) => value.trim()).filter((value) => mongoose.isValidObjectId(value));
+    if (idsSeleccionados.length) filtros.push({ _id: { $in: idsSeleccionados } });
     if (esSuper(req)) {
       if (usuarioId) filtros.push({ empleadoId: usuarioId });
     } else {

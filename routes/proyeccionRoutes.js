@@ -21,6 +21,7 @@ import {
   limpiarPagosProyeccion,
   limpiarObservacionesProyeccion,
   importarProyeccionesMasivo, // ← Importación masiva de proyecciones (Entidad/SubCesión)
+  eliminarProyeccionesMasivo,
 } from "../controllers/proyeccionController.js";
 
 import verifyToken from "../middleware/verifyToken.js";
@@ -78,6 +79,9 @@ router.put(
   },
   actualizarProyeccion
 );
+
+// Eliminación masiva administrativa (solo super-admin)
+router.delete("/admin/eliminar-masivo", verifyToken, permitirRoles("super-admin"), eliminarProyeccionesMasivo);
 
 // Eliminar (dueño o super-admin)
 router.delete("/:id", verifyToken, permitirRoles("super-admin", "operador", "operador-vip"), eliminarProyeccion);

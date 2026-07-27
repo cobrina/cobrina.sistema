@@ -225,28 +225,47 @@ function uniqNums(arr = []) {
   ];
 }
 
-function normalizarFallos(item = {}) {
-  let fallos = [];
+function valorResultadoCriterio(value) {
+  if (value === true || value === 1) return 1;
+  if (value === 0.5) return 0.5;
 
-  if (Array.isArray(item.fallosIds)) {
-    fallos = uniqNums(item.fallosIds);
+  const v = String(value ?? "").trim().toLowerCase();
+  if (["si", "sí", "ok", "cumple", "completo", "true", "1"].includes(v)) return 1;
+  if (["parcial", "medio", "mitad", "0.5", "0,5"].includes(v)) return 0.5;
+  return 0;
+}
+
+function normalizarResultados(item = {}) {
+  let fallosIds = [];
+  let parcialesIds = [];
+
+  if (item.checks && typeof item.checks === "object" && !Array.isArray(item.checks)) {
+    for (const id of ALL_IDS) {
+      const raw = item.checks[String(id)] ?? item.checks[id];
+      const valor = valorResultadoCriterio(raw);
+      if (valor === 0.5) parcialesIds.push(id);
+      else if (valor !== 1) fallosIds.push(id);
+    }
+  } else if (Array.isArray(item.fallosIds) || Array.isArray(item.parcialesIds)) {
+    fallosIds = uniqNums(item.fallosIds || []);
+    parcialesIds = uniqNums(item.parcialesIds || []);
   } else if (Array.isArray(item.okIds)) {
     const ok = new Set(uniqNums(item.okIds));
-    fallos = ALL_IDS.filter((id) => !ok.has(id));
-  } else if (item.checks && typeof item.checks === "object") {
-    const ok = new Set(
-      Object.entries(item.checks)
-        .filter(([, v]) => !!v)
-        .map(([k]) => Number(k))
-        .filter((n) => Number.isFinite(n))
-    );
-    fallos = ALL_IDS.filter((id) => !ok.has(id));
+    fallosIds = ALL_IDS.filter((id) => !ok.has(id));
   } else {
-    fallos = [...ALL_IDS];
+    fallosIds = [...ALL_IDS];
   }
 
-  fallos = fallos.filter((id) => CRITERIOS_BY_ID.has(id)).sort((a, b) => a - b);
-  return fallos;
+  const validos = new Set(ALL_IDS);
+  fallosIds = [...new Set(fallosIds)]
+    .filter((id) => validos.has(id))
+    .sort((a, b) => a - b);
+  const fallosSet = new Set(fallosIds);
+  parcialesIds = [...new Set(parcialesIds)]
+    .filter((id) => validos.has(id) && !fallosSet.has(id))
+    .sort((a, b) => a - b);
+
+  return { fallosIds, parcialesIds };
 }
 
 function parseComentariosCriterio(it = {}) {
@@ -273,27 +292,25 @@ function parseComentariosCriterio(it = {}) {
   return out;
 }
 
-function calcScoresFromFallos(fallosIds = []) {
+function calcScoresFromResultados(fallosIds = [], parcialesIds = []) {
   const fallos = new Set(fallosIds);
+  const parciales = new Set(parcialesIds);
 
   const totales = { presentacion: 3, negociacion: 7, cierre: 6, calidad: 8 };
-  const okCount = { presentacion: 0, negociacion: 0, cierre: 0, calidad: 0 };
+  const puntos = { presentacion: 0, negociacion: 0, cierre: 0, calidad: 0 };
 
   for (const id of ALL_IDS) {
     const c = CRITERIOS_BY_ID.get(id);
     if (!c) continue;
-    if (!fallos.has(id)) okCount[c.grupo] += 1;
+    if (fallos.has(id)) continue;
+    puntos[c.grupo] += parciales.has(id) ? 0.5 : 1;
   }
 
   const scoreBloques = {
-    presentacion: totales.presentacion
-      ? (okCount.presentacion / totales.presentacion) * 10
-      : 0,
-    negociacion: totales.negociacion
-      ? (okCount.negociacion / totales.negociacion) * 10
-      : 0,
-    cierre: totales.cierre ? (okCount.cierre / totales.cierre) * 10 : 0,
-    calidad: totales.calidad ? (okCount.calidad / totales.calidad) * 10 : 0,
+    presentacion: totales.presentacion ? (puntos.presentacion / totales.presentacion) * 10 : 0,
+    negociacion: totales.negociacion ? (puntos.negociacion / totales.negociacion) * 10 : 0,
+    cierre: totales.cierre ? (puntos.cierre / totales.cierre) * 10 : 0,
+    calidad: totales.calidad ? (puntos.calidad / totales.calidad) * 10 : 0,
   };
 
   const scoreAudio =
@@ -474,8 +491,11 @@ export async function crear(req, res) {
       }
 
       const comentariosCriterio = parseComentariosCriterio(it);
-      const fallosIds = normalizarFallos(it);
-      const { scoreBloques, scoreAudio } = calcScoresFromFallos(fallosIds);
+      const { fallosIds, parcialesIds } = normalizarResultados(it);
+      const { scoreBloques, scoreAudio } = calcScoresFromResultados(
+        fallosIds,
+        parcialesIds
+      );
 
       return {
         telefono,
@@ -489,6 +509,7 @@ export async function crear(req, res) {
         duracionSegundos,
         comentariosCriterio,
         fallosIds,
+        parcialesIds,
         scoreAudio,
         scoreBloques,
       };
@@ -726,8 +747,11 @@ export async function editar(req, res) {
       }
 
       const comentariosCriterio = parseComentariosCriterio(it);
-      const fallosIds = normalizarFallos(it);
-      const { scoreBloques, scoreAudio } = calcScoresFromFallos(fallosIds);
+      const { fallosIds, parcialesIds } = normalizarResultados(it);
+      const { scoreBloques, scoreAudio } = calcScoresFromResultados(
+        fallosIds,
+        parcialesIds
+      );
 
       return {
         telefono,
@@ -741,6 +765,7 @@ export async function editar(req, res) {
         duracionSegundos,
         comentariosCriterio,
         fallosIds,
+        parcialesIds,
         scoreAudio,
         scoreBloques,
       };
@@ -877,7 +902,7 @@ export async function analyticsResumen(req, res) {
           avgFinal: 1,
         },
       },
-      { $sort: { avgFinal: 1 } },
+      { $sort: { avgFinal: -1, auditorias: -1, operadorUsername: 1 } },
     ]);
 
     const topFallosRaw = await AuditoriaContactoDirecto.aggregate([

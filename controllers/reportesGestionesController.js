@@ -5,6 +5,20 @@ import { extraerEmails } from "../utils/email.util.js";
 import { toDateOnly, normalizarHora } from "../utils/fecha.util.js";
 import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
+import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
+import {
+  transformarGestionEnAcuerdo,
+  resumirAcuerdos,
+  crearExcelAcuerdos,
+  TIPOS_ACUERDO,
+} from "../services/acuerdosGestionesService.js";
+
+
+function validarConfirmacionDestructiva(req, fraseEsperada) {
+  const header = String(req.headers["x-cobrina-confirm-delete"] || "").trim();
+  const body = String(req.body?.confirmacion || "").trim();
+  return header === fraseEsperada && body === fraseEsperada;
+}
 
 /** Helper: extrae el usuario del JWT (lo setea verifyToken/miniVerify) */
 function getUsuarioId(req) {
@@ -121,6 +135,36 @@ const inExactMultiStrings = (raw, mapFn = (x) => x) => {
   return arr.length === 1 ? arr[0] : { $in: arr };
 };
 
+// Usuarios activos para métricas. No modifica ni elimina gestiones históricas:
+// solamente evita que usuarios dados de baja sigan apareciendo en tableros actuales.
+let __activeUsersCache = { exp: 0, names: [] };
+async function getActiveUsernames() {
+  if (Date.now() < __activeUsersCache.exp && __activeUsersCache.names.length) {
+    return __activeUsersCache.names;
+  }
+  const rows = await Empleado.find({ isActive: { $ne: false } })
+    .select("username")
+    .lean();
+  const names = rows
+    .map((row) => String(row.username || "").trim().toLowerCase())
+    .filter(Boolean);
+  __activeUsersCache = { exp: Date.now() + 60_000, names };
+  return names;
+}
+
+async function activeUserFilter(rawOperator) {
+  const active = await getActiveUsernames();
+  const activeSet = new Set(active);
+  const requested = splitCSV(rawOperator)
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean);
+  const selected = requested.length
+    ? requested.filter((value) => activeSet.has(value))
+    : active;
+  if (!selected.length) return { $in: ["__cobrina_sin_usuario_activo__"] };
+  return selected.length === 1 ? selected[0] : { $in: selected };
+}
+
 // Normaliza un string de fecha (dd/mm/yyyy, yyyy-mm-dd, serial Excel)
 // a INICIO de día UTC (00:00:00.000)
 function diaInicioUTC(raw) {
@@ -180,6 +224,17 @@ export async function cargar(req, res) {
     // ✅ Seguridad: cargar siempre pertenece al usuario que cargó (propietario)
     // ✅ Si marcás reemplazarTodo, borra SOLO el universo de este propietario
     if (reemplazarTodo) {
+      const frase = "REEMPLAZAR GESTIONES";
+      if (!eliminacionReportesHabilitada()) {
+        return res.status(403).json({
+          error: "El reemplazo total está deshabilitado para proteger las gestiones existentes.",
+        });
+      }
+      if (!validarConfirmacionDestructiva(req, frase)) {
+        return res.status(400).json({
+          error: "Falta la confirmación reforzada para reemplazar gestiones.",
+        });
+      }
       await ReporteGestion.deleteMany({
         propietario: new mongoose.Types.ObjectId(usuarioId),
       });
@@ -403,6 +458,11 @@ export async function cargar(req, res) {
       }
     }
 
+    if (insertados > 0 || reemplazarTodo) {
+      invalidateReportesAnalyticsCache();
+      invalidateSeguimientoCache();
+    }
+
     return res.status(200).json({
       ok: true,
       insertados,
@@ -439,6 +499,8 @@ export async function listar(req, res) {
       sortKey,
       sortDir,
       fields = "min",
+      soloActivos = "false",
+      withTotal = "true",
     } = req.query || {};
 
     // ✅ Scope: admin/super ve todo; otros => solo su propietario
@@ -468,7 +530,11 @@ export async function listar(req, res) {
     const fTipo = rxExactMulti(tipoContacto);
     const fEstado = rxExactMulti(estadoCuenta);
 
-    if (fUsuario) q.usuario = fUsuario;
+    if (String(soloActivos).toLowerCase() === "true") {
+      q.usuario = await activeUserFilter(operador);
+    } else if (fUsuario) {
+      q.usuario = fUsuario;
+    }
     if (fEntidad) q.entidad = fEntidad;
     if (fTipo) q.tipoContacto = fTipo;
     if (fEstado) q.estadoCuenta = fEstado;
@@ -518,18 +584,21 @@ export async function listar(req, res) {
 
     throwIfAborted(req);
 
+    const includeTotal = String(withTotal).toLowerCase() !== "false";
+    const itemsPromise = ReporteGestion.aggregate([
+      { $match: q },
+      { $sort: sortStage },
+      { $skip: skip },
+      { $limit: limitNum },
+      projectStage,
+    ])
+      .allowDiskUse(true)
+      .option({ maxTimeMS: 20000 })
+      .collation({ locale: "es", strength: 2 });
+
     const [total, items] = await Promise.all([
-      ReporteGestion.countDocuments(q),
-      ReporteGestion.aggregate([
-        { $match: q },
-        { $sort: sortStage },
-        { $skip: skip },
-        { $limit: limitNum },
-        projectStage,
-      ])
-        .allowDiskUse(true)
-        .option({ maxTimeMS: 20000 })
-        .collation({ locale: "es", strength: 2 }),
+      includeTotal ? ReporteGestion.countDocuments(q) : Promise.resolve(null),
+      itemsPromise,
     ]);
 
     throwIfAborted(req);
@@ -538,7 +607,7 @@ export async function listar(req, res) {
       ok: true,
       total,
       page: pageNum,
-      pages: Math.max(1, Math.ceil(total / limitNum)),
+      pages: total == null ? null : Math.max(1, Math.ceil(total / limitNum)),
       items,
     });
   } catch (e) {
@@ -551,6 +620,13 @@ export async function limpiar(req, res) {
   try {
     attachAbortFlag(req, res);
 
+    const frase = "ELIMINAR GESTIONES";
+    if (!validarConfirmacionDestructiva(req, frase)) {
+      return res.status(400).json({
+        error: "Falta la confirmación reforzada para eliminar gestiones.",
+      });
+    }
+
     const usuarioId = getUsuarioId(req);
     if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
 
@@ -559,6 +635,26 @@ export async function limpiar(req, res) {
 
     const f = req.body?.filtros || {};
     const { desde, hasta, operador, entidad, tipoContacto, estadoCuenta, dni } = f;
+
+    const hayFiltroExplicito = Boolean(
+      desde ||
+        hasta ||
+        (Array.isArray(operador) ? operador.length : String(operador || "").trim()) ||
+        (Array.isArray(entidad) ? entidad.length : String(entidad || "").trim()) ||
+        (Array.isArray(tipoContacto)
+          ? tipoContacto.length
+          : String(tipoContacto || "").trim()) ||
+        (Array.isArray(estadoCuenta)
+          ? estadoCuenta.length
+          : String(estadoCuenta || "").trim()) ||
+        String(dni || "").trim()
+    );
+
+    if (!hayFiltroExplicito) {
+      return res.status(400).json({
+        error: "Aplicá al menos un filtro antes de eliminar gestiones.",
+      });
+    }
 
     // ✅ Seguridad: limpiar por defecto SOLO mi propietario
     // (aunque seas admin/super). Si querés habilitar “borrar todo”, lo hacemos
@@ -591,6 +687,10 @@ export async function limpiar(req, res) {
     throwIfAborted(req);
 
     const r = await ReporteGestion.deleteMany(q);
+    if ((r.deletedCount || 0) > 0) {
+      invalidateReportesAnalyticsCache();
+      invalidateSeguimientoCache();
+    }
     return res.json({ ok: true, borrados: r.deletedCount || 0 });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
@@ -703,44 +803,59 @@ export async function comparativo(req, res) {
     const prevEnd = new Date(d1.getTime() - 86400000);
     const prevStart = new Date(prevEnd.getTime() - (days - 1) * 86400000);
 
-    // ✅ Scope: admin/super => todo; otros => solo lo suyo
-    // ✅ Scope: admin/super => todo; otros => solo lo suyo
-const base = {
-  ...ownerScope(req),
-  borrado: { $ne: true },
-};
+    // ✅ Scope: admin/super => todo; otros => solo lo suyo.
+    // Las métricas excluyen empleados inactivos sin tocar las gestiones históricas.
+    const base = {
+      ...ownerScope(req),
+      borrado: { $ne: true },
+    };
+    const activeFilter = await activeUserFilter(operador);
+    const dniFilter = buildDniFilter(dni);
+    const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
 
-const addFilters = (q) => {
-  const out = { ...base };
-  if (q?.fecha) out.fecha = q.fecha;
-
-  const dniFilter = buildDniFilter(dni);
-  if (dniFilter) out.dni = dniFilter;
-
-  const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
-  const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
-  const fTipo = rxExactMulti(tipoContacto);
-  const fEstado = rxExactMulti(estadoCuenta);
-
-  if (fUsuario) out.usuario = fUsuario;
-  if (fEntidad) out.entidad = fEntidad;
-  if (fTipo) out.tipoContacto = fTipo;
-  if (fEstado) out.estadoCuenta = fEstado;
-
-  return out;
-};
+    const addFilters = (q) => {
+      const out = { ...base, usuario: activeFilter };
+      if (q?.fecha) out.fecha = q.fecha;
+      if (dniFilter) out.dni = dniFilter;
+      if (fEntidad) out.entidad = fEntidad;
+      if (fTipo) out.tipoContacto = fTipo;
+      if (fEstado) out.estadoCuenta = fEstado;
+      return out;
+    };
 
 
     const qActual = addFilters({ fecha: { $gte: d1, $lte: endOfDayUTC(d2) } });
     const qPrevio = addFilters({ fecha: { $gte: prevStart, $lte: endOfDayUTC(prevEnd) } });
 
-    const esContactoDoc = {
+    const resultadoTextoSeguro = {
+      $convert: { input: "$resultadoGestion", to: "string", onError: "", onNull: "" },
+    };
+    const estadoTextoSeguro = {
+      $convert: { input: "$estadoCuenta", to: "string", onError: "", onNull: "" },
+    };
+    const esContactoExpr = {
       $or: [
-        { resultadoGestion: { $regex: /contactad[oa]/i } },
-        { estadoCuenta: { $regex: /contactad[oa]/i } },
+        { $regexMatch: { input: resultadoTextoSeguro, regex: /contactad[oa]/i } },
+        { $regexMatch: { input: estadoTextoSeguro, regex: /contactad[oa]/i } },
       ],
     };
-    const esMailLibreDoc = { resultadoGestion: { $regex: /mail\s*libre/i } };
+    const mailTextoSeguro = {
+      $toLower: {
+        $concat: [
+          { $convert: { input: "$tipoContacto", to: "string", onError: "", onNull: "" } },
+          " | ",
+          { $convert: { input: "$resultadoGestion", to: "string", onError: "", onNull: "" } },
+        ],
+      },
+    };
+    const esMailEnviadoExpr = {
+      $and: [
+        { $regexMatch: { input: mailTextoSeguro, regex: /mail|correo|e-?mail/i } },
+        { $not: [{ $regexMatch: { input: mailTextoSeguro, regex: /entrante|recibido|recepci[oó]n/i } }] },
+      ],
+    };
 
     const HORA_SAFE = {
       $convert: {
@@ -763,8 +878,8 @@ const addFilters = (q) => {
           resultadoGestion: 1,
           estadoCuenta: 1,
           telMailMarcado: 1,
-          isContacto: esContactoDoc,
-          isMailLibre: esMailLibreDoc,
+          isContacto: esContactoExpr,
+          isMailEnviado: esMailEnviadoExpr,
           horaHH: { $substrBytes: [HORA_SAFE, 0, 2] },
         },
       },
@@ -781,13 +896,13 @@ const addFilters = (q) => {
             },
           ],
           porDniMailLibre: [
-            {
-              $match: {
-                isMailLibre: true,
-                telMailMarcado: { $type: "string", $ne: "" },
-              },
-            },
-            { $project: { dni: 1, mails: "$telMailMarcado" } },
+            { $match: { isMailEnviado: true } },
+            { $group: { _id: "$dni", cantidad: { $sum: 1 } } },
+          ],
+          dnisContactados: [
+            { $match: { isContacto: true } },
+            { $group: { _id: "$dni" } },
+            { $count: "value" },
           ],
           porHora: [
             {
@@ -831,17 +946,17 @@ const addFilters = (q) => {
       const gestiones = base0.gestiones || 0;
       const dnisUnicos = (base0.dnisSet || []).filter(Boolean).length || 0;
       const contactos = base0.contactos || 0;
+      const dnisContactados = agg?.[0]?.dnisContactados?.[0]?.value || 0;
 
       const dnisPorDia = rangoDiasHabiles ? dnisUnicos / rangoDiasHabiles : 0;
 
       const porDniMailLibre = agg?.[0]?.porDniMailLibre || [];
-      const regexEmail = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
       const mapaDniMails = new Map();
       for (const r of porDniMailLibre) {
-        const mails = String(r.mails || "").match(regexEmail) || [];
-        if (!mails.length) continue;
-        const key = String(r.dni || "");
-        mapaDniMails.set(key, (mapaDniMails.get(key) || 0) + mails.length);
+        const key = String(r?._id || r?.dni || "");
+        const cantidad = Number(r?.cantidad || 0);
+        if (!key || cantidad <= 0) continue;
+        mapaDniMails.set(key, (mapaDniMails.get(key) || 0) + cantidad);
       }
       let promedioMailsPorDni = 0;
       if (mapaDniMails.size) {
@@ -875,7 +990,7 @@ const addFilters = (q) => {
         dnisUnicos,
         gestionesPorCaso: dnisUnicos ? gestiones / dnisUnicos : 0,
         tasaContactabilidad,
-        efectividadContacto: 0,
+        efectividadContacto: dnisUnicos ? (dnisContactados * 100) / dnisUnicos : 0,
         dnisPorDiaHabil: dnisPorDia,
         ritmoEntreCasosMin: null,
         promedioMailsPorDni,
@@ -930,7 +1045,8 @@ const addFilters = (q) => {
 }
 
 const __cacheResumen = new Map(); // key -> { exp, data }
-const CACHE_TTL_MS = 45_000;
+const __inflightResumen = new Map(); // key -> Promise
+const CACHE_TTL_MS = 120_000;
 
 function cacheGet(key) {
   const hit = __cacheResumen.get(key);
@@ -944,18 +1060,304 @@ function cacheGet(key) {
 function cacheSet(key, data) {
   __cacheResumen.set(key, { exp: Date.now() + CACHE_TTL_MS, data });
 }
+function invalidateReportesAnalyticsCache() {
+  __cacheResumen.clear();
+  __inflightResumen.clear();
+}
+
+const CONTACTO_RX = /contactad[oa]/i;
+const MAIL_ENVIADO_RX = /mail|correo|e-?mail/i;
+const MAIL_ENTRANTE_RX = /entrante|recibido|recepci[oó]n/i;
+
+function normalizarTipoContactoExpr() {
+  const RAW = {
+    $toLower: {
+      $concat: [
+        { $convert: { input: "$tipoContacto", to: "string", onError: "", onNull: "" } },
+        " | ",
+        { $convert: { input: "$resultadoGestion", to: "string", onError: "", onNull: "" } },
+      ],
+    },
+  };
+  const test = (regex) => ({ $regexMatch: { input: RAW, regex } });
+  return {
+    $switch: {
+      branches: [
+        { case: test(/proceso|batch|autom[aá]tico|ignorar/i), then: "Proceso" },
+        { case: test(/entrante.*tel|llamada.*entra.*tel|inbound/i), then: "Llamada entrante - telef." },
+        { case: test(/saliente|outbound|operador llama/i), then: "Llamada saliente" },
+        { case: test(/whats.*chat|wp.*chat|wa.*chat|mensaje saliente.*(wp|whats|wa)/i), then: "Whatsapp chat" },
+        { case: test(/carta.*entrante|mail entrante|correo entrante/i), then: "Llamada entrante - carta" },
+        { case: test(/whats.*entrante|wp.*entra|wa.*entra|mensaje entrante.*(wp|whats|wa)/i), then: "Whatsapp entrante" },
+        { case: test(/envio.*mail|email.*saliente|correo.*saliente|env[ií]a.*correo/i), then: "Envio e-mail" },
+        { case: test(/sms.*entrante|mensaje.*texto.*entrante|masiva.*sms/i), then: "Llamada entrante - sms" },
+        { case: test(/ivr.*entrante|sistema.*ivr|respuesta de voz|menu.*ivr/i), then: "Llamada entrante - ivr" },
+        { case: test(/whats|wp|wa/i), then: "Whatsapp chat" },
+        { case: test(/mail|correo|email/i), then: "Envio e-mail" },
+      ],
+      default: "Otros",
+    },
+  };
+}
+
+function buildResumenPipeline(matchQ, { completo = true, topN = 10 } = {}) {
+  const RESULTADO_SAFE = {
+    $convert: { input: "$resultadoGestion", to: "string", onError: "", onNull: "" },
+  };
+  const ESTADO_SAFE = {
+    $convert: { input: "$estadoCuenta", to: "string", onError: "", onNull: "" },
+  };
+  const HORA_SAFE = {
+    $convert: { input: "$hora", to: "string", onError: "00:00:00", onNull: "00:00:00" },
+  };
+  const MAIL_TEXT_SAFE = {
+    $toLower: {
+      $concat: [
+        { $convert: { input: "$tipoContacto", to: "string", onError: "", onNull: "" } },
+        " | ",
+        { $convert: { input: "$resultadoGestion", to: "string", onError: "", onNull: "" } },
+      ],
+    },
+  };
+
+  const facets = {
+    totales: [
+      {
+        $group: {
+          _id: null,
+          gestiones: { $sum: 1 },
+          contactos: { $sum: { $cond: ["$isContacto", 1, 0] } },
+          desde: { $min: "$fecha" },
+          hasta: { $max: "$fecha" },
+        },
+      },
+    ],
+    dnis: [
+      {
+        $group: {
+          _id: "$dni",
+          contactado: { $max: { $cond: ["$isContacto", 1, 0] } },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          dnisUnicos: { $sum: 1 },
+          dnisContactados: { $sum: "$contactado" },
+        },
+      },
+    ],
+    diasActividad: [
+      { $match: { diaSemana: { $gte: 1, $lte: 5 } } },
+      { $group: { _id: "$diaISO" } },
+      { $count: "value" },
+    ],
+    mails: [
+      { $match: { isMailEnviado: true } },
+      { $group: { _id: "$dni", cantidad: { $sum: 1 } } },
+      { $group: { _id: null, promedio: { $avg: "$cantidad" } } },
+    ],
+  };
+
+  if (completo) {
+    Object.assign(facets, {
+      porHora: [
+        {
+          $group: {
+            _id: "$horaHH",
+            gestiones: { $sum: 1 },
+            contactos: { $sum: { $cond: ["$isContacto", 1, 0] } },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ],
+      pieTipos: [
+        { $match: { tipoNormalizado: { $ne: "Proceso" } } },
+        { $group: { _id: "$tipoNormalizado", value: { $sum: 1 } } },
+        { $sort: { value: -1, _id: 1 } },
+      ],
+      topGestiones: [
+        { $group: { _id: "$dni", gestiones: { $sum: 1 } } },
+        { $sort: { gestiones: -1, _id: 1 } },
+        { $limit: topN },
+      ],
+      topDias: [
+        { $group: { _id: { dni: "$dni", dia: "$diaISO" } } },
+        { $group: { _id: "$_id.dni", diasTocados: { $sum: 1 } } },
+        { $sort: { diasTocados: -1, _id: 1 } },
+        { $limit: 10 },
+      ],
+      promedioDias: [
+        { $group: { _id: { dni: "$dni", dia: "$diaISO" } } },
+        { $group: { _id: "$_id.dni", diasTocados: { $sum: 1 } } },
+        { $group: { _id: null, promedio: { $avg: "$diasTocados" } } },
+      ],
+    });
+  }
+
+  return [
+    { $match: matchQ },
+    {
+      $project: {
+        dni: 1,
+        fecha: 1,
+        horaStr: HORA_SAFE,
+        tipoContacto: 1,
+        resultadoGestion: 1,
+        estadoCuenta: 1,
+        tipoNormalizado: normalizarTipoContactoExpr(),
+        isContacto: {
+          $or: [
+            { $regexMatch: { input: RESULTADO_SAFE, regex: CONTACTO_RX } },
+            { $regexMatch: { input: ESTADO_SAFE, regex: CONTACTO_RX } },
+          ],
+        },
+        isMailEnviado: {
+          $and: [
+            { $regexMatch: { input: MAIL_TEXT_SAFE, regex: MAIL_ENVIADO_RX } },
+            { $not: [{ $regexMatch: { input: MAIL_TEXT_SAFE, regex: MAIL_ENTRANTE_RX } }] },
+          ],
+        },
+        horaHH: { $substrBytes: [HORA_SAFE, 0, 2] },
+        diaISO: { $dateToString: { date: "$fecha", format: "%Y-%m-%d" } },
+        diaSemana: { $isoDayOfWeek: "$fecha" },
+      },
+    },
+    { $facet: facets },
+  ];
+}
+
+function buildRitmoPipeline(matchQ) {
+  const HORA_SAFE = {
+    $convert: { input: "$hora", to: "string", onError: "00:00:00", onNull: "00:00:00" },
+  };
+  const hh = { $convert: { input: { $substrBytes: [HORA_SAFE, 0, 2] }, to: "int", onError: 0, onNull: 0 } };
+  const mm = { $convert: { input: { $substrBytes: [HORA_SAFE, 3, 2] }, to: "int", onError: 0, onNull: 0 } };
+  const ss = { $convert: { input: { $substrBytes: [HORA_SAFE, 6, 2] }, to: "int", onError: 0, onNull: 0 } };
+
+  return [
+    { $match: matchQ },
+    { $match: { $expr: { $lte: [{ $isoDayOfWeek: "$fecha" }, 5] } } },
+    {
+      $project: {
+        dni: 1,
+        usuario: 1,
+        fecha: 1,
+        segundoDia: { $add: [{ $multiply: [hh, 3600] }, { $multiply: [mm, 60] }, ss] },
+        particion: {
+          $concat: [
+            "$usuario",
+            "|",
+            { $dateToString: { date: "$fecha", format: "%Y-%m-%d" } },
+          ],
+        },
+      },
+    },
+    {
+      $setWindowFields: {
+        partitionBy: "$particion",
+        sortBy: { segundoDia: 1 },
+        output: {
+          prevSegundo: { $shift: { output: "$segundoDia", by: -1 } },
+          prevDni: { $shift: { output: "$dni", by: -1 } },
+        },
+      },
+    },
+    {
+      $project: {
+        dni: 1,
+        prevDni: 1,
+        gapMin: {
+          $cond: [
+            {
+              $and: [
+                { $ne: ["$prevSegundo", null] },
+                { $gte: ["$prevSegundo", 9 * 3600] },
+                { $lte: ["$segundoDia", 13 * 3600] },
+                { $gte: [{ $subtract: ["$segundoDia", "$prevSegundo"] }, 0] },
+                { $lte: [{ $subtract: ["$segundoDia", "$prevSegundo"] }, 120 * 60] },
+              ],
+            },
+            { $divide: [{ $subtract: ["$segundoDia", "$prevSegundo"] }, 60] },
+            null,
+          ],
+        },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        promedioGestiones: { $avg: "$gapMin" },
+        promedioCasos: {
+          $avg: { $cond: [{ $and: [{ $ne: ["$gapMin", null] }, { $ne: ["$dni", "$prevDni"] }] }, "$gapMin", null] },
+        },
+      },
+    },
+  ];
+}
+
+async function calcularCasosNuevosTotales({
+  baseTenant,
+  d1,
+  d2,
+  usuarioFilter,
+  entidadFilter,
+  tipoFilter,
+  estadoFilter,
+  dniFilter,
+  minDias = 90,
+}) {
+  const corteInicio = new Date(d1.getTime() - minDias * 86400000);
+  const endOfDay = new Date(d2.getTime() + 86399999);
+  const comunes = {
+    ...(dniFilter ? { dni: dniFilter } : {}),
+    ...(entidadFilter ? { entidad: entidadFilter } : {}),
+    ...(tipoFilter ? { tipoContacto: tipoFilter } : {}),
+    ...(estadoFilter ? { estadoCuenta: estadoFilter } : {}),
+    ...(usuarioFilter ? { usuario: usuarioFilter } : {}),
+  };
+
+  const [recientesDNIs, pares] = await Promise.all([
+    ReporteGestion.distinct("dni", {
+      ...baseTenant,
+      ...comunes,
+      fecha: { $gte: corteInicio, $lt: d1 },
+    }).collation({ locale: "es", strength: 1 }),
+    ReporteGestion.aggregate([
+      { $match: { ...baseTenant, ...comunes, fecha: { $gte: d1, $lte: endOfDay } } },
+      { $group: { _id: { operador: "$usuario", dni: "$dni" } } },
+      { $project: { _id: 0, operador: "$_id.operador", dni: "$_id.dni" } },
+    ])
+      .allowDiskUse(true)
+      .option({ maxTimeMS: 20000 })
+      .collation({ locale: "es", strength: 1 }),
+  ]);
+
+  const recientes = new Set(recientesDNIs.map((x) => String(x || "")));
+  let casosDistintos = 0;
+  let casosNuevos = 0;
+  for (const row of pares) {
+    const dni = String(row?.dni || "").trim();
+    if (!dni) continue;
+    casosDistintos += 1;
+    if (!recientes.has(dni)) casosNuevos += 1;
+  }
+  return {
+    casosNuevos,
+    casosDistintos,
+    pctNuevos: casosDistintos ? (casosNuevos * 100) / casosDistintos : 0,
+  };
+}
 
 export async function analyticsResumen(req, res) {
   try {
     attachAbortFlag(req, res);
+    const startedAt = Date.now();
 
     const usuarioId = getUsuarioId(req);
     if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
-
-    // ✅ Operadores NO pueden acceder
     if (!ensureNoOperador(req, res)) return;
 
-    // ✅ ahora acepta rango actual y rango previo explícito
     const {
       desde,
       hasta,
@@ -967,66 +1369,51 @@ export async function analyticsResumen(req, res) {
       estadoCuenta,
       dni,
       topN = 10,
+      incluirCasosNuevos = "false",
+      minDias = 90,
     } = req.query || {};
 
     const topNNum = Math.max(1, Math.min(50, parseInt(topN, 10) || 10));
-
+    const minDiasNum = Math.max(0, Number(minDias) || 90);
     const d1 = diaInicioUTC(desde);
     const d2 = diaInicioUTC(hasta);
     const p1 = prevDesde ? diaInicioUTC(prevDesde) : null;
     const p2 = prevHasta ? diaInicioUTC(prevHasta) : null;
-
     const endOfDayUTC = (d) => new Date(d.getTime() + 86399999);
 
     if (!d1 || !d2 || d2 < d1) {
       return res.status(400).json({ error: "Rango de fechas invalido" });
     }
 
-    // ✅ si no mandan previo, mantiene el comportamiento anterior
     const days = Math.floor((endOfDayUTC(d2) - d1) / 86400000) + 1;
     const prevEndFallback = new Date(d1.getTime() - 86400000);
     const prevStartFallback = new Date(prevEndFallback.getTime() - (days - 1) * 86400000);
-
     const prevStart = p1 && p2 ? p1 : prevStartFallback;
     const prevEnd = p1 && p2 ? p2 : prevEndFallback;
 
     const dniFilter = buildDniFilter(dni);
-
-    // ✅ más index-friendly para usuario y entidad (ya están normalizados en BD)
-    const fUsuario = inExactMultiStrings(operador, (s) => s.toLowerCase());
     const fEntidad = inExactMultiStrings(entidad, (s) => s.toUpperCase());
-
-    // (estos dos suelen venir “tal cual”, no garantizamos normalización)
     const fTipo = rxExactMulti(tipoContacto);
     const fEstado = rxExactMulti(estadoCuenta);
+    const usuarioFilter = await activeUserFilter(operador);
+    const scope = ownerScope(req);
+    const baseTenant = { ...scope, borrado: { $ne: true } };
+    const baseFiltros = {
+      ...baseTenant,
+      usuario: usuarioFilter,
+      ...(dniFilter ? { dni: dniFilter } : {}),
+      ...(fEntidad ? { entidad: fEntidad } : {}),
+      ...(fTipo ? { tipoContacto: fTipo } : {}),
+      ...(fEstado ? { estadoCuenta: fEstado } : {}),
+    };
+    const matchActual = { ...baseFiltros, fecha: { $gte: d1, $lte: endOfDayUTC(d2) } };
+    const matchPrevio = { ...baseFiltros, fecha: { $gte: prevStart, $lte: endOfDayUTC(prevEnd) } };
 
-   // ✅ Scope: admin/super => todo; otros => solo lo suyo
-const baseFiltros = {
-  ...ownerScope(req),
-  borrado: { $ne: true },
-};
-
-if (dniFilter) baseFiltros.dni = dniFilter;
-if (fUsuario) baseFiltros.usuario = fUsuario;
-if (fEntidad) baseFiltros.entidad = fEntidad;
-if (fTipo) baseFiltros.tipoContacto = fTipo;
-if (fEstado) baseFiltros.estadoCuenta = fEstado;
-
-const matchActual = {
-  ...baseFiltros,
-  fecha: { $gte: d1, $lte: endOfDayUTC(d2) },
-};
-
-const matchPrevio = {
-  ...baseFiltros,
-  fecha: { $gte: prevStart, $lte: endOfDayUTC(prevEnd) },
-};
-
-
-    // ✅ cacheKey ya NO incluye owner fijo (porque admin/super ve todo)
-    // (igual conserva filtros, rangos, etc.)
+    const wantsCasosNuevos =
+      String(incluirCasosNuevos).toLowerCase() === "true" && splitCSV(operador).length > 0;
+    const scopeOwner = scope?.propietario ? String(scope.propietario) : "all";
     const cacheKey = JSON.stringify({
-      scope: String(req?.query?.onlyMine || req?.body?.onlyMine || "false"),
+      scopeOwner,
       d1: d1.toISOString().slice(0, 10),
       d2: d2.toISOString().slice(0, 10),
       prevStart: prevStart.toISOString().slice(0, 10),
@@ -1037,233 +1424,184 @@ const matchPrevio = {
       estadoCuenta: estadoCuenta || null,
       dni: dni || null,
       topN: topNNum,
+      wantsCasosNuevos,
+      minDias: minDiasNum,
     });
 
     const cached = cacheGet(cacheKey);
-    if (cached) return res.json(cached);
-
-    const RESULTADO_SAFE = {
-      $convert: { input: "$resultadoGestion", to: "string", onError: "", onNull: "" },
-    };
-    const ESTADO_SAFE = {
-      $convert: { input: "$estadoCuenta", to: "string", onError: "", onNull: "" },
-    };
-    const HORA_SAFE = {
-      $convert: { input: "$hora", to: "string", onError: "00:00:00", onNull: "00:00:00" },
-    };
-
-    const buildPipelineResumen = (matchQ) => [
-      { $match: matchQ },
-      {
-        $project: {
-          dni: 1,
-          nombreDeudor: 1,
-          fecha: 1,
-          horaStr: HORA_SAFE,
-          usuario: 1,
-          entidad: 1,
-          tipoContacto: 1,
-          resultadoGestion: 1,
-          estadoCuenta: 1,
-          telMailMarcado: 1,
-          isContacto: {
-            $or: [
-              { $regexMatch: { input: RESULTADO_SAFE, regex: /contactad[oa]/i } },
-              { $regexMatch: { input: ESTADO_SAFE, regex: /contactad[oa]/i } },
-            ],
-          },
-          isMailLibre: { $regexMatch: { input: RESULTADO_SAFE, regex: /mail\s*libre/i } },
-          horaHH: { $substrBytes: [HORA_SAFE, 0, 2] },
-          diaISO: { $dateToString: { date: "$fecha", format: "%Y-%m-%d" } },
-        },
-      },
-      {
-        $facet: {
-          base: [
-            {
-              $group: {
-                _id: null,
-                gestiones: { $sum: 1 },
-                dnisSet: { $addToSet: "$dni" },
-                contactos: { $sum: { $cond: ["$isContacto", 1, 0] } },
-              },
-            },
-          ],
-          porHora: [
-            {
-              $group: {
-                _id: "$horaHH",
-                gestiones: { $sum: 1 },
-                contactos: { $sum: { $cond: ["$isContacto", 1, 0] } },
-              },
-            },
-            { $sort: { _id: 1 } },
-          ],
-          pieTipos: [
-            { $match: { tipoContacto: { $not: /proceso|batch|autom[aá]tico|ignorar/i } } },
-            { $group: { _id: "$tipoContacto", value: { $sum: 1 } } },
-            { $sort: { value: -1, _id: 1 } },
-          ],
-          topGestiones: [
-            { $group: { _id: "$dni", gestiones: { $sum: 1 } } },
-            { $sort: { gestiones: -1, _id: 1 } },
-            { $limit: topNNum },
-          ],
-          topDias: [
-            { $group: { _id: { dni: "$dni", dia: "$diaISO" } } },
-            { $group: { _id: "$_id.dni", diasTocados: { $sum: 1 } } },
-            { $sort: { diasTocados: -1, _id: 1 } },
-            { $limit: 10 },
-            { $project: { _id: 1, diasTocados: 1 } },
-          ],
-          porDniMailLibre: [
-            { $match: { isMailLibre: true, telMailMarcado: { $type: "string", $ne: "" } } },
-            { $project: { dni: 1, mails: "$telMailMarcado" } },
-          ],
-        },
-      },
-    ];
-
-    throwIfAborted(req);
-
-    const [actAgg, prevAgg] = await Promise.all([
-      ReporteGestion.aggregate(buildPipelineResumen(matchActual))
-        .allowDiskUse(true)
-        .option({ maxTimeMS: 25000 })
-        .collation({ locale: "es", strength: 1 }),
-      ReporteGestion.aggregate(buildPipelineResumen(matchPrevio))
-        .allowDiskUse(true)
-        .option({ maxTimeMS: 25000 })
-        .collation({ locale: "es", strength: 1 }),
-    ]);
-
-    function daysHabilesEntre(a, b) {
-      let c = 0;
-      const d = new Date(a);
-      while (d <= b) {
-        const wd = d.getUTCDay();
-        if (wd >= 1 && wd <= 5) c++;
-        d.setUTCDate(d.getUTCDate() + 1);
-      }
-      return Math.max(c, 1);
+    if (cached) {
+      res.setHeader("X-Cobrina-Cache", "HIT");
+      res.setHeader("Server-Timing", `total;dur=${Date.now() - startedAt}`);
+      return res.json(cached);
     }
 
-    const foldKPIs = (agg, rangoDiasHabiles) => {
-      const base0 = agg?.[0]?.base?.[0] || {};
-      const gestiones = base0.gestiones || 0;
-      const dnisUnicos = (base0.dnisSet || []).filter(Boolean).length || 0;
-      const contactos = base0.contactos || 0;
+    let work = __inflightResumen.get(cacheKey);
+    if (!work) {
+      work = (async () => {
+        const queryStarted = Date.now();
+        const currentPromise = ReporteGestion.aggregate(
+          buildResumenPipeline(matchActual, { completo: true, topN: topNNum }),
+        )
+          .allowDiskUse(true)
+          .option({ maxTimeMS: 30000 })
+          .collation({ locale: "es", strength: 1 });
+        const previousPromise = ReporteGestion.aggregate(
+          buildResumenPipeline(matchPrevio, { completo: false, topN: topNNum }),
+        )
+          .allowDiskUse(true)
+          .option({ maxTimeMS: 30000 })
+          .collation({ locale: "es", strength: 1 });
+        const ritmoPromise = ReporteGestion.aggregate(buildRitmoPipeline(matchActual))
+          .allowDiskUse(true)
+          .option({ maxTimeMS: 30000 })
+          .collation({ locale: "es", strength: 1 })
+          .catch(() => []);
+        const casosPromise = wantsCasosNuevos
+          ? calcularCasosNuevosTotales({
+              baseTenant,
+              d1,
+              d2,
+              usuarioFilter,
+              entidadFilter: fEntidad,
+              tipoFilter: fTipo,
+              estadoFilter: fEstado,
+              dniFilter,
+              minDias: minDiasNum,
+            }).catch(() => null)
+          : Promise.resolve(null);
 
-      const gestionesPorCaso = dnisUnicos ? gestiones / dnisUnicos : 0;
-      const tasaContactabilidad = gestiones ? (contactos * 100) / gestiones : 0;
-      const dnisPorDiaHabil = rangoDiasHabiles ? dnisUnicos / rangoDiasHabiles : 0;
+        const [actAgg, prevAgg, ritmoAgg, casosNuevos] = await Promise.all([
+          currentPromise,
+          previousPromise,
+          ritmoPromise,
+          casosPromise,
+        ]);
+        const queryMs = Date.now() - queryStarted;
 
-      const porDniMailLibre = agg?.[0]?.porDniMailLibre || [];
-      const regexEmail = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
-      const mapa = new Map();
-      for (const r of porDniMailLibre) {
-        const mails = String(r.mails || "").match(regexEmail) || [];
-        if (!mails.length) continue;
-        const key = String(r.dni || "");
-        mapa.set(key, (mapa.get(key) || 0) + mails.length);
-      }
-      let promedioMailsPorDni = 0;
-      if (mapa.size) {
-        const sum = Array.from(mapa.values()).reduce((a, b) => a + b, 0);
-        promedioMailsPorDni = sum / mapa.size;
-      }
-
-      return {
-        gestiones,
-        dnisUnicos,
-        gestionesPorCaso,
-        tasaContactabilidad,
-        dnisPorDiaHabil,
-        mailsPorDniMailLibre: promedioMailsPorDni,
-      };
-    };
-
-    const rangoDiasActual = daysHabilesEntre(d1, d2);
-    const rangoDiasPrevio = daysHabilesEntre(prevStart, prevEnd);
-
-    const kpiAct = foldKPIs(actAgg, rangoDiasActual);
-    const kpiPrev = foldKPIs(prevAgg, rangoDiasPrevio);
-
-    const delta = (act, prev) => {
-      const a = Number.isFinite(Number(act)) ? Number(act) : null;
-      const p = Number.isFinite(Number(prev)) ? Number(prev) : null;
-      const deltaAbs = a != null && p != null ? a - p : null;
-      const deltaPct = p != null && p !== 0 && a != null ? ((a - p) * 100) / p : null;
-      return { actual: a, previo: p, deltaAbs, deltaPct };
-    };
-
-    const seriesHoraFromAgg = (agg) => {
-      const porHora = agg?.[0]?.porHora || [];
-      return porHora.map((h) => {
-        const hh = String(h._id || "").padStart(2, "0");
-        const tot = h.gestiones || 0;
-        const cont = h.contactos || 0;
-        return {
-          hora: `${hh}:00`,
-          gestiones: tot,
-          tasaContacto: tot ? (cont * 100) / tot : 0,
+        const unpack = (agg) => agg?.[0] || {};
+        const fold = (agg) => {
+          const root = unpack(agg);
+          const total = root?.totales?.[0] || {};
+          const dnis = root?.dnis?.[0] || {};
+          const gestiones = Number(total.gestiones || 0);
+          const contactos = Number(total.contactos || 0);
+          const dnisUnicos = Number(dnis.dnisUnicos || 0);
+          const dnisContactados = Number(dnis.dnisContactados || 0);
+          const diasHabilesConActividad = Number(root?.diasActividad?.[0]?.value || 0);
+          const promedioMails = Number(root?.mails?.[0]?.promedio || 0);
+          return {
+            gestiones,
+            contactos,
+            dnisUnicos,
+            dnisContactados,
+            diasHabilesConActividad,
+            promedioMails,
+            gestionesPorCaso: dnisUnicos ? gestiones / dnisUnicos : 0,
+            tasaContactabilidad: gestiones ? (contactos * 100) / gestiones : 0,
+            efectividadContacto: dnisUnicos ? (dnisContactados * 100) / dnisUnicos : 0,
+            dnisPorDiaHabil: diasHabilesConActividad ? dnisUnicos / diasHabilesConActividad : 0,
+            rangoDetectado: {
+              desde: total.desde ? new Date(total.desde).toISOString().slice(0, 10) : "",
+              hasta: total.hasta ? new Date(total.hasta).toISOString().slice(0, 10) : "",
+            },
+          };
         };
-      });
-    };
+        const actual = fold(actAgg);
+        const previo = fold(prevAgg);
+        const actRoot = unpack(actAgg);
+        const ritmo = ritmoAgg?.[0] || {};
 
-    const payload = {
-      ok: true,
-      rango: {
-        actual: {
-          desde: d1.toISOString().slice(0, 10),
-          hasta: d2.toISOString().slice(0, 10),
-        },
-        previo: {
-          desde: prevStart.toISOString().slice(0, 10),
-          hasta: prevEnd.toISOString().slice(0, 10),
-        },
-      },
-      filtros: {
-        operador: operador || null,
-        entidad: entidad || null,
-        tipoContacto: tipoContacto || null,
-        estadoCuenta: estadoCuenta || null,
-        dni: dni || null,
-        topN: topNNum,
-        prevDesde: prevDesde || null,
-        prevHasta: prevHasta || null,
-      },
-      actual: {
-        kpis: {
-          gestionesTotales: delta(kpiAct.gestiones, kpiPrev.gestiones),
-          dnisUnicos: delta(kpiAct.dnisUnicos, kpiPrev.dnisUnicos),
-          gestionesPorCaso: delta(kpiAct.gestionesPorCaso, kpiPrev.gestionesPorCaso),
-          tasaContactabilidad: delta(kpiAct.tasaContactabilidad, kpiPrev.tasaContactabilidad),
-          dnisPorDiaHabil: delta(kpiAct.dnisPorDiaHabil, kpiPrev.dnisPorDiaHabil),
-          mailsPorDniMailLibre: delta(kpiAct.mailsPorDniMailLibre, kpiPrev.mailsPorDniMailLibre),
-        },
-        seriesHora: seriesHoraFromAgg(actAgg),
-        pieTipos: (actAgg?.[0]?.pieTipos || []).map((x) => ({
-          name: String(x._id || "SIN_TIPO").trim() || "SIN_TIPO",
-          value: x.value || 0,
-        })),
-        topGestiones: actAgg?.[0]?.topGestiones || [],
-        topDias: actAgg?.[0]?.topDias || [],
-      },
-      previo: {
-        kpis: {
-          gestiones: kpiPrev.gestiones,
-          dnisUnicos: kpiPrev.dnisUnicos,
-          gestionesPorCaso: kpiPrev.gestionesPorCaso,
-          tasaContactabilidad: kpiPrev.tasaContactabilidad,
-          dnisPorDiaHabil: kpiPrev.dnisPorDiaHabil,
-          mailsPorDniMailLibre: kpiPrev.mailsPorDniMailLibre,
-        },
-      },
-      previoSinDatos: !kpiPrev.gestiones,
-    };
+        const series = Array.from({ length: 24 }, (_, h) => {
+          const hh = String(h).padStart(2, "0");
+          const row = (actRoot.porHora || []).find((x) => String(x?._id || "").padStart(2, "0") === hh);
+          const gestiones = Number(row?.gestiones || 0);
+          const contactos = Number(row?.contactos || 0);
+          return {
+            hora: `${hh}:00`,
+            gestiones,
+            contactos,
+            tasaContacto: gestiones ? (contactos * 100) / gestiones : 0,
+          };
+        });
 
-    cacheSet(cacheKey, payload);
+        const delta = (act, prev) => {
+          const a = Number.isFinite(Number(act)) ? Number(act) : null;
+          const p = Number.isFinite(Number(prev)) ? Number(prev) : null;
+          return {
+            actual: a,
+            previo: p,
+            deltaAbs: a != null && p != null ? a - p : null,
+            deltaPct: p != null && p !== 0 && a != null ? ((a - p) * 100) / p : null,
+          };
+        };
+
+        const payload = {
+          ok: true,
+          version: 2,
+          rango: {
+            actual: { desde: d1.toISOString().slice(0, 10), hasta: d2.toISOString().slice(0, 10) },
+            previo: { desde: prevStart.toISOString().slice(0, 10), hasta: prevEnd.toISOString().slice(0, 10) },
+          },
+          actual: {
+            kpis: {
+              gestionesTotales: delta(actual.gestiones, previo.gestiones),
+              dnisUnicos: delta(actual.dnisUnicos, previo.dnisUnicos),
+              gestionesPorCaso: delta(actual.gestionesPorCaso, previo.gestionesPorCaso),
+              tasaContactabilidad: delta(actual.tasaContactabilidad, previo.tasaContactabilidad),
+              efectividadContacto: delta(actual.efectividadContacto, previo.efectividadContacto),
+              dnisPorDiaHabil: delta(actual.dnisPorDiaHabil, previo.dnisPorDiaHabil),
+              mailsPorDniMailLibre: delta(actual.promedioMails, previo.promedioMails),
+            },
+            resumen: {
+              totalGestiones: actual.gestiones,
+              dnisUnicos: actual.dnisUnicos,
+              promedioGestionesPorCaso: actual.gestionesPorCaso,
+              promedioDNIsPorDia: actual.dnisPorDiaHabil,
+              tasaContactabilidad: actual.tasaContactabilidad,
+              efectividadContacto: actual.efectividadContacto,
+              promedioMailsPorDni: actual.promedioMails,
+              promIntervaloGestionesMin: Number(ritmo.promedioGestiones || 0),
+              promIntervaloCasosMin: Number(ritmo.promedioCasos || 0),
+              series,
+              pieTipos: (actRoot.pieTipos || []).map((x) => ({
+                label: String(x?._id || "Otros"),
+                value: Number(x?.value || 0),
+              })),
+              topGestiones: actRoot.topGestiones || [],
+              topDias: actRoot.topDias || [],
+              promedioDiasTocadosPorDni: Number(actRoot?.promedioDias?.[0]?.promedio || 0),
+              diasHabilesConActividad: actual.diasHabilesConActividad,
+              rangoDetectado: actual.rangoDetectado,
+            },
+            casosNuevos,
+          },
+          previo: {
+            kpis: {
+              gestiones: previo.gestiones,
+              dnisUnicos: previo.dnisUnicos,
+              gestionesPorCaso: previo.gestionesPorCaso,
+              tasaContactabilidad: previo.tasaContactabilidad,
+              efectividadContacto: previo.efectividadContacto,
+              dnisPorDiaHabil: previo.dnisPorDiaHabil,
+              mailsPorDniMailLibre: previo.promedioMails,
+            },
+          },
+          previoSinDatos: !previo.gestiones,
+          meta: { queryMs, generatedAt: new Date().toISOString() },
+        };
+        cacheSet(cacheKey, payload);
+        return payload;
+      })().finally(() => __inflightResumen.delete(cacheKey));
+      __inflightResumen.set(cacheKey, work);
+    }
+
+    const payload = await work;
+    throwIfAborted(req);
+    res.setHeader("X-Cobrina-Cache", "MISS");
+    res.setHeader(
+      "Server-Timing",
+      `mongo;dur=${Number(payload?.meta?.queryMs || 0)}, total;dur=${Date.now() - startedAt}`,
+    );
     return res.json(payload);
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
@@ -1274,6 +1612,7 @@ const matchPrevio = {
     });
   }
 }
+
 
 export async function resumenDia(req, res) {
   try {
@@ -1322,12 +1661,12 @@ export async function resumenDia(req, res) {
     const dniFilter = buildDniFilter(dni);
     if (dniFilter) matchDia.dni = dniFilter;
 
-    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+    const activeFilter = await activeUserFilter(operador);
     const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
     const fTipo = rxExactMulti(tipoContacto);
     const fEstado = rxExactMulti(estadoCuenta);
 
-    if (fUsuario) matchDia.usuario = fUsuario;
+    matchDia.usuario = activeFilter;
     if (fEntidad) matchDia.entidad = fEntidad;
     if (fTipo) matchDia.tipoContacto = fTipo;
     if (fEstado) matchDia.estadoCuenta = fEstado;
@@ -1338,7 +1677,7 @@ export async function resumenDia(req, res) {
       fecha: { $gte: corteInicio, $lt: desde },
     };
     if (dniFilter) matchPrev.dni = dniFilter;
-    if (fUsuario) matchPrev.usuario = fUsuario;
+    matchPrev.usuario = activeFilter;
     if (fEntidad) matchPrev.entidad = fEntidad;
     if (fTipo) matchPrev.tipoContacto = fTipo;
     if (fEstado) matchPrev.estadoCuenta = fEstado;
@@ -1498,12 +1837,12 @@ export async function calendarioMes(req, res) {
       fecha: { $gte: desde, $lte: hasta },
     };
 
-    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+    const activeFilter = await activeUserFilter(operador);
     const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
     const fTipo = rxExactMulti(tipoContacto);
     const fEstado = rxExactMulti(estadoCuenta);
 
-    if (fUsuario) match.usuario = fUsuario;
+    match.usuario = activeFilter;
     if (fEntidad) match.entidad = fEntidad;
     if (fTipo) match.tipoContacto = fTipo;
     if (fEstado) match.estadoCuenta = fEstado;
@@ -1604,12 +1943,12 @@ export async function calendarioMesMatriz(req, res) {
       fecha: { $gte: d1, $lte: endOfDay(d2) },
     };
 
-    const fUsuario = rxExactMulti(operador, (s) => s.toLowerCase());
+    const activeFilter = await activeUserFilter(operador);
     const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
     const fTipo = rxExactMulti(tipoContacto);
     const fEstado = rxExactMulti(estadoCuenta);
 
-    if (fUsuario) base.usuario = fUsuario;
+    base.usuario = activeFilter;
     if (fEntidad) base.entidad = fEntidad;
     if (fTipo) base.tipoContacto = fTipo;
     if (fEstado) base.estadoCuenta = fEstado;
@@ -1673,6 +2012,143 @@ export async function calendarioMesMatriz(req, res) {
   }
 }
 
+export async function asistenciaMes(req, res) {
+  try {
+    attachAbortFlag(req, res);
+
+    const usuarioId = getUsuarioId(req);
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!ensureNoOperador(req, res)) return;
+
+    const { mes, operador, entidad, tipoContacto, estadoCuenta } = req.query || {};
+    if (!/^\d{4}-\d{2}$/.test(mes || "")) {
+      return res.status(400).json({ error: "Parametro 'mes' invalido (yyyy-mm)." });
+    }
+
+    const cacheKey = `asistencia-mes:${JSON.stringify({
+      scope: ownerScope(req), mes, operador, entidad, tipoContacto, estadoCuenta,
+    })}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      res.setHeader("X-Cobrina-Cache", "HIT");
+      return res.json(cached);
+    }
+
+    const year = Number(mes.slice(0, 4));
+    const month = Number(mes.slice(5, 7)) - 1;
+    const desde = new Date(Date.UTC(year, month, 1));
+    const hasta = new Date(Date.UTC(year, month + 1, 1));
+
+    const match = {
+      ...ownerScope(req),
+      borrado: { $ne: true },
+      fecha: { $gte: desde, $lt: hasta },
+    };
+
+    const activeFilter = await activeUserFilter(operador);
+    const fEntidad = rxExactMulti(entidad, (value) => value.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
+    match.usuario = activeFilter;
+    if (fEntidad) match.entidad = fEntidad;
+    if (fTipo) match.tipoContacto = fTipo;
+    if (fEstado) match.estadoCuenta = fEstado;
+
+    const HORA_SAFE = {
+      $convert: { input: "$hora", to: "string", onError: "00:00:00", onNull: "00:00:00" },
+    };
+
+    throwIfAborted(req);
+
+    const [resultado = {}] = await ReporteGestion.aggregate([
+      { $match: match },
+      {
+        $project: {
+          usuario: 1,
+          dni: 1,
+          dia: { $dateToString: { date: "$fecha", format: "%Y-%m-%d" } },
+          horaSafe: HORA_SAFE,
+        },
+      },
+      {
+        $facet: {
+          dias: [
+            {
+              $group: {
+                _id: "$dia",
+                dnisSet: { $addToSet: "$dni" },
+                gestiones: { $sum: 1 },
+                minHora: { $min: "$horaSafe" },
+                maxHora: { $max: "$horaSafe" },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                fecha: "$_id",
+                dnisUnicos: { $size: "$dnisSet" },
+                cuentas: { $size: "$dnisSet" },
+                gestiones: 1,
+                inicio: { $substrBytes: ["$minHora", 0, 5] },
+                fin: { $substrBytes: ["$maxHora", 0, 5] },
+              },
+            },
+            { $sort: { fecha: 1 } },
+          ],
+          matriz: [
+            {
+              $group: {
+                _id: { usuario: "$usuario", dia: "$dia" },
+                dnisSet: { $addToSet: "$dni" },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                usuario: "$_id.usuario",
+                dia: "$_id.dia",
+                cuentas: { $size: "$dnisSet" },
+              },
+            },
+            { $sort: { usuario: 1, dia: 1 } },
+          ],
+        },
+      },
+    ])
+      .allowDiskUse(true)
+      .option({ maxTimeMS: 20000 })
+      .collation({ locale: "es", strength: 1 });
+
+    throwIfAborted(req);
+
+    const ultimoDia = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+    const diasCabecera = Array.from({ length: ultimoDia }, (_, index) => (
+      `${mes}-${String(index + 1).padStart(2, "0")}`
+    ));
+
+    const mapaUsuarios = new Map();
+    for (const row of resultado.matriz || []) {
+      if (!mapaUsuarios.has(row.usuario)) {
+        mapaUsuarios.set(row.usuario, { usuario: row.usuario, dias: {} });
+      }
+      mapaUsuarios.get(row.usuario).dias[row.dia] = row.cuentas;
+    }
+
+    const payload = {
+      ok: true,
+      mes,
+      dias: resultado.dias || [],
+      diasCabecera,
+      usuariosMatriz: Array.from(mapaUsuarios.values()),
+    };
+    cacheSet(cacheKey, payload);
+    return res.json(payload);
+  } catch (e) {
+    if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
+    return res.status(500).json({ error: e.message });
+  }
+}
+
 export async function casosNuevos(req, res) {
   try {
     attachAbortFlag(req, res);
@@ -1720,11 +2196,25 @@ export async function casosNuevos(req, res) {
 
     // filtros index-friendly (strings normalizados)
     // 🔥 OJO: ahora operador es OPCIONAL. Si viene vacío => trae por todos.
-    const usuarioFilter = inExactMultiStrings(operador, (s) => s.toLowerCase());
+    const usuarioFilter = await activeUserFilter(operador);
     const entidadFilter = inExactMultiStrings(entidad, (s) => s.toUpperCase());
     const tipoFilter = inExactMultiStrings(tipoContacto, (s) => String(s));
     const estadoFilter = inExactMultiStrings(estadoCuenta, (s) => String(s));
     const dniFilter = buildDniFilter(dni);
+
+    const casosCacheKey = `casos-nuevos::${JSON.stringify({
+      scope: baseTenant?.propietario ? String(baseTenant.propietario) : "all",
+      desde: d1.toISOString().slice(0, 10),
+      hasta: d2.toISOString().slice(0, 10),
+      operador: operador || null,
+      entidad: entidad || null,
+      tipoContacto: tipoContacto || null,
+      estadoCuenta: estadoCuenta || null,
+      dni: dni || null,
+      minDias: MIN_DIAS,
+    })}`;
+    const casosCached = cacheGet(casosCacheKey);
+    if (casosCached) return res.json(casosCached);
 
     // 1) DNIs con actividad reciente antes del rango (ventana)
     const corteInicio = new Date(d1.getTime() - MIN_DIAS * 86400000);
@@ -1794,7 +2284,7 @@ export async function casosNuevos(req, res) {
     );
     totales.pctNuevos = totales.casosDistintos ? (totales.casosNuevos * 100) / totales.casosDistintos : 0;
 
-    return res.json({
+    const payload = {
       ok: true,
       // ✅ ahora SIEMPRE se puede usar en asistencia sin seleccionar operador
       requireOperador: false,
@@ -1810,7 +2300,9 @@ export async function casosNuevos(req, res) {
         dni: dni || null,
         minDias: MIN_DIAS,
       },
-    });
+    };
+    cacheSet(casosCacheKey, payload);
+    return res.json(payload);
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     if (String(e?.message || "").toLowerCase().includes("exceeded time limit")) {
@@ -1878,5 +2370,406 @@ export async function ultimaActualizacion(req, res) {
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
+  }
+}
+
+
+/* ============================================================
+   ACUERDOS DE PAGO · derivados del mismo Reporte de Gestiones
+   ============================================================ */
+
+const ACUERDOS_SORT_KEYS = new Set([
+  "estadoVencimiento", "primerVencimiento", "dias", "tipoAcuerdo", "primerPago",
+  "montoTotalAcuerdo", "fechaAnticipo", "montoAnticipo", "cuotas", "montoCuota",
+  "deudaMaxima", "dni", "nombreDeudor", "fecha", "hora", "usuario", "entidad",
+  "tipoContacto", "resultadoGestion", "estadoCuenta", "telMailMarcado", "observacionGestion",
+]);
+
+const ACUERDOS_NUMERIC_SORT_KEYS = new Set([
+  "dias", "primerPago", "montoTotalAcuerdo", "montoAnticipo", "cuotas", "montoCuota", "deudaMaxima",
+]);
+
+function valorOrdenAcuerdo(row, key) {
+  if (key === "dias") {
+    return row.estadoVencimiento === "VENCIDO"
+      ? Number(row.diasVencido || 0)
+      : Number(row.diasParaVencer ?? 999999);
+  }
+  return row?.[key];
+}
+
+function desplazarISOUnMesAtras(value) {
+  const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return "";
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const target = new Date(Date.UTC(year, month - 2, 1));
+  const targetYear = target.getUTCFullYear();
+  const targetMonth = target.getUTCMonth() + 1;
+  const lastDay = new Date(Date.UTC(targetYear, targetMonth, 0)).getUTCDate();
+  return `${targetYear}-${String(targetMonth).padStart(2, "0")}-${String(Math.min(day, lastDay)).padStart(2, "0")}`;
+}
+
+function resumenComparacionAcuerdos(summary, desde, hasta) {
+  if (!summary) return null;
+  return {
+    desde,
+    hasta,
+    totalGestiones: Number(summary.totalGestiones || 0),
+    totalAcuerdos: Number(summary.totalAcuerdos || 0),
+    tasaAcuerdo: Number(summary.tasaAcuerdo || 0),
+    dnisConAcuerdo: Number(summary.dnisConAcuerdo || 0),
+    totalPrimerPago: Number(summary.totalPrimerPago || 0),
+    montoTotalAcuerdos: Number(summary.montoTotalAcuerdos || 0),
+    vencidos: Number(summary.vencidos || 0),
+    montoVencido: Number(summary.montoVencido || 0),
+  };
+}
+
+function ordenarAcuerdos(rows, rawKey = "fecha", rawDir = "desc") {
+  const key = ACUERDOS_SORT_KEYS.has(String(rawKey || "")) ? String(rawKey) : "fecha";
+  const dir = String(rawDir || "desc").toLowerCase() === "asc" ? "asc" : "desc";
+  const factor = dir === "asc" ? 1 : -1;
+
+  rows.sort((a, b) => {
+    const av = valorOrdenAcuerdo(a, key);
+    const bv = valorOrdenAcuerdo(b, key);
+    let comparison = 0;
+
+    if (ACUERDOS_NUMERIC_SORT_KEYS.has(key)) {
+      comparison = Number(av || 0) - Number(bv || 0);
+    } else {
+      comparison = String(av ?? "").localeCompare(String(bv ?? ""), "es", {
+        sensitivity: "base",
+        numeric: true,
+      });
+    }
+
+    if (comparison !== 0) return comparison * factor;
+
+    const byDate = String(b.fecha || "").localeCompare(String(a.fecha || ""));
+    if (byDate !== 0) return byDate;
+    const byTime = String(b.hora || "").localeCompare(String(a.hora || ""));
+    if (byTime !== 0) return byTime;
+    return String(b.id || "").localeCompare(String(a.id || ""));
+  });
+
+  return { key, dir };
+}
+
+async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false } = {}) {
+  const {
+    desde,
+    hasta,
+    operador,
+    entidad,
+    tipoContacto,
+    estadoCuenta,
+    dni,
+    tipoAcuerdo,
+    estadoVencimiento,
+    sortKey = "fecha",
+    sortDir = "desc",
+    page = 1,
+    limit = 100,
+  } = req.query || {};
+
+  const match = {
+    ...ownerScope(req),
+    borrado: { $ne: true },
+    usuario: await activeUserFilter(operador),
+  };
+
+  const d1 = diaInicioUTC(desde);
+  const d2 = diaFinUTC(hasta);
+  if ((desde && !d1) || (hasta && !d2) || (d1 && d2 && d2 < d1)) {
+    const error = new Error("Rango de fechas inválido.");
+    error.status = 400;
+    throw error;
+  }
+  if (d1 || d2) {
+    match.fecha = {};
+    if (d1) match.fecha.$gte = d1;
+    if (d2) match.fecha.$lte = d2;
+  }
+
+  const fEntidad = rxExactMulti(entidad, (value) => value.toUpperCase());
+  const fTipo = rxExactMulti(tipoContacto);
+  const fEstado = rxExactMulti(estadoCuenta);
+  const fDni = buildDniFilter(dni);
+  if (fEntidad) match.entidad = fEntidad;
+  if (fTipo) match.tipoContacto = fTipo;
+  if (fEstado) match.estadoCuenta = fEstado;
+  if (fDni) match.dni = fDni;
+
+  throwIfAborted(req);
+
+  const agreementMatch = {
+    ...match,
+    resultadoGestion: /acuerdo/i,
+  };
+
+  const [totalGestiones, gestionesPorOperador, rawRows] = await Promise.all([
+    ReporteGestion.countDocuments(match).maxTimeMS(30000),
+    ReporteGestion.aggregate([
+      { $match: match },
+      { $group: { _id: "$usuario", gestiones: { $sum: 1 } } },
+      { $project: { _id: 0, operador: "$_id", gestiones: 1 } },
+      { $sort: { gestiones: -1, operador: 1 } },
+    ])
+      .option({ maxTimeMS: 30000 })
+      .collation({ locale: "es", strength: 1 }),
+    ReporteGestion.find(agreementMatch)
+      .select(
+        "dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad"
+      )
+      .sort({ fecha: -1, hora: -1, _id: -1 })
+      .lean()
+      .maxTimeMS(30000),
+  ]);
+
+  throwIfAborted(req);
+
+  let acuerdos = rawRows
+    .map((row) => transformarGestionEnAcuerdo(row))
+    .filter(Boolean);
+
+  const tiposSolicitados = splitCSV(tipoAcuerdo).map((value) => value.toLocaleLowerCase("es"));
+  if (tiposSolicitados.length) {
+    const tiposSet = new Set(tiposSolicitados);
+    acuerdos = acuerdos.filter((row) => tiposSet.has(String(row.tipoAcuerdo || "").toLocaleLowerCase("es")));
+  }
+
+  const estadosSolicitados = splitCSV(estadoVencimiento).map((value) => value.toLocaleUpperCase("es"));
+  if (estadosSolicitados.length) {
+    const estadosSet = new Set(estadosSolicitados);
+    acuerdos = acuerdos.filter((row) => estadosSet.has(String(row.estadoVencimiento || "").toLocaleUpperCase("es")));
+  }
+  if (soloVencidos) {
+    acuerdos = acuerdos.filter((row) => row.estadoVencimiento === "VENCIDO");
+  }
+
+  const appliedSort = ordenarAcuerdos(acuerdos, sortKey, sortDir);
+  const summary = resumirAcuerdos(acuerdos, totalGestiones, gestionesPorOperador);
+
+  if (paginate && desde && hasta) {
+    const anteriorDesde = desplazarISOUnMesAtras(desde);
+    const anteriorHasta = desplazarISOUnMesAtras(hasta);
+    const anteriorD1 = diaInicioUTC(anteriorDesde);
+    const anteriorD2 = diaFinUTC(anteriorHasta);
+
+    if (anteriorD1 && anteriorD2) {
+      const previousMatch = {
+        ...match,
+        fecha: { $gte: anteriorD1, $lte: anteriorD2 },
+      };
+      const previousAgreementMatch = {
+        ...previousMatch,
+        resultadoGestion: /acuerdo/i,
+      };
+
+      const [previousTotalGestiones, previousGestionesPorOperador, previousRawRows] = await Promise.all([
+        ReporteGestion.countDocuments(previousMatch).maxTimeMS(30000),
+        ReporteGestion.aggregate([
+          { $match: previousMatch },
+          { $group: { _id: "$usuario", gestiones: { $sum: 1 } } },
+          { $project: { _id: 0, operador: "$_id", gestiones: 1 } },
+          { $sort: { gestiones: -1, operador: 1 } },
+        ])
+          .option({ maxTimeMS: 30000 })
+          .collation({ locale: "es", strength: 1 }),
+        ReporteGestion.find(previousAgreementMatch)
+          .select(
+            "dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad"
+          )
+          .sort({ fecha: -1, hora: -1, _id: -1 })
+          .lean()
+          .maxTimeMS(30000),
+      ]);
+
+      let previousAgreements = previousRawRows
+        .map((row) => transformarGestionEnAcuerdo(row))
+        .filter(Boolean);
+
+      if (tiposSolicitados.length) {
+        const tiposSet = new Set(tiposSolicitados);
+        previousAgreements = previousAgreements.filter((row) =>
+          tiposSet.has(String(row.tipoAcuerdo || "").toLocaleLowerCase("es"))
+        );
+      }
+      if (estadosSolicitados.length) {
+        const estadosSet = new Set(estadosSolicitados);
+        previousAgreements = previousAgreements.filter((row) =>
+          estadosSet.has(String(row.estadoVencimiento || "").toLocaleUpperCase("es"))
+        );
+      }
+
+      const previousSummary = resumirAcuerdos(
+        previousAgreements,
+        previousTotalGestiones,
+        previousGestionesPorOperador
+      );
+      summary.comparacionAnterior = resumenComparacionAcuerdos(
+        previousSummary,
+        anteriorDesde,
+        anteriorHasta
+      );
+    }
+  }
+
+  const dueRows = acuerdos
+    .filter((row) => row.primerVencimiento)
+    .slice()
+    .sort((a, b) =>
+      (a.primerVencimiento || "9999-12-31").localeCompare(b.primerVencimiento || "9999-12-31") ||
+      String(a.usuario || "").localeCompare(String(b.usuario || ""), "es")
+    );
+
+  const safePage = Math.max(1, Number(page) || 1);
+  const safeLimit = Math.max(10, Math.min(500, Number(limit) || 100));
+  const total = acuerdos.length;
+  const pages = Math.max(1, Math.ceil(total / safeLimit));
+  const currentPage = Math.min(safePage, pages);
+  const items = paginate
+    ? acuerdos.slice((currentPage - 1) * safeLimit, currentPage * safeLimit)
+    : acuerdos;
+
+  return {
+    acuerdos,
+    items,
+    vencimientos: paginate ? dueRows.slice(0, 250) : dueRows,
+    summary,
+    total,
+    page: currentPage,
+    pages,
+    limit: safeLimit,
+    catalogos: {
+      tiposAcuerdo: TIPOS_ACUERDO,
+      estadosVencimiento: ["VENCIDO", "VENCE HOY", "PRÓXIMO 3 DÍAS", "PENDIENTE", "SIN FECHA"],
+    },
+    params: {
+      desde: desde || null,
+      hasta: hasta || null,
+      operador: operador || null,
+      entidad: entidad || null,
+      tipoContacto: tipoContacto || null,
+      estadoCuenta: estadoCuenta || null,
+      dni: dni || null,
+      tipoAcuerdo: tipoAcuerdo || null,
+      estadoVencimiento: estadoVencimiento || null,
+      sortKey: appliedSort.key,
+      sortDir: appliedSort.dir,
+    },
+  };
+}
+
+/** GET /api/reportes-gestiones/analytics/acuerdos */
+export async function analyticsAcuerdos(req, res) {
+  try {
+    attachAbortFlag(req, res);
+    if (!getUsuarioId(req)) return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!ensureNoOperador(req, res)) return;
+
+    const data = await obtenerDatosAcuerdos(req, { paginate: true });
+    return res.json({
+      ok: true,
+      items: data.items,
+      vencimientos: data.vencimientos,
+      resumen: data.summary,
+      total: data.total,
+      page: data.page,
+      pages: data.pages,
+      limit: data.limit,
+      catalogos: data.catalogos,
+      params: data.params,
+    });
+  } catch (error) {
+    if (error?.code === "CLIENT_ABORTED") return res.status(499).end();
+    return res.status(error?.status || 500).json({ error: error?.message || "No se pudo generar el reporte de acuerdos." });
+  }
+}
+
+function nombreExcelAcuerdos(prefix, params = {}) {
+  const desde = String(params.desde || "inicio").replace(/[^0-9-]/g, "");
+  const hasta = String(params.hasta || "actualidad").replace(/[^0-9-]/g, "");
+  return `${prefix}_${desde}_a_${hasta}.xlsx`;
+}
+
+function enviarExcel(res, buffer, filename) {
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.setHeader("Cache-Control", "no-store");
+  return res.send(Buffer.from(buffer));
+}
+
+/** Compatibilidad: el antiguo /excel ahora descarga únicamente estadísticas. */
+export async function exportarAcuerdosExcel(req, res) {
+  return exportarAcuerdosEstadisticasExcel(req, res);
+}
+
+/** GET /api/reportes-gestiones/analytics/acuerdos/estadisticas-excel */
+export async function exportarAcuerdosEstadisticasExcel(req, res) {
+  try {
+    attachAbortFlag(req, res);
+    if (!getUsuarioId(req)) return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!ensureNoOperador(req, res)) return;
+
+    const data = await obtenerDatosAcuerdos(req, { paginate: false });
+    const buffer = await crearExcelAcuerdos({
+      rows: data.acuerdos,
+      summary: data.summary,
+      metadata: data.params,
+      kind: "estadisticas",
+    });
+    const filename = nombreExcelAcuerdos("ESTADISTICAS_ACUERDOS_COBRINA", data.params);
+    return enviarExcel(res, buffer, filename);
+  } catch (error) {
+    if (error?.code === "CLIENT_ABORTED") return res.status(499).end();
+    return res.status(error?.status || 500).json({ error: error?.message || "No se pudieron exportar las estadísticas de acuerdos." });
+  }
+}
+
+/** GET /api/reportes-gestiones/analytics/acuerdos/gestiones-excel */
+export async function exportarAcuerdosGestionesExcel(req, res) {
+  try {
+    attachAbortFlag(req, res);
+    if (!getUsuarioId(req)) return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!ensureNoOperador(req, res)) return;
+
+    const data = await obtenerDatosAcuerdos(req, { paginate: false });
+    const buffer = await crearExcelAcuerdos({
+      rows: data.acuerdos,
+      summary: data.summary,
+      metadata: data.params,
+      kind: "gestiones",
+    });
+    const filename = nombreExcelAcuerdos("GESTIONES_CON_ACUERDO_COBRINA", data.params);
+    return enviarExcel(res, buffer, filename);
+  } catch (error) {
+    if (error?.code === "CLIENT_ABORTED") return res.status(499).end();
+    return res.status(error?.status || 500).json({ error: error?.message || "No se pudieron exportar las gestiones con acuerdo." });
+  }
+}
+
+/** GET /api/reportes-gestiones/analytics/acuerdos/vencidos-excel */
+export async function exportarAcuerdosVencidosExcel(req, res) {
+  try {
+    attachAbortFlag(req, res);
+    if (!getUsuarioId(req)) return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!ensureNoOperador(req, res)) return;
+
+    const data = await obtenerDatosAcuerdos(req, { paginate: false, soloVencidos: true });
+    const buffer = await crearExcelAcuerdos({
+      rows: data.acuerdos,
+      summary: data.summary,
+      metadata: data.params,
+      kind: "vencidos",
+    });
+    const filename = nombreExcelAcuerdos("ACUERDOS_VENCIDOS_COBRINA", data.params);
+    return enviarExcel(res, buffer, filename);
+  } catch (error) {
+    if (error?.code === "CLIENT_ABORTED") return res.status(499).end();
+    return res.status(error?.status || 500).json({ error: error?.message || "No se pudo exportar el Excel de vencidos." });
   }
 }
