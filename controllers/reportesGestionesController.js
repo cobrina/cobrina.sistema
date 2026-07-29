@@ -2381,7 +2381,7 @@ export async function ultimaActualizacion(req, res) {
 const ACUERDOS_SORT_KEYS = new Set([
   "estadoVencimiento", "primerVencimiento", "dias", "tipoAcuerdo", "primerPago",
   "montoTotalAcuerdo", "fechaAnticipo", "montoAnticipo", "cuotas", "montoCuota",
-  "deudaMaxima", "dni", "nombreDeudor", "fecha", "hora", "usuario", "entidad",
+  "deudaMaxima", "dni", "telefonoGestion", "nombreDeudor", "fecha", "hora", "usuario", "entidad",
   "tipoContacto", "resultadoGestion", "estadoCuenta", "telMailMarcado", "observacionGestion",
 ]);
 
@@ -2646,7 +2646,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     limit: safeLimit,
     catalogos: {
       tiposAcuerdo: TIPOS_ACUERDO,
-      estadosVencimiento: ["VENCIDO", "VENCE HOY", "PRÓXIMO 3 DÍAS", "PENDIENTE", "SIN FECHA"],
+      estadosVencimiento: ["VENCIDO", "VENCE HOY", "PRÓXIMO 3 DÍAS", "PENDIENTE"],
     },
     params: {
       desde: desde || null,

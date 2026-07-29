@@ -19,6 +19,14 @@ const esOperadorVip = (req) =>
 const esOperador = (req) => (req.user.role || req.user.rol) === "operador";
 const esOperativo = (req) => esOperador(req) || esOperadorVip(req); // propios
 
+const normalizarTurno = (value) => {
+  const texto = String(value || "").trim().toLowerCase();
+  if (!texto) return "";
+  if (texto === "m" || texto === "tm" || texto.includes("mañana") || texto.includes("manana")) return "M";
+  if (texto === "t" || texto === "tt" || texto.includes("tarde")) return "T";
+  return "";
+};
+
 // 🔁 Calcula saldo pendiente priorizando deudaPorMes
 export const calcularSaldoPendiente = (cuota) => {
   if (Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length) {
@@ -77,11 +85,16 @@ export const crearCuota = async (req, res) => {
     } = req.body;
 
     const dniN = parseInt(dni, 10);
+    const turnoNormalizado = normalizarTurno(turno);
     const cuotaNumeroN =
       cuotaNumero != null ? parseInt(cuotaNumero, 10) : undefined;
     const importeCuotaN =
       importeCuota != null ? Number(importeCuota) : undefined;
     const vencimientoN = parseInt(vencimiento, 10);
+
+    if (turno && !turnoNormalizado) {
+      return res.status(400).json({ error: "Turno inválido. Usá TM para mañana o TT para tarde." });
+    }
 
     if (
       !entidadId ||
@@ -123,7 +136,7 @@ export const crearCuota = async (req, res) => {
       fiduciario,
       entidadId: new mongoose.Types.ObjectId(entidadId),
       subCesionId: new mongoose.Types.ObjectId(subCesionId),
-      turno,
+      turno: turnoNormalizado,
       telefono,
       pagos: pagos || [],
       vencimientoCuotas: { desde: vencimientoDesde, hasta: vencimientoHasta },
@@ -249,7 +262,13 @@ export const editarCuota = async (req, res) => {
     if (observacionesOperador !== undefined)
       cuota.observacionesOperador = observacionesOperador;
     if (fiduciario !== undefined) cuota.fiduciario = fiduciario;
-    if (turno !== undefined) cuota.turno = turno;
+    if (turno !== undefined) {
+      const turnoNormalizado = normalizarTurno(turno);
+      if (turno && !turnoNormalizado) {
+        return res.status(400).json({ error: "Turno inválido. Usá TM para mañana o TT para tarde." });
+      }
+      cuota.turno = turnoNormalizado;
+    }
     if (telefono !== undefined) cuota.telefono = telefono;
     if (Array.isArray(pagos)) cuota.pagos = pagos;
     if (empleadoId !== undefined) cuota.empleadoId = empleadoId;
@@ -727,7 +746,8 @@ export const importarExcel = async (req, res) => {
       const dni = parseInt(row.getCell(3).value);
       const nombre = (row.getCell(4).value || "").toString().trim();
       const operadorUsername = (row.getCell(5).value || "").toString().trim();
-      const turno = (row.getCell(6).value || "").toString().trim();
+      const turnoRaw = (row.getCell(6).value || "").toString().trim();
+      const turno = normalizarTurno(turnoRaw);
       const cartera = (row.getCell(7).value || "").toString().trim();
       const vtoCuota = parseInt(row.getCell(8).value);
       const cuotas = parseInt(row.getCell(9).value);
@@ -739,7 +759,8 @@ export const importarExcel = async (req, res) => {
       if (!dni) motivos.push("Falta DNI");
       if (!nombre) motivos.push("Falta NOMBRE");
       if (!operadorUsername) motivos.push("Falta OPERADOR");
-      if (!turno) motivos.push("Falta TURNO");
+      if (!turnoRaw) motivos.push("Falta TURNO");
+      else if (!turno) motivos.push("TURNO inválido: usar M/T o TM/TT");
       if (!cartera) motivos.push("Falta SUBCESIÓN");
       if (!vtoCuota) motivos.push("Falta VTO CUO");
       if (!cuotas) motivos.push("Falta C/CUOTAS");
@@ -1005,8 +1026,7 @@ export const exportarExcel = async (req, res) => {
       if (!texto) return "";
       if (texto === "m" || texto === "tm" || texto.includes("mañana") || texto.includes("manana")) return "TM";
       if (texto === "t" || texto === "tt" || texto.includes("tarde")) return "TT";
-      if (texto === "r" || texto === "tr" || texto.includes("residual")) return "TR";
-      return String(value).trim();
+      return "";
     };
 
     cuotas = cuotas
@@ -1664,7 +1684,7 @@ export const descargarModeloColchon = async (req, res) => {
       dni: "30123456",
       nombre: "JUAN PÉREZ",
       operador: "jsuarez",
-      turno: "M-T-R",
+      turno: "M o T",
       cartera: "FRAVEGA",
       vencimiento: 10,
       cuotas: 1,

@@ -21,6 +21,7 @@ import auditoriasRoutes from "./routes/auditorias.js";
 import asistenciaRoutes from "./routes/asistenciaRoutes.js";
 import { procesarCierresAutomaticos } from "./controllers/asistenciaController.js";
 import agendaRoutes from "./routes/agendaRoutes.js";
+import tipsRoutes from "./routes/tipsRoutes.js";
 
 dotenv.config();
 
@@ -70,9 +71,15 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-// Se conserva el límite actual porque Reportes e importaciones pueden enviar lotes grandes.
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+// Reportes e importaciones pueden enviar lotes grandes.
+app.use(express.json({ limit: "100mb" }));
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: "100mb",
+    parameterLimit: 1_000_000,
+  })
+);
 
 const ipsBloqueadas = new Set([
   "149.102.242.103",
@@ -114,20 +121,24 @@ app.get("/health", (_req, res) => {
 
 app.use("/auth", authRoutes);
 app.use("/empleados", empleadosRoutes);
+app.use("/api/empleados", empleadosRoutes);
 app.use("/certificados", certificadosRoutes);
 app.use("/proyecciones", proyeccionRoutes);
 app.use("/usuarios", usuarioRoutes);
 app.use("/colchon", colchonRoutes);
 app.use("/subcesiones", subcesionRoutes);
+app.use("/api/subcesiones", subcesionRoutes);
 app.use("/entidades", entidadRoutes);
+app.use("/api/entidades", entidadRoutes);
 app.use("/api/stickies", stickiesRoutes);
+app.use("/api/tips", tipsRoutes);
 app.use("/api/reportes-gestiones", reportesGestionesRoutes);
 app.use("/api/auditorias", auditoriasRoutes);
 app.use("/api/asistencia", asistenciaRoutes);
 app.use("/api/agenda", agendaRoutes);
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, message: "API de Cobrina funcionando" });
+  res.json({ ok: true, message: "API de Cobrina RDC funcionando" });
 });
 
 app.use((req, res) => {
@@ -135,11 +146,25 @@ app.use((req, res) => {
 });
 
 app.use((error, _req, res, _next) => {
+  if (
+    error?.type === "entity.too.large" ||
+    error?.status === 413 ||
+    error?.code === "LIMIT_FILE_SIZE"
+  ) {
+    return res.status(413).json({
+      error: "El archivo o la carga es demasiado grande. Límite: 100 MB.",
+    });
+  }
+
+  if (String(error?.message || "").includes("Formato no permitido")) {
+    return res.status(400).json({ error: error.message });
+  }
+
   const status = Number(error?.status) || 500;
   if (process.env.NODE_ENV === "development") {
     console.error("❌ Error HTTP:", error);
   }
-  res.status(status).json({
+  return res.status(status).json({
     error: status >= 500 ? "Error interno del servidor" : error.message,
   });
 });
@@ -155,10 +180,10 @@ async function start() {
   try {
     await mongoose.connect(process.env.MONGO_URI, mongoOptions);
     console.log("✅ Conectado a MongoDB");
-    console.log("🔒 Los índices de ReporteGestion no se modifican automáticamente al iniciar.");
+    console.log("🔒 Los índices y datos existentes no se modifican automáticamente al iniciar.");
 
     httpServer = app.listen(PORT, "0.0.0.0", () => {
-      console.log(`✅ API lista en el puerto ${PORT}`);
+      console.log(`✅ API RDC lista en el puerto ${PORT}`);
     });
 
     // Presentismo: procesa cierres de navegador y cierra toda jornada abierta

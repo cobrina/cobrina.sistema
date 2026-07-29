@@ -132,6 +132,10 @@ function rangeDays(desde, hasta) {
   return result;
 }
 
+function isSingleDayRange(desde, hasta) {
+  return Boolean(desde && hasta && desde.toISOString().slice(0, 10) === hasta.toISOString().slice(0, 10));
+}
+
 function groupActivity(rows, employeeByUsername) {
   const grouped = new Map();
   for (const row of rows) {
@@ -499,18 +503,23 @@ export async function seguimientoOperadores(req, res) {
       .lean();
 
     const daily = groupActivity(rows, employeeByUsername);
+    const includeDailyRows = usernames.length === 1 || isSingleDayRange(desde, hasta);
     const operadores = usernames.map((username) => {
       const employee = employeeByUsername.get(username) || { username };
       const days = daily.filter((row) => row.username === username);
       const summary = summarizeDaily(days, employee, desde, hasta);
+      const alerts = buildActivityRecommendations(summary);
+      if (!days.length && includeDailyRows) {
+        alerts.unshift('Sin actividad registrada en el rango seleccionado.');
+      }
       return {
         username,
         nombre: employee.nombre || "",
         role: employee.role || "",
         horarioLaboral: employee.horarioLaboral || {},
         resumen: summary,
-        dias: usernames.length === 1 ? days : [],
-        alertas: buildActivityRecommendations(summary),
+        dias: includeDailyRows ? days : [],
+        alertas: alerts,
       };
     });
     operadores.sort((a, b) => b.resumen.horasTrabajadasMin - a.resumen.horasTrabajadasMin);
@@ -535,7 +544,7 @@ export async function seguimientoOperadores(req, res) {
 
     const payload = {
       ok: true,
-      modo: usernames.length === 1 ? "individual" : "general",
+      modo: usernames.length === 1 ? "individual" : includeDailyRows ? "equipo-dia" : "general",
       rango: { desde: desde.toISOString().slice(0, 10), hasta: hasta.toISOString().slice(0, 10) },
       parametros: {
         continuidadMin: CONTINUIDAD_MIN,

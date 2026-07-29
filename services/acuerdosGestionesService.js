@@ -18,6 +18,7 @@ const COLORS = {
   fuchsia: "FFE400D8",
   turquoise: "FF00B8D9",
   yellow: "FFFFF2CC",
+  orangeSoft: "FFFFD9C2",
   red: "FFC00000",
   redSoft: "FFFCE4D6",
   gray: "FFEDEDED",
@@ -58,32 +59,52 @@ const dateFromISO = (raw) => {
   return Number.isNaN(date.getTime()) ? null : date;
 };
 
-function parseFechaFlexible(value) {
+function parseFechaFlexible(value, fallbackYear = null) {
   if (value instanceof Date && !Number.isNaN(value.getTime())) {
     return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()));
   }
   const text = normalizarTexto(value);
   if (!text) return null;
 
+  const buildDate = (day, month, year) => {
+    const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+    return date.getUTCFullYear() === Number(year) &&
+      date.getUTCMonth() === Number(month) - 1 &&
+      date.getUTCDate() === Number(day)
+      ? date
+      : null;
+  };
+
   let match = text.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b/);
   if (match) {
     let year = Number(match[3]);
     if (year < 100) year += 2000;
-    const date = new Date(Date.UTC(year, Number(match[2]) - 1, Number(match[1])));
-    if (
-      date.getUTCFullYear() === year &&
-      date.getUTCMonth() === Number(match[2]) - 1 &&
-      date.getUTCDate() === Number(match[1])
-    ) {
-      return date;
-    }
+    const date = buildDate(match[1], match[2], year);
+    if (date) return date;
+  }
+
+  match = text.match(/\b(\d{1,2})\s+(\d{1,2})\s+(\d{2,4})\b/);
+  if (match) {
+    let year = Number(match[3]);
+    if (year < 100) year += 2000;
+    const date = buildDate(match[1], match[2], year);
+    if (date) return date;
   }
 
   match = text.match(/\b(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})\b/);
   if (match) {
-    const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
-    if (!Number.isNaN(date.getTime())) return date;
+    const date = buildDate(match[3], match[2], match[1]);
+    if (date) return date;
   }
+
+  if (Number(fallbackYear) > 1900) {
+    match = text.match(/\b(\d{1,2})[\/\-.\s]+(\d{1,2})\b/);
+    if (match) {
+      const date = buildDate(match[1], match[2], Number(fallbackYear));
+      if (date) return date;
+    }
+  }
+
   return null;
 }
 
@@ -117,10 +138,32 @@ function parseNumero(value) {
 function extraerValorPorLabel(text, labels) {
   const source = normalizarTexto(text);
   if (!source) return "";
+
+  const labelsByKey = new Set(labels.map((label) => claveSimple(label)));
+  const chunks = source
+    .split(/\s+-\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  // Formato moderno: "Campo: valor" o "Campo = valor".
+  for (const chunk of chunks) {
+    const pair = chunk.match(/^([^:=]{2,80}?)\s*[:=]\s*(.+)$/);
+    if (!pair) continue;
+    if (labelsByKey.has(claveSimple(pair[1]))) return normalizarTexto(pair[2]);
+  }
+
+  // Formato histórico de Mango: "Campo - valor - Campo - valor".
+  for (let index = 0; index < chunks.length - 1; index += 1) {
+    if (labelsByKey.has(claveSimple(chunks[index]))) {
+      return normalizarTexto(chunks[index + 1]);
+    }
+  }
+
+  // Respaldo para observaciones que no separan todos los campos de igual manera.
   for (const label of labels) {
-    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escaped = label.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
     const regex = new RegExp(
-      `(?:^|\\s-\\s|\\b)${escaped}\\s*[:：]\\s*(.*?)(?=\\s+-\\s+[^-:]{2,80}[:：]|$)`,
+      `(?:^|\\s-\\s|\\b)${escaped}\\s*(?::|=|\\s-\\s)\\s*(.*?)(?=\\s+-\\s+[^-:=]{2,80}(?::|=|\\s-\\s)|$)`,
       "i"
     );
     const found = source.match(regex);
@@ -141,17 +184,95 @@ function extraerEntero(text, labels) {
   return match ? Number(match[0]) : null;
 }
 
-function extraerFecha(text, labels) {
-  return parseFechaFlexible(extraerValorPorLabel(text, labels));
+function extraerFecha(text, labels, fallbackYear = null) {
+  return parseFechaFlexible(extraerValorPorLabel(text, labels), fallbackYear);
 }
 
-export function esBajaAcuerdo(doc = {}) {
+function extraerPrimeraFechaLibre(text, fallbackYear = null) {
+  const source = normalizarTexto(text);
+  if (!source) return null;
+  const regex = /\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}|\d{1,2}\s+\d{1,2}(?:\s+\d{2,4})?|\d{4}[\/-]\d{1,2}[\/-]\d{1,2})\b/g;
+  for (const match of source.matchAll(regex)) {
+    const parsed = parseFechaFlexible(match[0], fallbackYear);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function extraerTelefonoGestion(doc = {}) {
+  const telMail = normalizarTexto(doc.telMailMarcado);
+  const observacion = normalizarTexto(doc.observacionGestion);
+  const fuentes = [
+    telMail,
+    extraerValorPorLabel(observacion, [
+      "Teléfono marcado",
+      "Telefono marcado",
+      "Teléfono",
+      "Telefono",
+      "Celular",
+      "Número llamado",
+      "Numero llamado",
+    ]),
+  ].filter(Boolean);
+
+  const encontrados = [];
+  fuentes.forEach((fuente) => {
+    const matches = String(fuente).match(/(?:\+?\d[\d\s().-]{5,}\d)/g) || [];
+    matches.forEach((match) => {
+      const limpio = match
+        .replace(/[^\d+]/g, "")
+        .replace(/(?!^)\+/g, "");
+      const cantidadDigitos = limpio.replace(/\D/g, "").length;
+      if (cantidadDigitos >= 6 && cantidadDigitos <= 16 && !encontrados.includes(limpio)) {
+        encontrados.push(limpio);
+      }
+    });
+  });
+
+  if (encontrados.length) return encontrados.join(" / ");
+  if (telMail && !telMail.includes("@") && /\d{6,}/.test(telMail.replace(/\D/g, ""))) {
+    return telMail;
+  }
+  return "";
+}
+
+export function esAcuerdoCaido(doc = {}) {
   const combined = claveSimple(
     [doc.resultadoGestion, doc.observacionGestion, doc.tipoAcuerdo, doc.estadoCuenta, doc.tipoContacto]
       .filter(Boolean)
       .join(" ")
   );
-  return (combined.includes("baja") && combined.includes("acuerdo")) || combined.replace(/\s/g, "").includes("bajaacuerdo");
+  return (
+    combined.includes("acuerdo caido") ||
+    combined.includes("caida de acuerdo") ||
+    combined.includes("caida acuerdo") ||
+    combined.includes("caido acuerdo") ||
+    combined.includes("caido el acuerdo") ||
+    combined.includes("acuerdo cayo") ||
+    combined.includes("se cayo el acuerdo") ||
+    combined.replace(/\s/g, "").includes("acuerdocaido")
+  );
+}
+
+export function esBajaAcuerdo(doc = {}) {
+  const result = claveSimple(doc.resultadoGestion);
+  const accountState = claveSimple(doc.estadoCuenta);
+  const combined = claveSimple(
+    [doc.resultadoGestion, doc.observacionGestion, doc.tipoAcuerdo, doc.estadoCuenta, doc.tipoContacto]
+      .filter(Boolean)
+      .join(" ")
+  );
+
+  const explicitLowAgreement = result === "bajo acuerdo" || result === "baja acuerdo";
+  const explicitCancellation =
+    accountState.includes("baja acuerdo") ||
+    combined.includes("baja de acuerdo") ||
+    combined.includes("dar de baja el acuerdo") ||
+    combined.includes("dio de baja el acuerdo") ||
+    combined.includes("acuerdo dado de baja") ||
+    combined.replace(/\s/g, "").includes("bajaacuerdo");
+
+  return explicitLowAgreement || explicitCancellation || esAcuerdoCaido(doc);
 }
 
 function clasificarTipoAcuerdo(observation, installments, advanceAmount, result) {
@@ -195,6 +316,8 @@ export function transformarGestionEnAcuerdo(doc = {}) {
   if (!claveSimple(result).includes("acuerdo") || esBajaAcuerdo(doc)) return null;
 
   const observation = normalizarTexto(doc.observacionGestion);
+  const gestionDate = parseFechaFlexible(doc.fecha);
+  const gestionYear = gestionDate?.getUTCFullYear() || null;
   const resultKey = claveSimple(result);
   const obsKey = claveSimple(observation);
   const partial = resultKey.includes("parcial") || obsKey.includes("pppar");
@@ -210,7 +333,7 @@ export function transformarGestionEnAcuerdo(doc = {}) {
     "Fecha anticipo",
     "Vcto. del anticipo",
     "Vencimiento anticipo",
-  ]);
+  ], gestionYear);
   let advanceAmount = extraerMonto(observation, ["Monto del anticipo", "Monto anticipo"]);
   if (partial) advanceAmount = null;
 
@@ -220,33 +343,81 @@ export function transformarGestionEnAcuerdo(doc = {}) {
     "Cantidad de cuotas",
     "Cuotas",
   ]);
-  const firstDue = extraerFecha(observation, [
+  let firstDue = extraerFecha(observation, [
     "Primer vencimiento",
     "Primer vto",
     "PrimerVto",
     "PPPAR Fecha vencimiento",
     "Fecha vencimiento",
-  ]);
+    "Fecha de vencimiento",
+    "Vencimiento",
+    "Fecha de pago",
+    "Fecha pago",
+    "Fecha del pago",
+    "Fecha 1er pago",
+    "Fecha primer pago",
+    "Fecha del primer pago",
+    "Primer pago fecha",
+    "Fec. pago",
+    "Fec pago",
+    "Vencimiento de pago",
+    "Vto. de pago",
+    "Vto pago",
+  ], gestionYear);
+  if (!firstDue) firstDue = extraerPrimeraFechaLibre(observation, gestionYear);
 
   let installmentAmount = extraerMonto(observation, ["Monto de cuota", "Monto cuota"]);
   const partialAmount = extraerMonto(observation, ["Monto"]);
+  const explicitTotalAmount = extraerMonto(observation, [
+    "Monto total del acuerdo",
+    "Monto total acuerdo",
+    "Total del acuerdo",
+    "Total acuerdo",
+    "Saldo acordado",
+    "Saldo negociado",
+    "Saldo a cancelar",
+    "Saldo del acuerdo",
+    "Saldo total",
+    "Saldos",
+    "Saldo",
+    "Importe total",
+  ]);
   if (installmentAmount == null && partial) installmentAmount = partialAmount;
 
-  let totalAmount = null;
-  if (partial) totalAmount = partialAmount ?? installmentAmount;
-  else if (installments && installmentAmount != null) {
+  let totalAmount = Number(explicitTotalAmount || 0) > 0 ? explicitTotalAmount : null;
+  if (totalAmount == null && partial) totalAmount = partialAmount ?? installmentAmount;
+  else if (totalAmount == null && installments && installmentAmount != null) {
     totalAmount = installments * installmentAmount + Number(advanceAmount || 0);
-  } else if (installmentAmount != null) totalAmount = installmentAmount;
-  else if (advanceAmount != null) totalAmount = advanceAmount;
+  } else if (totalAmount == null && installmentAmount != null) totalAmount = installmentAmount;
+  else if (totalAmount == null && advanceAmount != null) totalAmount = advanceAmount;
+  else if (totalAmount == null && partialAmount != null) totalAmount = partialAmount;
 
   const firstPayment = Number(advanceAmount || 0) > 0
     ? advanceAmount
     : Number(partialAmount || 0) > 0
     ? partialAmount
-    : installmentAmount;
+    : Number(installmentAmount || 0) > 0
+    ? installmentAmount
+    : explicitTotalAmount;
 
   const type = clasificarTipoAcuerdo(observation, installments, advanceAmount, result);
-  const firstDueISO = fechaISO(firstDue);
+  let paymentDate = advanceDate || firstDue;
+  const hasPaymentAmount = Number(firstPayment || 0) > 0 || Number(totalAmount || 0) > 0;
+
+  // En gestiones históricas a veces el acuerdo libre/cancelación trae el monto,
+  // pero no repite la fecha de pago. En ese caso usamos la fecha de la gestión
+  // como respaldo para no perder acuerdos viejos ya cerrados.
+  if (!paymentDate && hasPaymentAmount && (type === "Cancelación" || type === "Cancelación con anticipo")) {
+    paymentDate = gestionDate;
+  }
+
+  const hasPaymentDate = Boolean(paymentDate);
+
+  // Un resultado que solo dice “acuerdo”, pero no contiene fecha de pago ni montos/saldos,
+  // no es un acuerdo válido para estadísticas. También evita contar registros incompletos.
+  if (!hasPaymentDate || !hasPaymentAmount) return null;
+
+  const firstDueISO = fechaISO(firstDue || advanceDate || paymentDate);
   const dueStatus = estadoVencimiento(firstDueISO);
 
   return {
@@ -259,6 +430,7 @@ export function transformarGestionEnAcuerdo(doc = {}) {
     tipoContacto: normalizarTexto(doc.tipoContacto),
     resultadoGestion: result,
     estadoCuenta: normalizarTexto(doc.estadoCuenta),
+    telefonoGestion: extraerTelefonoGestion(doc),
     telMailMarcado: normalizarTexto(doc.telMailMarcado),
     observacionGestion: observation,
     entidad: normalizarTexto(doc.entidad),
@@ -277,7 +449,40 @@ export function transformarGestionEnAcuerdo(doc = {}) {
   };
 }
 
-const sum = (rows, key) => rows.reduce((acc, row) => acc + Number(row?.[key] || 0), 0);
+
+function emptyAgreementTypes() {
+  return {
+    cancelacion: 0,
+    cancelacionConAnticipo: 0,
+    cuotasConAnticipo: 0,
+    cuotasSinAnticipo: 0,
+    parcial: 0,
+  };
+}
+
+function addAgreementTypeCounter(item, type) {
+  if (type === "Cancelación") item.cancelacion += 1;
+  else if (type === "Cancelación con anticipo") item.cancelacionConAnticipo += 1;
+  else if (type === "Acuerdo en cuotas con anticipo") item.cuotasConAnticipo += 1;
+  else if (type === "Acuerdo en cuotas sin anticipo") item.cuotasSinAnticipo += 1;
+  else if (type === "Parcial") item.parcial += 1;
+}
+
+function emptyOperatorSummary(nombre, totalGestiones = 0) {
+  return {
+    nombre: normalizarTexto(nombre) || "Sin dato",
+    acuerdos: 0,
+    dnis: 0,
+    primerPago: 0,
+    montoTotal: 0,
+    deudaMaxima: 0,
+    vencidos: 0,
+    totalGestiones: Number(totalGestiones || 0),
+    tasaAcuerdo: 0,
+    ticketPromedio: 0,
+    ...emptyAgreementTypes(),
+  };
+}
 
 function groupRows(rows, key, totalGestionesMap = null) {
   const map = new Map();
@@ -292,6 +497,7 @@ function groupRows(rows, key, totalGestionesMap = null) {
         montoTotal: 0,
         deudaMaxima: 0,
         vencidos: 0,
+        ...emptyAgreementTypes(),
       });
     }
     const item = map.get(value);
@@ -301,6 +507,7 @@ function groupRows(rows, key, totalGestionesMap = null) {
     item.montoTotal += Number(row.montoTotalAcuerdo || 0);
     item.deudaMaxima += Number(row.deudaMaxima || 0);
     if (row.estadoVencimiento === "VENCIDO") item.vencidos += 1;
+    addAgreementTypeCounter(item, row.tipoAcuerdo);
   });
 
   return [...map.values()]
@@ -317,6 +524,8 @@ function groupRows(rows, key, totalGestionesMap = null) {
     .sort((a, b) => b.acuerdos - a.acuerdos || b.primerPago - a.primerPago || a.nombre.localeCompare(b.nombre, "es"));
 }
 
+const sum = (rows, key) => rows.reduce((acc, row) => acc + Number(row?.[key] || 0), 0);
+
 export function resumirAcuerdos(rows, totalGestiones = 0, gestionesPorOperador = []) {
   const totalMap = new Map(
     gestionesPorOperador.map((row) => [claveSimple(row.operador), Number(row.gestiones || 0)])
@@ -330,11 +539,24 @@ export function resumirAcuerdos(rows, totalGestiones = 0, gestionesPorOperador =
   const dueToday = rows.filter((row) => row.estadoVencimiento === "VENCE HOY");
   const upcoming = rows.filter((row) => row.estadoVencimiento === "PRÓXIMO 3 DÍAS");
 
-  const porOperador = groupRows(rows, "usuario", totalMap);
-  const operatorsWithAgreement = new Set(porOperador.map((row) => claveSimple(row.nombre)));
-  const sinAcuerdos = gestionesPorOperador
-    .filter((row) => Number(row.gestiones || 0) > 0 && !operatorsWithAgreement.has(claveSimple(row.operador)))
-    .map((row) => ({ operador: row.operador, gestiones: Number(row.gestiones || 0) }))
+  const porOperadorConAcuerdos = groupRows(rows, "usuario", totalMap);
+  const operatorSummaryMap = new Map(
+    porOperadorConAcuerdos.map((row) => [claveSimple(row.nombre), row])
+  );
+
+  gestionesPorOperador.forEach((row) => {
+    const key = claveSimple(row.operador);
+    if (!operatorSummaryMap.has(key)) {
+      operatorSummaryMap.set(key, emptyOperatorSummary(row.operador, row.gestiones));
+    }
+  });
+
+  const porOperador = [...operatorSummaryMap.values()].sort(
+    (a, b) => b.acuerdos - a.acuerdos || b.primerPago - a.primerPago || b.totalGestiones - a.totalGestiones || a.nombre.localeCompare(b.nombre, "es")
+  );
+  const sinAcuerdos = porOperador
+    .filter((row) => Number(row.totalGestiones || 0) > 0 && Number(row.acuerdos || 0) === 0)
+    .map((row) => ({ operador: row.nombre, gestiones: Number(row.totalGestiones || 0) }))
     .sort((a, b) => b.gestiones - a.gestiones || a.operador.localeCompare(b.operador, "es"));
 
   const porDiaMap = new Map();
@@ -471,13 +693,31 @@ function styleDataRow(row, { height = 23, center = [], moneyCols = [], dateCols 
   });
 }
 
+function performanceFill(agreements, maxAgreements) {
+  const value = Number(agreements || 0);
+  const max = Math.max(1, Number(maxAgreements || 0));
+  if (value <= 0) return { fill: COLORS.redSoft, font: COLORS.red };
+  if (value >= max * 0.8) return { fill: COLORS.greenSoft, font: "FF075D43" };
+  if (value >= max * 0.3) return { fill: COLORS.yellow, font: "FF6A5200" };
+  return { fill: COLORS.orangeSoft, font: "FF8A3B12" };
+}
+
+function stylePerformanceCells(row, agreements, maxAgreements) {
+  const tone = performanceFill(agreements, maxAgreements);
+  [1, 3].forEach((col) => {
+    const cell = row.getCell(col);
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: tone.fill } };
+    cell.font = { ...cell.font, color: { argb: tone.font }, bold: true };
+  });
+}
+
 function addStatisticsSheet(workbook, summary, metadata) {
   const ws = workbook.addWorksheet("Estadisticas");
   titleSheet(
     ws,
     "ESTADÍSTICAS DE ACUERDOS DE PAGO",
     `Período ${metadata.desde || "inicio"} a ${metadata.hasta || "actualidad"} · sin detalle de gestiones`,
-    8
+    11
   );
 
   const labels = [
@@ -518,22 +758,31 @@ function addStatisticsSheet(workbook, summary, metadata) {
   });
 
   ws.addRow([]);
-  ws.addRow(["OPERADOR", "GESTIONES", "ACUERDOS", "TASA", "PRIMER PAGO", "TICKET PROMEDIO", "MONTO ACORDADO", "VENCIDOS"]);
+  ws.addRow([
+    "OPERADOR", "TOTAL GESTIONES", "ACUERDOS", "PRIMER PAGO TOTAL", "TICKET PROMEDIO 1ER PAGO",
+    "MONTO TOTAL ACUERDO", "CANCELACIÓN", "CANCELACIÓN CON ANTICIPO",
+    "ACUERDO EN CUOTAS CON ANTICIPO", "ACUERDO EN CUOTAS SIN ANTICIPO", "PARCIAL",
+  ]);
   const operatorHeader = ws.lastRow.number;
   styleHeader(ws.getRow(operatorHeader));
-  summary.porOperador.forEach((item) => {
+  const maxAgreements = Math.max(1, ...(summary.porOperador || []).map((item) => Number(item.acuerdos || 0)));
+  (summary.porOperador || []).forEach((item) => {
     const row = ws.addRow([
       item.nombre,
       item.totalGestiones,
       item.acuerdos,
-      item.tasaAcuerdo / 100,
       item.primerPago,
       item.ticketPromedio,
       item.montoTotal,
-      item.vencidos,
+      item.cancelacion,
+      item.cancelacionConAnticipo,
+      item.cuotasConAnticipo,
+      item.cuotasSinAnticipo,
+      item.parcial,
     ]);
-    styleDataRow(row, { center: [2, 3, 4, 8], moneyCols: [5, 6, 7] });
-    row.getCell(4).numFmt = "0.00%";
+    styleDataRow(row, { center: [2, 3, 7, 8, 9, 10, 11], moneyCols: [4, 5, 6] });
+    [4, 5, 6].forEach((col) => { row.getCell(col).numFmt = '$ #,##0'; });
+    stylePerformanceCells(row, item.acuerdos, maxAgreements);
   });
 
   const typeStart = ws.lastRow.number + 2;
@@ -541,7 +790,7 @@ function addStatisticsSheet(workbook, summary, metadata) {
   ws.getCell(typeStart, 1).font = { bold: true, color: { argb: COLORS.purple }, size: 11 };
   ws.getRow(typeStart + 1).values = ["TIPO", "ACUERDOS", "DNIs", "PRIMER PAGO", "MONTO TOTAL", "VENCIDOS"];
   styleHeader(ws.getRow(typeStart + 1), COLORS.purple);
-  summary.porTipo.forEach((item) => {
+  (summary.porTipo || []).forEach((item) => {
     const row = ws.addRow([item.nombre, item.acuerdos, item.dnis, item.primerPago, item.montoTotal, item.vencidos]);
     styleDataRow(row, { center: [2, 3, 6], moneyCols: [4, 5] });
   });
@@ -551,7 +800,7 @@ function addStatisticsSheet(workbook, summary, metadata) {
   ws.getCell(entityStart, 1).font = { bold: true, color: { argb: COLORS.purple }, size: 11 };
   ws.getRow(entityStart + 1).values = ["ENTIDAD", "ACUERDOS", "DNIs", "PRIMER PAGO", "TICKET PROMEDIO", "MONTO TOTAL", "VENCIDOS"];
   styleHeader(ws.getRow(entityStart + 1), COLORS.dark);
-  summary.porEntidad.forEach((item) => {
+  (summary.porEntidad || []).forEach((item) => {
     const row = ws.addRow([item.nombre, item.acuerdos, item.dnis, item.primerPago, item.ticketPromedio, item.montoTotal, item.vencidos]);
     styleDataRow(row, { center: [2, 3, 7], moneyCols: [4, 5, 6] });
   });
@@ -568,33 +817,50 @@ function addStatisticsSheet(workbook, summary, metadata) {
     });
   }
 
-  setWidths(ws, [28, 14, 14, 14, 18, 18, 18, 14]);
+  setWidths(ws, [28, 16, 12, 19, 23, 21, 15, 23, 28, 28, 12]);
   ws.views = [{ state: "frozen", ySplit: 4, showGridLines: false }];
   ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
 }
 
 function addProductivitySheet(workbook, summary) {
   const ws = workbook.addWorksheet("Productividad");
-  titleSheet(ws, "PRODUCTIVIDAD POR OPERADOR", "Conversión, primeros pagos, ticket promedio y vencidos", 8);
-  ws.addRow(["OPERADOR", "GESTIONES", "ACUERDOS", "TASA", "PRIMEROS PAGOS", "TICKET PROMEDIO", "MONTO ACORDADO", "VENCIDOS"]);
+  titleSheet(
+    ws,
+    "RESUMEN DE ACUERDOS POR OPERADOR",
+    "Verde = mejor rendimiento del período | amarillo = medio | naranja = bajo | rojo = activos sin acuerdos",
+    11
+  );
+  ws.addRow([
+    "OPERADOR", "TOTAL GESTIONES", "ACUERDOS", "PRIMER PAGO TOTAL", "TICKET PROMEDIO 1ER PAGO",
+    "MONTO TOTAL ACUERDO", "CANCELACIÓN", "CANCELACIÓN CON ANTICIPO",
+    "ACUERDO EN CUOTAS CON ANTICIPO", "ACUERDO EN CUOTAS SIN ANTICIPO", "PARCIAL",
+  ]);
   styleHeader(ws.getRow(4));
-  summary.porOperador.forEach((item) => {
+
+  const operators = summary.porOperador || [];
+  const maxAgreements = Math.max(1, ...operators.map((item) => Number(item.acuerdos || 0)));
+  operators.forEach((item) => {
     const row = ws.addRow([
       item.nombre,
       item.totalGestiones,
       item.acuerdos,
-      item.tasaAcuerdo / 100,
       item.primerPago,
       item.ticketPromedio,
       item.montoTotal,
-      item.vencidos,
+      item.cancelacion,
+      item.cancelacionConAnticipo,
+      item.cuotasConAnticipo,
+      item.cuotasSinAnticipo,
+      item.parcial,
     ]);
-    styleDataRow(row, { center: [1, 2, 3, 4, 5, 6, 7, 8], moneyCols: [5, 6, 7] });
-    row.getCell(4).numFmt = "0.00%";
+    styleDataRow(row, { center: [2, 3, 7, 8, 9, 10, 11], moneyCols: [4, 5, 6] });
+    [4, 5, 6].forEach((col) => { row.getCell(col).numFmt = '$ #,##0'; });
+    stylePerformanceCells(row, item.acuerdos, maxAgreements);
   });
-  ws.autoFilter = { from: "A4", to: `H${Math.max(4, summary.porOperador.length + 4)}` };
-  setWidths(ws, [25, 14, 14, 12, 20, 19, 20, 13]);
-  ws.views = [{ state: "frozen", ySplit: 4, showGridLines: false }];
+  ws.autoFilter = { from: "A4", to: `K${Math.max(4, operators.length + 4)}` };
+  setWidths(ws, [26, 16, 12, 20, 23, 21, 15, 23, 29, 29, 12]);
+  ws.views = [{ state: "frozen", xSplit: 1, ySplit: 4, showGridLines: false }];
+  ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
 }
 
 function addDailySheet(workbook, summary) {
@@ -730,12 +996,12 @@ function addCalendarSheet(workbook, summary, metadata) {
 
 function addAgreementRowsSheet(workbook, rows) {
   const ws = workbook.addWorksheet("Gestiones_con_acuerdo");
-  titleSheet(ws, "GESTIONES CON ACUERDO", "Datos limpios primero y gestión original a la derecha", 22);
+  titleSheet(ws, "GESTIONES CON ACUERDO", "Datos limpios del acuerdo y gestión original a la derecha", 22);
   ws.addRow([
     "ESTADO VENCIMIENTO", "PRIMER VENCIMIENTO", "DÍAS", "TIPO ACUERDO", "PRIMER PAGO", "MONTO TOTAL",
-    "FECHA ANTICIPO", "MONTO ANTICIPO", "CUOTAS", "MONTO CUOTA", "DEUDA MÁXIMA",
-    "DNI", "NOMBRE DEUDOR", "FECHA GESTIÓN", "HORA", "USUARIO", "ENTIDAD", "TIPO CONTACTO",
-    "RESULTADO GESTIÓN", "ESTADO DE LA CUENTA", "TEL-MAIL MARCADO", "OBSERVACIÓN ORIGINAL",
+    "FECHA ANTICIPO", "MONTO ANTICIPO", "CUOTAS", "MONTO CUOTA", "DEUDA MÁXIMA", "DNI",
+    "TELÉFONO GESTIÓN", "NOMBRE DEUDOR", "FECHA GESTIÓN", "HORA", "USUARIO", "ENTIDAD",
+    "TIPO CONTACTO", "RESULTADO GESTIÓN", "ESTADO DE LA CUENTA", "OBSERVACIÓN ORIGINAL",
   ]);
   styleHeader(ws.getRow(4));
 
@@ -753,6 +1019,7 @@ function addAgreementRowsSheet(workbook, rows) {
       money(item.montoCuota),
       money(item.deudaMaxima),
       Number(item.dni || 0) || item.dni,
+      item.telefonoGestion,
       item.nombreDeudor,
       excelDate(item.fecha),
       item.hora,
@@ -761,14 +1028,13 @@ function addAgreementRowsSheet(workbook, rows) {
       item.tipoContacto,
       item.resultadoGestion,
       item.estadoCuenta,
-      item.telMailMarcado,
       item.observacionGestion,
     ]);
     styleDataRow(row, {
       height: 24,
-      center: [1, 2, 3, 7, 9, 12, 14, 15],
+      center: [1, 2, 3, 7, 9, 12, 13, 15, 16],
       moneyCols: [5, 6, 8, 10, 11],
-      dateCols: [2, 7, 14],
+      dateCols: [2, 7, 15],
       wrapCols: [22],
     });
 
@@ -783,7 +1049,7 @@ function addAgreementRowsSheet(workbook, rows) {
     row.getCell(1).font = { bold: true, color: { argb: item.estadoVencimiento === "VENCIDO" ? COLORS.red : COLORS.dark } };
   });
 
-  setWidths(ws, [19, 16, 9, 34, 17, 17, 16, 17, 10, 17, 17, 14, 27, 16, 12, 20, 21, 23, 29, 27, 26, 54]);
+  setWidths(ws, [19, 16, 9, 34, 17, 17, 16, 17, 10, 17, 17, 14, 20, 27, 16, 12, 20, 21, 23, 29, 27, 54]);
   ws.autoFilter = { from: "A4", to: `V${Math.max(4, rows.length + 4)}` };
   ws.views = [{ state: "frozen", xSplit: 1, ySplit: 4, showGridLines: false }];
   ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
@@ -791,11 +1057,11 @@ function addAgreementRowsSheet(workbook, rows) {
 
 function addDueSheet(workbook, rows) {
   const ws = workbook.addWorksheet("Vencidos");
-  titleSheet(ws, "ACUERDOS VENCIDOS", "Primeros vencimientos anteriores a hoy, con la gestión original a la derecha", 18);
+  titleSheet(ws, "ACUERDOS VENCIDOS", "Control de vencimientos y gestión original", 18);
   ws.addRow([
     "PRIMER VENCIMIENTO", "ESTADO", "DÍAS VENCIDO", "PRIMER PAGO", "MONTO TOTAL", "TIPO ACUERDO",
-    "OPERADOR", "ENTIDAD", "DNI", "NOMBRE", "FECHA GESTIÓN", "HORA", "RESULTADO", "ESTADO CUENTA",
-    "TEL-MAIL", "TIPO CONTACTO", "OBSERVACIÓN ORIGINAL", "ID COBRINA",
+    "OPERADOR", "ENTIDAD", "DNI", "TELÉFONO GESTIÓN", "NOMBRE", "FECHA GESTIÓN", "HORA",
+    "RESULTADO", "ESTADO CUENTA", "TIPO CONTACTO", "OBSERVACIÓN ORIGINAL", "ID COBRINA",
   ]);
   styleHeader(ws.getRow(4));
 
@@ -807,15 +1073,15 @@ function addDueSheet(workbook, rows) {
     const row = ws.addRow([
       excelDate(item.primerVencimiento), item.estadoVencimiento, item.diasVencido,
       money(item.primerPago), money(item.montoTotalAcuerdo), item.tipoAcuerdo,
-      item.usuario, item.entidad, Number(item.dni || 0) || item.dni, item.nombreDeudor,
+      item.usuario, item.entidad, Number(item.dni || 0) || item.dni, item.telefonoGestion, item.nombreDeudor,
       excelDate(item.fecha), item.hora, item.resultadoGestion, item.estadoCuenta,
-      item.telMailMarcado, item.tipoContacto, item.observacionGestion, item.id,
+      item.tipoContacto, item.observacionGestion, item.id,
     ]);
     styleDataRow(row, {
       height: 30,
-      center: [1, 2, 3, 9, 11, 12],
+      center: [1, 2, 3, 9, 10, 12, 13],
       moneyCols: [4, 5],
-      dateCols: [1, 11],
+      dateCols: [1, 12],
       wrapCols: [17],
     });
     [1, 2, 3].forEach((col) => {
@@ -824,7 +1090,7 @@ function addDueSheet(workbook, rows) {
     });
   });
 
-  setWidths(ws, [17, 16, 13, 17, 17, 27, 20, 21, 14, 27, 16, 12, 29, 27, 25, 23, 54, 26]);
+  setWidths(ws, [17, 16, 13, 17, 17, 27, 20, 21, 14, 20, 27, 16, 12, 29, 27, 23, 54, 26]);
   ws.autoFilter = { from: "A4", to: `R${Math.max(4, dueRows.length + 4)}` };
   ws.views = [{ state: "frozen", xSplit: 1, ySplit: 4, showGridLines: false }];
 }
