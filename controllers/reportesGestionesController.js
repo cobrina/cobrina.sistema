@@ -6,6 +6,7 @@ import { toDateOnly, normalizarHora } from "../utils/fecha.util.js";
 import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
+import { invalidateCalidadCache } from "./calidadGestionesController.js";
 import {
   transformarGestionEnAcuerdo,
   resumirAcuerdos,
@@ -461,6 +462,7 @@ export async function cargar(req, res) {
     if (insertados > 0 || reemplazarTodo) {
       invalidateReportesAnalyticsCache();
       invalidateSeguimientoCache();
+      invalidateCalidadCache();
     }
 
     return res.status(200).json({
@@ -690,6 +692,7 @@ export async function limpiar(req, res) {
     if ((r.deletedCount || 0) > 0) {
       invalidateReportesAnalyticsCache();
       invalidateSeguimientoCache();
+      invalidateCalidadCache();
     }
     return res.json({ ok: true, borrados: r.deletedCount || 0 });
   } catch (e) {
