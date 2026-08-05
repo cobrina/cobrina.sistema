@@ -434,6 +434,7 @@ export function transformarGestionEnAcuerdo(doc = {}) {
     telMailMarcado: normalizarTexto(doc.telMailMarcado),
     observacionGestion: observation,
     entidad: normalizarTexto(doc.entidad),
+    entidadNumero: Number(doc.entidadNumero || 0) || null,
     tipoAcuerdo: type,
     fechaAnticipo: fechaISO(advanceDate),
     montoAnticipo: Number(advanceAmount || 0),
@@ -449,6 +450,198 @@ export function transformarGestionEnAcuerdo(doc = {}) {
   };
 }
 
+
+function paymentDateISO(value) {
+  if (!value) return "";
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : fechaISO(date);
+}
+
+/**
+ * Vincula pagos con acuerdos sin convertir la ausencia del módulo Pagos en una falla.
+ * La coincidencia principal es DNI + entidad (cuando el catálogo permite resolverla).
+ * Se consideran válidos los pagos cuya FECHA_PAGO sea el mismo día o posterior a la
+ * gestión que generó el acuerdo. Los pagos del mismo día quedan además identificados
+ * por separado y se informa si coinciden con el importe esperado. También conserva el
+ * pago inmediatamente anterior para detectar acuerdos cargados tarde en Mango.
+ */
+export function vincularPagosPosteriores(
+  acuerdos = [],
+  pagos = [],
+  entidades = [],
+  { disponible = false, motivo = "" } = {}
+) {
+  const entityNumberByName = new Map(
+    (entidades || []).map((item) => [claveSimple(item?.nombre), Number(item?.numero)])
+  );
+  const paymentsByCase = new Map();
+
+  (pagos || []).forEach((payment) => {
+    const dni = normalizarTexto(payment?.dni).replace(/\D/g, "");
+    const entidadNumero = Number(payment?.entidadId || 0);
+    const fecha = paymentDateISO(payment?.fechaPago);
+    if (!dni || !entidadNumero || !fecha) return;
+    const key = `${dni}|${entidadNumero}`;
+    if (!paymentsByCase.has(key)) paymentsByCase.set(key, []);
+    paymentsByCase.get(key).push({
+      idPago: payment?.idPago ?? "",
+      fecha,
+      monto: Number(payment?.monto || 0),
+      entidadId: entidadNumero,
+      subCesionId: String(payment?.subCesionId || ""),
+      conceptoCodigo: normalizarTexto(payment?.conceptoCodigo),
+      estado: normalizarTexto(payment?.estado),
+      operadorUsername: normalizarTexto(payment?.operadorUsername),
+    });
+  });
+
+  paymentsByCase.forEach((items) => items.sort((a, b) => a.fecha.localeCompare(b.fecha)));
+
+  // Cada acuerdo toma pagos hasta el día anterior al próximo acuerdo del mismo DNI/entidad.
+  // Así un pago de una renegociación posterior no queda duplicado en un acuerdo viejo.
+  const agreementWindows = new Map();
+  const agreementsByKey = new Map();
+  (acuerdos || []).forEach((agreement, index) => {
+    const dni = normalizarTexto(agreement?.dni).replace(/\D/g, "");
+    const entityNumber = Number(
+      agreement?.entidadNumero || entityNumberByName.get(claveSimple(agreement?.entidad)) || 0
+    );
+    const key = `${dni}|${entityNumber}`;
+    if (!dni || !entityNumber) return;
+    if (!agreementsByKey.has(key)) agreementsByKey.set(key, []);
+    agreementsByKey.get(key).push({ index, fecha: String(agreement?.fecha || "").slice(0, 10) });
+  });
+  agreementsByKey.forEach((items) => {
+    items.sort((a, b) => a.fecha.localeCompare(b.fecha) || a.index - b.index);
+    items.forEach((item, position) => {
+      const next = items.slice(position + 1).find((candidate) => candidate.fecha > item.fecha);
+      agreementWindows.set(item.index, next?.fecha || "");
+    });
+  });
+
+  return (acuerdos || []).map((agreement, agreementIndex) => {
+    const base = {
+      ...agreement,
+      integracionPagosDisponible: Boolean(disponible),
+      integracionPagosMotivo: motivo || "",
+      estadoPagoAcuerdo: disponible ? "SIN PAGO VÁLIDO" : "SIN DATOS DE PAGOS",
+      cantidadPagosPosteriores: 0,
+      montoPagosPosteriores: 0,
+      cantidadPagosEstrictamentePosteriores: 0,
+      montoPagosEstrictamentePosteriores: 0,
+      cantidadPagosValidos: 0,
+      montoPagosValidos: 0,
+      ultimoPagoPosterior: "",
+      ultimoPagoValido: "",
+      ultimoPagoAnterior: "",
+      montoUltimoPagoAnterior: 0,
+      conceptoUltimoPagoAnterior: "",
+      diasPagoAnterior: null,
+      cantidadPagosMismoDia: 0,
+      montoPagosMismoDia: 0,
+      coincidenciaImporteMismoDia: false,
+      coincidenciaPagoPor: "",
+      requiereRevisionPagos: false,
+      motivoRevisionPagos: "",
+      subCesionesPagosDetectadas: [],
+      operadorGestion: agreement?.operador || agreement?.usuario || "",
+      operadorPago: "",
+    };
+
+    if (!disponible) return base;
+
+    const dni = normalizarTexto(agreement?.dni).replace(/\D/g, "");
+    const agreementDate = String(agreement?.fecha || "").slice(0, 10);
+    const entityNumber = Number(
+      agreement?.entidadNumero || entityNumberByName.get(claveSimple(agreement?.entidad)) || 0
+    );
+    if (!dni || !agreementDate || !entityNumber) {
+      return {
+        ...base,
+        estadoPagoAcuerdo: "REQUIERE REVISIÓN",
+        requiereRevisionPagos: true,
+        motivoRevisionPagos: !entityNumber
+          ? "El acuerdo no tiene número de entidad y no puede cruzarse solo por DNI."
+          : "El acuerdo no tiene DNI o fecha válida.",
+      };
+    }
+
+    const candidates = paymentsByCase.get(`${dni}|${entityNumber}`) || [];
+    const nextAgreementDate = agreementWindows.get(agreementIndex) || "";
+    const insideWindow = (payment) => !nextAgreementDate || payment.fecha < nextAgreementDate;
+    const previous = candidates.filter((payment) => payment.fecha < agreementDate);
+    const sameDay = candidates.filter((payment) => payment.fecha === agreementDate && insideWindow(payment));
+    const later = candidates.filter((payment) => payment.fecha > agreementDate && insideWindow(payment));
+    const validPayments = [...sameDay, ...later].sort((a, b) => a.fecha.localeCompare(b.fecha));
+    const subCesiones = [...new Set(validPayments.map((payment) => payment.subCesionId).filter(Boolean))];
+    const lastPrevious = previous.at(-1) || null;
+    const daysBefore = lastPrevious
+      ? Math.max(0, Math.round((dateFromISO(agreementDate).getTime() - dateFromISO(lastPrevious.fecha).getTime()) / 86400000))
+      : null;
+
+    if (subCesiones.length > 1) {
+      return {
+        ...base,
+        estadoPagoAcuerdo: "REQUIERE REVISIÓN",
+        requiereRevisionPagos: true,
+        motivoRevisionPagos: "Hay pagos del mismo DNI y entidad en más de una subcesión.",
+        subCesionesPagosDetectadas: subCesiones,
+        ultimoPagoAnterior: lastPrevious?.fecha || "",
+        montoUltimoPagoAnterior: Number(lastPrevious?.monto || 0),
+        conceptoUltimoPagoAnterior: normalizarTexto(lastPrevious?.conceptoCodigo),
+        diasPagoAnterior: daysBefore,
+        coincidenciaPagoPor: "DNI + entidad",
+        ventanaPagoHasta: nextAgreementDate || "",
+      };
+    }
+
+    const amountLater = later.reduce((total, payment) => total + Number(payment.monto || 0), 0);
+    const amountSameDay = sameDay.reduce((total, payment) => total + Number(payment.monto || 0), 0);
+    const amountValid = amountLater + amountSameDay;
+    const expectedAmount = Number(
+      agreement?.primerPago || agreement?.montoAnticipo || agreement?.montoCuota || 0
+    );
+    const sameDayMatchesExpected = expectedAmount > 0 && sameDay.some(
+      (payment) => Math.abs(Number(payment.monto || 0) - expectedAmount) < 0.01
+    );
+    const state = later.length
+      ? "CON PAGO VÁLIDO"
+      : sameDay.length
+      ? "PAGO MISMO DÍA VÁLIDO"
+      : "SIN PAGO VÁLIDO";
+    const paymentOwner = validPayments.at(-1)?.operadorUsername || "";
+
+    return {
+      ...base,
+      estadoPagoAcuerdo: state,
+      // Compatibilidad: estos campos históricos pasan a representar todos los pagos válidos
+      // (posteriores + mismo día) para que reportes y exportaciones no omitan cobros válidos.
+      cantidadPagosPosteriores: validPayments.length,
+      montoPagosPosteriores: amountValid,
+      cantidadPagosEstrictamentePosteriores: later.length,
+      montoPagosEstrictamentePosteriores: amountLater,
+      cantidadPagosValidos: validPayments.length,
+      montoPagosValidos: amountValid,
+      ultimoPagoPosterior: later.at(-1)?.fecha || "",
+      ultimoPagoValido: validPayments.at(-1)?.fecha || "",
+      ultimoPagoAnterior: lastPrevious?.fecha || "",
+      montoUltimoPagoAnterior: Number(lastPrevious?.monto || 0),
+      conceptoUltimoPagoAnterior: normalizarTexto(lastPrevious?.conceptoCodigo),
+      diasPagoAnterior: daysBefore,
+      cantidadPagosMismoDia: sameDay.length,
+      montoPagosMismoDia: amountSameDay,
+      coincidenciaImporteMismoDia: sameDayMatchesExpected,
+      coincidenciaPagoPor: "DNI + entidad",
+      ventanaPagoHasta: nextAgreementDate || "",
+      pagosValidos: validPayments,
+      operadorPago: paymentOwner,
+      operador: paymentOwner || agreement?.operador || agreement?.usuario || "",
+      usuario: paymentOwner || agreement?.usuario || agreement?.operador || "",
+    };
+  });
+}
+
+const sum = (rows, key) => rows.reduce((acc, row) => acc + Number(row?.[key] || 0), 0);
 
 function emptyAgreementTypes() {
   return {
@@ -477,6 +670,14 @@ function emptyOperatorSummary(nombre, totalGestiones = 0) {
     montoTotal: 0,
     deudaMaxima: 0,
     vencidos: 0,
+    conPagoPosterior: 0,
+    pagoMismoDia: 0,
+    sinPagoPosterior: 0,
+    sinDatosPagos: 0,
+    cantidadPagosPosteriores: 0,
+    montoPagosPosteriores: 0,
+    montoPagosMismoDia: 0,
+    tasaPagoPosterior: 0,
     totalGestiones: Number(totalGestiones || 0),
     tasaAcuerdo: 0,
     ticketPromedio: 0,
@@ -497,6 +698,13 @@ function groupRows(rows, key, totalGestionesMap = null) {
         montoTotal: 0,
         deudaMaxima: 0,
         vencidos: 0,
+        conPagoPosterior: 0,
+        pagoMismoDia: 0,
+        sinPagoPosterior: 0,
+        sinDatosPagos: 0,
+        cantidadPagosPosteriores: 0,
+        montoPagosPosteriores: 0,
+        montoPagosMismoDia: 0,
         ...emptyAgreementTypes(),
       });
     }
@@ -507,6 +715,20 @@ function groupRows(rows, key, totalGestionesMap = null) {
     item.montoTotal += Number(row.montoTotalAcuerdo || 0);
     item.deudaMaxima += Number(row.deudaMaxima || 0);
     if (row.estadoVencimiento === "VENCIDO") item.vencidos += 1;
+    const tienePagoValido = [
+      "CON PAGO POSTERIOR",
+      "CON PAGO VÁLIDO",
+      "PAGO MISMO DÍA",
+      "PAGO MISMO DÍA VÁLIDO",
+    ].includes(row.estadoPagoAcuerdo);
+    const tienePagoMismoDia = Number(row.cantidadPagosMismoDia || 0) > 0;
+    if (tienePagoValido) item.conPagoPosterior += 1;
+    if (tienePagoMismoDia) item.pagoMismoDia += 1;
+    if (["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(row.estadoPagoAcuerdo)) item.sinPagoPosterior += 1;
+    else if (row.estadoPagoAcuerdo === "SIN DATOS DE PAGOS") item.sinDatosPagos += 1;
+    item.cantidadPagosPosteriores += Number(row.cantidadPagosPosteriores || 0);
+    item.montoPagosPosteriores += Number(row.montoPagosPosteriores || 0);
+    item.montoPagosMismoDia += Number(row.montoPagosMismoDia || 0);
     addAgreementTypeCounter(item, row.tipoAcuerdo);
   });
 
@@ -519,14 +741,13 @@ function groupRows(rows, key, totalGestionesMap = null) {
         totalGestiones,
         tasaAcuerdo: totalGestiones ? (item.acuerdos * 100) / totalGestiones : 0,
         ticketPromedio: item.acuerdos ? item.primerPago / item.acuerdos : 0,
+        tasaPagoPosterior: item.acuerdos ? (item.conPagoPosterior * 100) / item.acuerdos : 0,
       };
     })
     .sort((a, b) => b.acuerdos - a.acuerdos || b.primerPago - a.primerPago || a.nombre.localeCompare(b.nombre, "es"));
 }
 
-const sum = (rows, key) => rows.reduce((acc, row) => acc + Number(row?.[key] || 0), 0);
-
-export function resumirAcuerdos(rows, totalGestiones = 0, gestionesPorOperador = []) {
+export function resumirAcuerdos(rows, totalGestiones = 0, gestionesPorOperador = [], integracionPagos = {}) {
   const totalMap = new Map(
     gestionesPorOperador.map((row) => [claveSimple(row.operador), Number(row.gestiones || 0)])
   );
@@ -538,6 +759,36 @@ export function resumirAcuerdos(rows, totalGestiones = 0, gestionesPorOperador =
   const overdue = rows.filter((row) => row.estadoVencimiento === "VENCIDO");
   const dueToday = rows.filter((row) => row.estadoVencimiento === "VENCE HOY");
   const upcoming = rows.filter((row) => row.estadoVencimiento === "PRÓXIMO 3 DÍAS");
+  const paymentAvailable = Boolean(integracionPagos?.disponible);
+  const estadosConPagoValido = new Set([
+    "CON PAGO POSTERIOR",
+    "CON PAGO VÁLIDO",
+    "PAGO MISMO DÍA",
+    "PAGO MISMO DÍA VÁLIDO",
+  ]);
+  const estadosMismoDia = new Set(["PAGO MISMO DÍA", "PAGO MISMO DÍA VÁLIDO"]);
+  const estadosSinPagoValido = new Set(["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"]);
+  const agreementsWithLaterPayment = paymentAvailable
+    ? rows.filter((row) => estadosConPagoValido.has(row.estadoPagoAcuerdo))
+    : [];
+  const agreementsSameDayPayment = paymentAvailable
+    ? rows.filter((row) => estadosMismoDia.has(row.estadoPagoAcuerdo) || Number(row.cantidadPagosMismoDia || 0) > 0)
+    : [];
+  const agreementsWithoutLaterPayment = paymentAvailable
+    ? rows.filter((row) => estadosSinPagoValido.has(row.estadoPagoAcuerdo))
+    : [];
+  const agreementsWithoutPaymentData = rows.filter(
+    (row) => row.estadoPagoAcuerdo === "SIN DATOS DE PAGOS"
+  );
+  const overdueWithLaterPayment = paymentAvailable
+    ? overdue.filter((row) => estadosConPagoValido.has(row.estadoPagoAcuerdo))
+    : [];
+  const overdueSameDayPayment = paymentAvailable
+    ? overdue.filter((row) => estadosMismoDia.has(row.estadoPagoAcuerdo) || Number(row.cantidadPagosMismoDia || 0) > 0)
+    : [];
+  const overdueWithoutLaterPayment = paymentAvailable
+    ? overdue.filter((row) => estadosSinPagoValido.has(row.estadoPagoAcuerdo))
+    : [];
 
   const porOperadorConAcuerdos = groupRows(rows, "usuario", totalMap);
   const operatorSummaryMap = new Map(
@@ -619,6 +870,99 @@ export function resumirAcuerdos(rows, totalGestiones = 0, gestionesPorOperador =
     venceHoy: dueToday.length,
     proximos3Dias: upcoming.length,
     montoVencido: sum(overdue, "primerPago"),
+    vencidosConPagoPosterior: overdueWithLaterPayment.length,
+    vencidosConPagoValido: overdueWithLaterPayment.length,
+    vencidosPagoMismoDia: overdueSameDayPayment.length,
+    vencidosSinPagoPosterior: overdueWithoutLaterPayment.length,
+    vencidosSinPagoValido: overdueWithoutLaterPayment.length,
+    montoPagosPosterioresVencidos: sum(overdueWithLaterPayment, "montoPagosPosteriores"),
+    montoPagosValidosVencidos: sum(overdueWithLaterPayment, "montoPagosPosteriores"),
+    montoPagosMismoDiaVencidos: sum(overdueSameDayPayment, "montoPagosMismoDia"),
+    acuerdosConPagoPosterior: agreementsWithLaterPayment.length,
+    acuerdosConPagoValido: agreementsWithLaterPayment.length,
+    acuerdosPagoMismoDia: agreementsSameDayPayment.length,
+    acuerdosSinPagoPosterior: agreementsWithoutLaterPayment.length,
+    acuerdosSinPagoValido: agreementsWithoutLaterPayment.length,
+    acuerdosSinDatosPagos: paymentAvailable ? agreementsWithoutPaymentData.length : rows.length,
+    cantidadPagosPosteriores: sum(rows, "cantidadPagosPosteriores"),
+    cantidadPagosValidos: sum(rows, "cantidadPagosPosteriores"),
+    totalPagosPosteriores: sum(rows, "montoPagosPosteriores"),
+    totalPagosValidos: sum(rows, "montoPagosPosteriores"),
+    totalPagosMismoDia: sum(rows, "montoPagosMismoDia"),
+    tasaPagoPosterior: paymentAvailable && rows.length
+      ? (agreementsWithLaterPayment.length * 100) / rows.length
+      : 0,
+    tasaPagoValido: paymentAvailable && rows.length
+      ? (agreementsWithLaterPayment.length * 100) / rows.length
+      : 0,
+    ticketPromedioPagoPosterior: agreementsWithLaterPayment.length
+      ? sum(rows, "montoPagosPosteriores") / agreementsWithLaterPayment.length
+      : 0,
+    ticketPromedioPagoValido: agreementsWithLaterPayment.length
+      ? sum(rows, "montoPagosPosteriores") / agreementsWithLaterPayment.length
+      : 0,
+    seguimientoPagos: {
+      disponible: paymentAvailable,
+      acuerdosAnalizados: rows.length,
+      conPagoPosterior: agreementsWithLaterPayment.length,
+      conPagoValido: agreementsWithLaterPayment.length,
+      pagoMismoDia: agreementsSameDayPayment.length,
+      sinPagoPosterior: agreementsWithoutLaterPayment.length,
+      sinPagoValido: agreementsWithoutLaterPayment.length,
+      sinDatosPagos: paymentAvailable ? agreementsWithoutPaymentData.length : rows.length,
+      cantidadPagosPosteriores: sum(rows, "cantidadPagosPosteriores"),
+      cantidadPagosValidos: sum(rows, "cantidadPagosPosteriores"),
+      montoPagosPosteriores: sum(rows, "montoPagosPosteriores"),
+      montoPagosValidos: sum(rows, "montoPagosPosteriores"),
+      montoPagosMismoDia: sum(rows, "montoPagosMismoDia"),
+      tasaConPagoPosterior: paymentAvailable && rows.length
+        ? (agreementsWithLaterPayment.length * 100) / rows.length
+        : 0,
+      tasaConPagoValido: paymentAvailable && rows.length
+        ? (agreementsWithLaterPayment.length * 100) / rows.length
+        : 0,
+      ticketPromedioPosterior: agreementsWithLaterPayment.length
+        ? sum(rows, "montoPagosPosteriores") / agreementsWithLaterPayment.length
+        : 0,
+      ticketPromedioValido: agreementsWithLaterPayment.length
+        ? sum(rows, "montoPagosPosteriores") / agreementsWithLaterPayment.length
+        : 0,
+      periodoHasta: String(integracionPagos?.periodoHasta || ""),
+      motivo: integracionPagos?.motivo || "",
+    },
+    integracionPagos: {
+      disponible: paymentAvailable,
+      motivo: integracionPagos?.motivo || "",
+      pagosConsultados: Number(integracionPagos?.pagosConsultados || 0),
+      acuerdosEvaluados: Number(integracionPagos?.acuerdosEvaluados || rows.length),
+      periodoHasta: String(integracionPagos?.periodoHasta || ""),
+    },
+    crucePagos: {
+      disponible: paymentAvailable,
+      acuerdosVencidosAnalizados: overdue.length,
+      conPagoPosterior: overdueWithLaterPayment.length,
+      conPagoValido: overdueWithLaterPayment.length,
+      pagoMismoDia: overdueSameDayPayment.length,
+      sinPagoPosterior: overdueWithoutLaterPayment.length,
+      sinPagoValido: overdueWithoutLaterPayment.length,
+      sinDatosPagos: paymentAvailable
+        ? overdue.filter((row) => row.estadoPagoAcuerdo === "SIN DATOS DE PAGOS").length
+        : overdue.length,
+      pagosRelacionados: overdue.reduce(
+        (total, row) => total + Number(row.cantidadPagosPosteriores || 0),
+        0
+      ),
+      montoPosterior: sum(overdueWithLaterPayment, "montoPagosPosteriores"),
+      montoValido: sum(overdueWithLaterPayment, "montoPagosPosteriores"),
+      montoMismoDia: sum(overdueSameDayPayment, "montoPagosMismoDia"),
+      entidadesSinDatos: [...new Set(
+        overdue
+          .filter((row) => row.estadoPagoAcuerdo === "SIN DATOS DE PAGOS")
+          .map((row) => row.entidad)
+          .filter(Boolean)
+      )],
+      periodoHasta: String(integracionPagos?.periodoHasta || ""),
+    },
     porOperador,
     porEntidad: groupRows(rows, "entidad"),
     porTipo: groupRows(rows, "tipoAcuerdo"),
@@ -717,7 +1061,7 @@ function addStatisticsSheet(workbook, summary, metadata) {
     ws,
     "ESTADÍSTICAS DE ACUERDOS DE PAGO",
     `Período ${metadata.desde || "inicio"} a ${metadata.hasta || "actualidad"} · sin detalle de gestiones`,
-    11
+    13
   );
 
   const labels = [
@@ -748,25 +1092,53 @@ function addStatisticsSheet(workbook, summary, metadata) {
   ws.addRow([]);
   ws.addRow(["ESTADO DE VENCIMIENTOS", "CANTIDAD", "MONTO PRIMER PAGO"]);
   styleHeader(ws.getRow(7));
-  [
+  const vencimientosRows = [
     ["Vencidos", summary.vencidos, summary.montoVencido],
     ["Vence hoy", summary.venceHoy, ""],
     ["Próximos 3 días", summary.proximos3Dias, ""],
-  ].forEach((data) => {
+  ];
+  if (summary.integracionPagos?.disponible) {
+    vencimientosRows.push(
+      ["Vencidos con pago válido", summary.vencidosConPagoValido ?? summary.vencidosConPagoPosterior, summary.montoPagosValidosVencidos ?? summary.montoPagosPosterioresVencidos],
+      ["Vencidos con pago el mismo día (válido)", summary.vencidosPagoMismoDia, summary.montoPagosMismoDiaVencidos],
+      ["Vencidos sin pago válido", summary.vencidosSinPagoValido ?? summary.vencidosSinPagoPosterior, ""]
+    );
+  } else {
+    vencimientosRows.push(["Cruce con Pagos", "Sin datos cargados", ""]);
+  }
+  vencimientosRows.forEach((data) => {
     const row = ws.addRow(data);
     styleDataRow(row, { center: [2], moneyCols: [3] });
   });
 
   ws.addRow([]);
+  ws.addRow(["SEGUIMIENTO REAL DE PAGOS DEL ACUERDO", "VALOR", "DETALLE"]);
+  styleHeader(ws.lastRow, COLORS.green);
+  const paymentSummaryRows = summary.integracionPagos?.disponible
+    ? [
+        ["Acuerdos evaluados", summary.seguimientoPagos?.acuerdosAnalizados || 0, "Cruce por DNI + entidad cuando es posible"],
+        ["Acuerdos con pago válido", summary.seguimientoPagos?.conPagoValido ?? summary.seguimientoPagos?.conPagoPosterior ?? 0, `${Number(summary.seguimientoPagos?.tasaConPagoValido ?? summary.seguimientoPagos?.tasaConPagoPosterior ?? 0).toFixed(1)}% de los acuerdos`],
+        ["Cobrado válido", summary.seguimientoPagos?.montoPagosValidos ?? summary.seguimientoPagos?.montoPagosPosteriores ?? 0, `${summary.seguimientoPagos?.cantidadPagosValidos ?? summary.seguimientoPagos?.cantidadPagosPosteriores ?? 0} pago(s) válido(s)`],
+        ["Incluyen pago el mismo día", summary.seguimientoPagos?.pagoMismoDia || 0, "Se considera válido y también se identifica por separado"],
+        ["Sin pago válido", summary.seguimientoPagos?.sinPagoValido ?? summary.seguimientoPagos?.sinPagoPosterior ?? 0, "Sin cobro desde la fecha del acuerdo dentro de la ventana"],
+      ]
+    : [["Cruce con Pagos", "Sin datos cargados", summary.integracionPagos?.motivo || "La empresa no utiliza o no tiene cargado el módulo Pagos"]];
+  paymentSummaryRows.forEach((data, index) => {
+    const row = ws.addRow(data);
+    styleDataRow(row, { center: [2], moneyCols: index === 2 && summary.integracionPagos?.disponible ? [2] : [] });
+  });
+
+  ws.addRow([]);
   ws.addRow([
     "OPERADOR", "TOTAL GESTIONES", "ACUERDOS", "PRIMER PAGO TOTAL", "TICKET PROMEDIO 1ER PAGO",
-    "MONTO TOTAL ACUERDO", "CANCELACIÓN", "CANCELACIÓN CON ANTICIPO",
+    "MONTO TOTAL ACUERDO", "ACUERDOS CON PAGO POSTERIOR", "COBRADO POSTERIOR",
+    "CANCELACIÓN", "CANCELACIÓN CON ANTICIPO",
     "ACUERDO EN CUOTAS CON ANTICIPO", "ACUERDO EN CUOTAS SIN ANTICIPO", "PARCIAL",
   ]);
   const operatorHeader = ws.lastRow.number;
   styleHeader(ws.getRow(operatorHeader));
   const maxAgreements = Math.max(1, ...(summary.porOperador || []).map((item) => Number(item.acuerdos || 0)));
-  (summary.porOperador || []).forEach((item) => {
+  summary.porOperador.forEach((item) => {
     const row = ws.addRow([
       item.nombre,
       item.totalGestiones,
@@ -774,14 +1146,16 @@ function addStatisticsSheet(workbook, summary, metadata) {
       item.primerPago,
       item.ticketPromedio,
       item.montoTotal,
+      item.conPagoPosterior,
+      item.montoPagosPosteriores,
       item.cancelacion,
       item.cancelacionConAnticipo,
       item.cuotasConAnticipo,
       item.cuotasSinAnticipo,
       item.parcial,
     ]);
-    styleDataRow(row, { center: [2, 3, 7, 8, 9, 10, 11], moneyCols: [4, 5, 6] });
-    [4, 5, 6].forEach((col) => { row.getCell(col).numFmt = '$ #,##0'; });
+    styleDataRow(row, { center: [2, 3, 7, 9, 10, 11, 12, 13], moneyCols: [4, 5, 6, 8] });
+    [4, 5, 6, 8].forEach((col) => { row.getCell(col).numFmt = '$ #,##0'; });
     stylePerformanceCells(row, item.acuerdos, maxAgreements);
   });
 
@@ -790,7 +1164,7 @@ function addStatisticsSheet(workbook, summary, metadata) {
   ws.getCell(typeStart, 1).font = { bold: true, color: { argb: COLORS.purple }, size: 11 };
   ws.getRow(typeStart + 1).values = ["TIPO", "ACUERDOS", "DNIs", "PRIMER PAGO", "MONTO TOTAL", "VENCIDOS"];
   styleHeader(ws.getRow(typeStart + 1), COLORS.purple);
-  (summary.porTipo || []).forEach((item) => {
+  summary.porTipo.forEach((item) => {
     const row = ws.addRow([item.nombre, item.acuerdos, item.dnis, item.primerPago, item.montoTotal, item.vencidos]);
     styleDataRow(row, { center: [2, 3, 6], moneyCols: [4, 5] });
   });
@@ -800,7 +1174,7 @@ function addStatisticsSheet(workbook, summary, metadata) {
   ws.getCell(entityStart, 1).font = { bold: true, color: { argb: COLORS.purple }, size: 11 };
   ws.getRow(entityStart + 1).values = ["ENTIDAD", "ACUERDOS", "DNIs", "PRIMER PAGO", "TICKET PROMEDIO", "MONTO TOTAL", "VENCIDOS"];
   styleHeader(ws.getRow(entityStart + 1), COLORS.dark);
-  (summary.porEntidad || []).forEach((item) => {
+  summary.porEntidad.forEach((item) => {
     const row = ws.addRow([item.nombre, item.acuerdos, item.dnis, item.primerPago, item.ticketPromedio, item.montoTotal, item.vencidos]);
     styleDataRow(row, { center: [2, 3, 7], moneyCols: [4, 5, 6] });
   });
@@ -817,7 +1191,7 @@ function addStatisticsSheet(workbook, summary, metadata) {
     });
   }
 
-  setWidths(ws, [28, 16, 12, 19, 23, 21, 15, 23, 28, 28, 12]);
+  setWidths(ws, [28, 16, 12, 19, 23, 21, 22, 21, 15, 23, 28, 28, 12]);
   ws.views = [{ state: "frozen", ySplit: 4, showGridLines: false }];
   ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
 }
@@ -828,11 +1202,12 @@ function addProductivitySheet(workbook, summary) {
     ws,
     "RESUMEN DE ACUERDOS POR OPERADOR",
     "Verde = mejor rendimiento del período | amarillo = medio | naranja = bajo | rojo = activos sin acuerdos",
-    11
+    13
   );
   ws.addRow([
     "OPERADOR", "TOTAL GESTIONES", "ACUERDOS", "PRIMER PAGO TOTAL", "TICKET PROMEDIO 1ER PAGO",
-    "MONTO TOTAL ACUERDO", "CANCELACIÓN", "CANCELACIÓN CON ANTICIPO",
+    "MONTO TOTAL ACUERDO", "ACUERDOS CON PAGO POSTERIOR", "COBRADO POSTERIOR",
+    "CANCELACIÓN", "CANCELACIÓN CON ANTICIPO",
     "ACUERDO EN CUOTAS CON ANTICIPO", "ACUERDO EN CUOTAS SIN ANTICIPO", "PARCIAL",
   ]);
   styleHeader(ws.getRow(4));
@@ -847,18 +1222,20 @@ function addProductivitySheet(workbook, summary) {
       item.primerPago,
       item.ticketPromedio,
       item.montoTotal,
+      item.conPagoPosterior,
+      item.montoPagosPosteriores,
       item.cancelacion,
       item.cancelacionConAnticipo,
       item.cuotasConAnticipo,
       item.cuotasSinAnticipo,
       item.parcial,
     ]);
-    styleDataRow(row, { center: [2, 3, 7, 8, 9, 10, 11], moneyCols: [4, 5, 6] });
-    [4, 5, 6].forEach((col) => { row.getCell(col).numFmt = '$ #,##0'; });
+    styleDataRow(row, { center: [2, 3, 7, 9, 10, 11, 12, 13], moneyCols: [4, 5, 6, 8] });
+    [4, 5, 6, 8].forEach((col) => { row.getCell(col).numFmt = '$ #,##0'; });
     stylePerformanceCells(row, item.acuerdos, maxAgreements);
   });
-  ws.autoFilter = { from: "A4", to: `K${Math.max(4, operators.length + 4)}` };
-  setWidths(ws, [26, 16, 12, 20, 23, 21, 15, 23, 29, 29, 12]);
+  ws.autoFilter = { from: "A4", to: `M${Math.max(4, operators.length + 4)}` };
+  setWidths(ws, [26, 16, 12, 20, 23, 21, 22, 21, 15, 23, 29, 29, 12]);
   ws.views = [{ state: "frozen", xSplit: 1, ySplit: 4, showGridLines: false }];
   ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
 }
@@ -996,12 +1373,15 @@ function addCalendarSheet(workbook, summary, metadata) {
 
 function addAgreementRowsSheet(workbook, rows) {
   const ws = workbook.addWorksheet("Gestiones_con_acuerdo");
-  titleSheet(ws, "GESTIONES CON ACUERDO", "Datos limpios del acuerdo y gestión original a la derecha", 22);
+  titleSheet(ws, "GESTIONES CON ACUERDO", "Datos limpios, cruce opcional con Pagos, gestión original y última gestión del caso", 33);
   ws.addRow([
-    "ESTADO VENCIMIENTO", "PRIMER VENCIMIENTO", "DÍAS", "TIPO ACUERDO", "PRIMER PAGO", "MONTO TOTAL",
-    "FECHA ANTICIPO", "MONTO ANTICIPO", "CUOTAS", "MONTO CUOTA", "DEUDA MÁXIMA", "DNI",
-    "TELÉFONO GESTIÓN", "NOMBRE DEUDOR", "FECHA GESTIÓN", "HORA", "USUARIO", "ENTIDAD",
-    "TIPO CONTACTO", "RESULTADO GESTIÓN", "ESTADO DE LA CUENTA", "OBSERVACIÓN ORIGINAL",
+    "ESTADO VENCIMIENTO", "PRIMER VENCIMIENTO", "DÍAS", "CRUCE CON PAGOS", "PAGOS VÁLIDOS",
+    "MONTO PAGOS VÁLIDOS", "ÚLTIMO PAGO ANTERIOR", "MONTO ÚLTIMO PAGO ANTERIOR", "DÍAS ANTES", "PAGOS MISMO DÍA",
+    "TIPO ACUERDO", "PRIMER PAGO", "MONTO TOTAL", "FECHA ANTICIPO", "MONTO ANTICIPO",
+    "CUOTAS", "MONTO CUOTA", "DEUDA MÁXIMA", "DNI", "TELÉFONO GESTIÓN", "NOMBRE DEUDOR", "FECHA GESTIÓN",
+    "HORA", "USUARIO", "ENTIDAD", "TIPO CONTACTO", "RESULTADO GESTIÓN",
+    "ESTADO DE LA CUENTA", "OBSERVACIÓN ORIGINAL", "ÚLTIMA GESTIÓN MANGO",
+    "HORA ÚLTIMA GESTIÓN", "ÚLTIMO GESTOR", "RESULTADO ÚLTIMA GESTIÓN",
   ]);
   styleHeader(ws.getRow(4));
 
@@ -1010,6 +1390,13 @@ function addAgreementRowsSheet(workbook, rows) {
       item.estadoVencimiento,
       excelDate(item.primerVencimiento),
       item.estadoVencimiento === "VENCIDO" ? item.diasVencido : item.diasParaVencer ?? "",
+      item.estadoPagoAcuerdo,
+      item.cantidadPagosPosteriores,
+      money(item.montoPagosPosteriores),
+      excelDate(item.ultimoPagoAnterior),
+      money(item.montoUltimoPagoAnterior),
+      item.diasPagoAnterior ?? "",
+      item.cantidadPagosMismoDia,
       item.tipoAcuerdo,
       money(item.primerPago),
       money(item.montoTotalAcuerdo),
@@ -1029,13 +1416,17 @@ function addAgreementRowsSheet(workbook, rows) {
       item.resultadoGestion,
       item.estadoCuenta,
       item.observacionGestion,
+      excelDate(item.ultimaGestionMangoFecha),
+      item.ultimaGestionMangoHora,
+      item.ultimaGestionMangoUsuario,
+      item.ultimaGestionMangoResultado,
     ]);
     styleDataRow(row, {
       height: 24,
-      center: [1, 2, 3, 7, 9, 12, 13, 15, 16],
-      moneyCols: [5, 6, 8, 10, 11],
-      dateCols: [2, 7, 15],
-      wrapCols: [22],
+      center: [1, 2, 3, 4, 5, 7, 9, 10, 14, 16, 19, 20, 22, 23, 30, 31],
+      moneyCols: [6, 8, 12, 13, 15, 17, 18],
+      dateCols: [2, 7, 14, 22, 30],
+      wrapCols: [29, 33],
     });
 
     const fillColor = item.estadoVencimiento === "VENCIDO"
@@ -1047,21 +1438,34 @@ function addAgreementRowsSheet(workbook, rows) {
       : COLORS.greenSoft;
     row.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: fillColor } };
     row.getCell(1).font = { bold: true, color: { argb: item.estadoVencimiento === "VENCIDO" ? COLORS.red : COLORS.dark } };
+
+    const paymentCell = row.getCell(4);
+    const paymentFill = ["CON PAGO POSTERIOR", "CON PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo)
+      ? COLORS.greenSoft
+      : ["PAGO MISMO DÍA", "PAGO MISMO DÍA VÁLIDO"].includes(item.estadoPagoAcuerdo)
+      ? COLORS.yellow
+      : ["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo)
+      ? COLORS.redSoft
+      : COLORS.gray;
+    paymentCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: paymentFill } };
+    paymentCell.font = { bold: true, color: { argb: ["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo) ? COLORS.red : COLORS.dark } };
   });
 
-  setWidths(ws, [19, 16, 9, 34, 17, 17, 16, 17, 10, 17, 17, 14, 20, 27, 16, 12, 20, 21, 23, 29, 27, 54]);
-  ws.autoFilter = { from: "A4", to: `V${Math.max(4, rows.length + 4)}` };
+  setWidths(ws, [19, 16, 9, 24, 16, 22, 19, 22, 12, 16, 34, 17, 17, 16, 17, 10, 17, 17, 14, 20, 27, 16, 12, 20, 21, 23, 29, 27, 54, 17, 13, 20, 34]);
+  ws.autoFilter = { from: "A4", to: `AG${Math.max(4, rows.length + 4)}` };
   ws.views = [{ state: "frozen", xSplit: 1, ySplit: 4, showGridLines: false }];
   ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
 }
 
 function addDueSheet(workbook, rows) {
   const ws = workbook.addWorksheet("Vencidos");
-  titleSheet(ws, "ACUERDOS VENCIDOS", "Control de vencimientos y gestión original", 18);
+  titleSheet(ws, "ACUERDOS VENCIDOS", "Cruce con pagos válidos desde la fecha del acuerdo y último pago anterior", 25);
   ws.addRow([
-    "PRIMER VENCIMIENTO", "ESTADO", "DÍAS VENCIDO", "PRIMER PAGO", "MONTO TOTAL", "TIPO ACUERDO",
-    "OPERADOR", "ENTIDAD", "DNI", "TELÉFONO GESTIÓN", "NOMBRE", "FECHA GESTIÓN", "HORA",
-    "RESULTADO", "ESTADO CUENTA", "TIPO CONTACTO", "OBSERVACIÓN ORIGINAL", "ID COBRINA",
+    "PRIMER VENCIMIENTO", "ESTADO", "DÍAS VENCIDO", "CRUCE CON PAGOS", "PAGOS VÁLIDOS",
+    "MONTO PAGOS VÁLIDOS", "ÚLTIMO PAGO ANTERIOR", "MONTO ÚLTIMO PAGO ANTERIOR", "DÍAS ANTES", "PAGOS MISMO DÍA",
+    "PRIMER PAGO", "MONTO TOTAL", "TIPO ACUERDO", "OPERADOR", "ENTIDAD", "DNI", "TELÉFONO GESTIÓN", "NOMBRE",
+    "FECHA GESTIÓN", "HORA", "RESULTADO", "ESTADO CUENTA", "TIPO CONTACTO",
+    "OBSERVACIÓN ORIGINAL", "ID COBRINA",
   ]);
   styleHeader(ws.getRow(4));
 
@@ -1072,6 +1476,8 @@ function addDueSheet(workbook, rows) {
   dueRows.forEach((item) => {
     const row = ws.addRow([
       excelDate(item.primerVencimiento), item.estadoVencimiento, item.diasVencido,
+      item.estadoPagoAcuerdo, item.cantidadPagosPosteriores, money(item.montoPagosPosteriores),
+      excelDate(item.ultimoPagoAnterior), money(item.montoUltimoPagoAnterior), item.diasPagoAnterior ?? "", item.cantidadPagosMismoDia,
       money(item.primerPago), money(item.montoTotalAcuerdo), item.tipoAcuerdo,
       item.usuario, item.entidad, Number(item.dni || 0) || item.dni, item.telefonoGestion, item.nombreDeudor,
       excelDate(item.fecha), item.hora, item.resultadoGestion, item.estadoCuenta,
@@ -1079,19 +1485,29 @@ function addDueSheet(workbook, rows) {
     ]);
     styleDataRow(row, {
       height: 30,
-      center: [1, 2, 3, 9, 10, 12, 13],
-      moneyCols: [4, 5],
-      dateCols: [1, 12],
-      wrapCols: [17],
+      center: [1, 2, 3, 4, 5, 7, 9, 10, 16, 17, 19, 20],
+      moneyCols: [6, 8, 11, 12],
+      dateCols: [1, 7, 19],
+      wrapCols: [24],
     });
     [1, 2, 3].forEach((col) => {
       row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLORS.redSoft } };
       row.getCell(col).font = { color: { argb: COLORS.red }, bold: col === 2 };
     });
+    const paymentCell = row.getCell(4);
+    const paymentFill = ["CON PAGO POSTERIOR", "CON PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo)
+      ? COLORS.greenSoft
+      : ["PAGO MISMO DÍA", "PAGO MISMO DÍA VÁLIDO"].includes(item.estadoPagoAcuerdo)
+      ? COLORS.yellow
+      : ["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo)
+      ? COLORS.redSoft
+      : COLORS.gray;
+    paymentCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: paymentFill } };
+    paymentCell.font = { bold: true, color: { argb: ["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo) ? COLORS.red : COLORS.dark } };
   });
 
-  setWidths(ws, [17, 16, 13, 17, 17, 27, 20, 21, 14, 20, 27, 16, 12, 29, 27, 23, 54, 26]);
-  ws.autoFilter = { from: "A4", to: `R${Math.max(4, dueRows.length + 4)}` };
+  setWidths(ws, [17, 16, 13, 24, 16, 22, 19, 22, 12, 16, 17, 17, 27, 20, 21, 14, 20, 27, 16, 12, 29, 27, 23, 54, 26]);
+  ws.autoFilter = { from: "A4", to: `Y${Math.max(4, dueRows.length + 4)}` };
   ws.views = [{ state: "frozen", xSplit: 1, ySplit: 4, showGridLines: false }];
 }
 

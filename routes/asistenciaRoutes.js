@@ -1,6 +1,7 @@
 import { Router } from "express";
 import verifyToken from "../middleware/verifyToken.js";
 import permitirRoles from "../middleware/permitirRoles.js";
+import permitirModulos from "../middleware/permitirModulos.js";
 import {
   actualizarHorario,
   marcarEntrada,
@@ -19,13 +20,13 @@ router.post("/cierre-navegador", verifyToken, programarCierreNavegador);
 router.get(
   "/panel",
   verifyToken,
-  permitirRoles("admin", "super-admin"),
+  permitirModulos("presentismo"),
   panel
 );
 router.put(
   "/horario/:empleadoId",
   verifyToken,
-  permitirRoles("super-admin"),
+  permitirRoles("administracion", "supervisor", "super-admin"),
   actualizarHorario
 );
 

@@ -17,11 +17,21 @@ const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Admin y super-admin para mutaciones
-const soloAdmin = [verifyToken, permitirRoles("admin", "super-admin")];
+const soloAdmin = [
+  verifyToken,
+  permitirRoles("administracion", "supervisor", "super-admin"),
+];
 // Lectura para todos los roles válidos
 const lecturaTodos = [
   verifyToken,
-  permitirRoles("super-admin", "admin", "operador", "operador-vip"),
+  permitirRoles(
+    "operador-vip",
+    "cuotero",
+    "capacitadora",
+    "administracion",
+    "supervisor",
+    "super-admin"
+  ),
 ];
 
 const validar = (req, res) => {

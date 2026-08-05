@@ -8,8 +8,8 @@ import mongoose from "mongoose";
 
 const router = express.Router();
 
-const soloAdmin = [verifyToken, permitirRoles("super-admin")];
-const lecturaTodos = [verifyToken, permitirRoles("super-admin", "admin", "operador", "operador-vip")];
+const soloAdmin = [verifyToken, permitirRoles("administracion", "supervisor", "super-admin")];
+const lecturaTodos = [verifyToken, permitirRoles("operador", "operador-vip", "cuotero", "capacitadora", "administracion", "supervisor", "super-admin")];
 
 // ➕ Crear (super-admin)
 router.post("/", ...soloAdmin, async (req, res) => {

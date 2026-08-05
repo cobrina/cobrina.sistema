@@ -1,6 +1,8 @@
 import mongoose from "mongoose";
 import Asistencia from "../models/Asistencia.js";
 import Empleado from "../models/Empleado.js";
+import NovedadRRHH from "../models/NovedadRRHH.js";
+import { horarioEfectivoParaFecha } from "../utils/calculoAsistencia.js";
 
 const TIME_ZONE = "America/Argentina/Buenos_Aires";
 const HORA_CIERRE_AUTOMATICO = "21:00";
@@ -103,44 +105,88 @@ async function finalizarAsistencia(asistencia, fechaSalida, motivo) {
  * - jornadas de días anteriores que hayan quedado abiertas;
  * - cierre de navegador confirmado luego de 60 segundos sin volver a abrir COBRINA.
  */
-export async function procesarCierresAutomaticos() {
-  try {
-    const ahora = new Date();
-    const hoy = fechaClaveArgentina(ahora);
-    const despuesDeLas21 = minutosArgentina(ahora) >= 21 * 60;
+let cierresAutomaticosEnCurso = null;
 
-    const condiciones = [
-      { cierrePendienteHasta: { $ne: null, $lte: ahora } },
-      { fechaClave: { $lt: hoy } },
-    ];
-    if (despuesDeLas21) condiciones.push({ fechaClave: hoy });
+function esErrorMongoTransitorio(error) {
+  const code = String(error?.code || error?.cause?.code || "").toUpperCase();
+  const name = String(error?.name || error?.cause?.name || "").toLowerCase();
+  const message = String(error?.message || error?.cause?.message || "").toLowerCase();
+  return (
+    ["ECONNRESET", "ETIMEDOUT", "EPIPE", "ENETUNREACH", "ECONNREFUSED"].includes(code) ||
+    name.includes("mongonetwork") ||
+    name.includes("mongoserverselection") ||
+    message.includes("read econnreset") ||
+    message.includes("connection closed") ||
+    message.includes("socket hang up")
+  );
+}
 
-    const abiertas = await Asistencia.find({
-      estado: "presente",
-      $or: condiciones,
-    });
+const esperarCierre = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    let cerradas = 0;
-    for (const asistencia of abiertas) {
-      const cierreNavegador =
-        asistencia.cierrePendienteHasta &&
-        new Date(asistencia.cierrePendienteHasta).getTime() <= ahora.getTime();
+async function ejecutarCierresAutomaticos() {
+  const ahora = new Date();
+  const hoy = fechaClaveArgentina(ahora);
+  const despuesDeLas21 = minutosArgentina(ahora) >= 21 * 60;
 
-      if (cierreNavegador) {
-        const salida = asistencia.cierrePendienteDesde || ahora;
-        if (await finalizarAsistencia(asistencia, salida, "cierre-navegador")) cerradas++;
-        continue;
-      }
+  const condiciones = [
+    { cierrePendienteHasta: { $ne: null, $lte: ahora } },
+    { fechaClave: { $lt: hoy } },
+  ];
+  if (despuesDeLas21) condiciones.push({ fechaClave: hoy });
 
-      const salida21 = fechaHoraArgentina(asistencia.fechaClave, HORA_CIERRE_AUTOMATICO);
-      if (await finalizarAsistencia(asistencia, salida21, "automatico-21")) cerradas++;
+  const abiertas = await Asistencia.find({
+    estado: "presente",
+    $or: condiciones,
+  }).maxTimeMS(20000);
+
+  let cerradas = 0;
+  for (const asistencia of abiertas) {
+    const cierreNavegador =
+      asistencia.cierrePendienteHasta &&
+      new Date(asistencia.cierrePendienteHasta).getTime() <= ahora.getTime();
+
+    if (cierreNavegador) {
+      const salida = asistencia.cierrePendienteDesde || ahora;
+      if (await finalizarAsistencia(asistencia, salida, "cierre-navegador")) cerradas++;
+      continue;
     }
 
-    return { ok: true, cerradas };
-  } catch (error) {
-    console.error("❌ Error procesando cierres automáticos:", error?.message || error);
-    return { ok: false, cerradas: 0 };
+    const salida21 = fechaHoraArgentina(asistencia.fechaClave, HORA_CIERRE_AUTOMATICO);
+    if (await finalizarAsistencia(asistencia, salida21, "automatico-21")) cerradas++;
   }
+
+  return { ok: true, cerradas };
+}
+
+export async function procesarCierresAutomaticos() {
+  // Varias pantallas consultan asistencia al mismo tiempo. Compartimos una
+  // única ejecución para no multiplicar consultas ni cierres en paralelo.
+  if (cierresAutomaticosEnCurso) return cierresAutomaticosEnCurso;
+
+  cierresAutomaticosEnCurso = (async () => {
+    if (mongoose.connection.readyState !== 1) {
+      return { ok: false, cerradas: 0, omitido: "mongo-no-disponible" };
+    }
+
+    let ultimoError = null;
+    for (let intento = 1; intento <= 2; intento += 1) {
+      try {
+        return await ejecutarCierresAutomaticos();
+      } catch (error) {
+        ultimoError = error;
+        if (!esErrorMongoTransitorio(error) || intento >= 2) break;
+        console.warn("⚠️ Cierres automáticos: conexión Mongo interrumpida; reintentando una vez.");
+        await esperarCierre(500);
+      }
+    }
+
+    console.error("❌ Error procesando cierres automáticos:", ultimoError?.message || ultimoError);
+    return { ok: false, cerradas: 0 };
+  })().finally(() => {
+    cierresAutomaticosEnCurso = null;
+  });
+
+  return cierresAutomaticosEnCurso;
 }
 
 export async function miEstado(req, res) {
@@ -310,6 +356,22 @@ export async function panel(req, res) {
         .lean(),
       Asistencia.find({ fechaClave }).lean(),
     ]);
+    const fechaConsulta = new Date(`${fechaClave}T00:00:00.000Z`);
+    const novedades = empleados.length
+      ? await NovedadRRHH.find({
+          empleadoId: { $in: empleados.map((empleado) => empleado._id) },
+          tipo: { $in: ["cambio-horario", "licencia-medica"] },
+          estado: { $ne: "anulado" },
+          fechaDesde: { $lte: fechaConsulta },
+          $or: [{ fechaHasta: null }, { fechaHasta: { $gte: fechaConsulta } }],
+        }).lean()
+      : [];
+    const novedadesPorEmpleado = new Map();
+    for (const novedad of novedades) {
+      const key = String(novedad.empleadoId);
+      if (!novedadesPorEmpleado.has(key)) novedadesPorEmpleado.set(key, []);
+      novedadesPorEmpleado.get(key).push(novedad);
+    }
 
     const porEmpleado = new Map(
       asistencias.map((item) => [String(item.empleado), item])
@@ -319,6 +381,11 @@ export async function panel(req, res) {
       const asistencia = porEmpleado.get(String(empleado._id));
       const marcas = asistencia?.marcas || [];
       const ultimaSalida = [...marcas].reverse().find((marca) => marca.tipo === "salida");
+      const horarioEfectivo = horarioEfectivoParaFecha(
+        empleado,
+        fechaClave,
+        novedadesPorEmpleado.get(String(empleado._id)) || []
+      );
       return {
         _id: empleado._id,
         username: empleado.username,
@@ -326,6 +393,14 @@ export async function panel(req, res) {
         role: empleado.role,
         ultimaActividad: empleado.ultimaActividad || null,
         horarioLaboral: empleado.horarioLaboral || {},
+        horarioEfectivo: {
+          entrada: horarioEfectivo.entrada,
+          salida: horarioEfectivo.salida,
+          toleranciaMinutos: horarioEfectivo.toleranciaMinutos,
+          etiqueta: horarioEfectivo.etiqueta,
+          cambioTemporal: horarioEfectivo.cambioHorario,
+          licenciaMedica: horarioEfectivo.licenciaMedica,
+        },
         fichaje: {
           estado: asistencia?.estado || "sin-fichar",
           entrada: primeraMarca(marcas, "entrada"),

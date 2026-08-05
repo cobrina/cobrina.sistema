@@ -1,7 +1,7 @@
 // BACKEND/routes/reportesGestiones.routes.js
 import { Router } from "express";
 import verifyToken from "../middleware/verifyToken.js";
-import permitirRoles from "../middleware/permitirRoles.js";
+import permitirModulos from "../middleware/permitirModulos.js";
 import { seguimientoOperadores, seguimientoAuditorias } from "../controllers/reportesSeguimientoController.js";
 import { calidadGestiones } from "../controllers/calidadGestionesController.js";
 
@@ -31,7 +31,7 @@ import {
 const router = Router();
 
 // ✅ Protegido: solo admin/super-admin
-const guard = [verifyToken, permitirRoles("admin", "super-admin")];
+const guard = [verifyToken, permitirModulos("reportes")];
 
 /* =========================
    Básicos

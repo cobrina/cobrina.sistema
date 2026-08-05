@@ -1,5 +1,6 @@
 // models/Empleado.js
 import mongoose from "mongoose";
+import { normalizeStoredRole } from "../config/roles.js";
 
 const EmpleadoSchema = new mongoose.Schema(
   {
@@ -42,7 +43,16 @@ const EmpleadoSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ["operador", "operador-vip", "admin", "super-admin"],
+      enum: [
+        "operador",
+        "operador-vip",
+        "cuotero",
+        "capacitadora",
+        "administracion",
+        "supervisor",
+        "admin", // compatibilidad con usuarios existentes
+        "super-admin",
+      ],
       default: "operador",
       index: true,
     },
@@ -108,6 +118,9 @@ EmpleadoSchema.pre("validate", function (next) {
   if (typeof this.username === "string") this.username = this.username.trim().toLowerCase();
   if (typeof this.email === "string") this.email = this.email.trim().toLowerCase();
   if (typeof this.nombre === "string") this.nombre = this.nombre.trim();
+  if (typeof this.role === "string" && this.role !== "admin") {
+    this.role = normalizeStoredRole(this.role);
+  }
   next();
 });
 

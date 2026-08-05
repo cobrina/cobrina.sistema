@@ -1,18 +1,60 @@
 import mongoose from "mongoose";
+import { randomUUID } from "node:crypto";
 import AgendaItem from "../models/AgendaItem.js";
 import Empleado from "../models/Empleado.js";
+import { canAssignAgenda } from "../config/roles.js";
 
 const fechaValida = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || "").trim());
 const horaValida = (value) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || "").trim());
 const TIPOS = new Set(["tarea", "reunion", "recordatorio"]);
-const ROLES_QUE_ASIGNAN = new Set(["admin", "super-admin"]);
+const RECURRENCIAS = new Set(["semanal", "mensual"]);
+const MAX_OCURRENCIAS = 120;
 
 function limpiarTexto(value, max) {
   return String(value || "").trim().slice(0, max);
 }
 
 function puedeAsignar(req) {
-  return ROLES_QUE_ASIGNAN.has(String(req.user?.role || "").toLowerCase());
+  return canAssignAgenda(req.user?.role);
+}
+
+function fechaUTCDesdeClave(clave) {
+  const [anio, mes, dia] = String(clave || "").split("-").map(Number);
+  return new Date(Date.UTC(anio, mes - 1, dia, 12, 0, 0, 0));
+}
+
+function claveDesdeFechaUTC(fecha) {
+  return fecha.toISOString().slice(0, 10);
+}
+
+function sumarMesConAncla(fecha, meses, diaAncla) {
+  const objetivo = new Date(Date.UTC(fecha.getUTCFullYear(), fecha.getUTCMonth() + meses, 1, 12));
+  const ultimoDia = new Date(Date.UTC(objetivo.getUTCFullYear(), objetivo.getUTCMonth() + 1, 0, 12)).getUTCDate();
+  objetivo.setUTCDate(Math.min(diaAncla, ultimoDia));
+  return objetivo;
+}
+
+function fechasRecurrencia(fechaInicial, recurrencia, hastaClave) {
+  if (!recurrencia) return [fechaInicial];
+  if (!RECURRENCIAS.has(recurrencia)) throw new Error("Frecuencia de repetición inválida");
+  if (!fechaValida(hastaClave) || hastaClave < fechaInicial) {
+    throw new Error("Elegí hasta qué fecha se repite la actividad");
+  }
+
+  const inicio = fechaUTCDesdeClave(fechaInicial);
+  const diaAncla = inicio.getUTCDate();
+  const fechas = [];
+  let cursor = new Date(inicio);
+  let indice = 0;
+  while (claveDesdeFechaUTC(cursor) <= hastaClave && fechas.length < MAX_OCURRENCIAS) {
+    fechas.push(claveDesdeFechaUTC(cursor));
+    indice += 1;
+    cursor = recurrencia === "semanal"
+      ? new Date(cursor.getTime() + 7 * 86_400_000)
+      : sumarMesConAncla(inicio, indice, diaAncla);
+  }
+  if (!fechas.length) throw new Error("No se pudieron generar las repeticiones");
+  return fechas;
 }
 
 function normalizarPayload(body = {}, { parcial = false } = {}) {
@@ -137,16 +179,39 @@ export async function crearAgendaItem(req, res) {
   try {
     const payload = normalizarPayload(req.body);
     const propietario = await resolverPropietario(req);
-    const item = await AgendaItem.create({
+    const recurrencia = String(req.body?.recurrencia || "").trim().toLowerCase();
+    const recurrenciaHasta = recurrencia ? String(req.body?.recurrenciaHasta || "").trim() : "";
+    const fechas = fechasRecurrencia(payload.fechaClave, recurrencia, recurrenciaHasta);
+    const serieId = fechas.length > 1 ? randomUUID() : "";
+    const base = {
       ...payload,
       propietario,
       creadoPor: req.user.id,
       creadoPorUsername: req.user.username || "",
-    });
-    const creado = await AgendaItem.findById(item._id)
+      recurrencia: fechas.length > 1 ? recurrencia : "",
+      recurrenciaHasta: fechas.length > 1 ? recurrenciaHasta : "",
+      serieId,
+    };
+    const creados = await AgendaItem.insertMany(
+      fechas.map((fechaClave, indiceRecurrencia) => ({
+        ...base,
+        fechaClave,
+        indiceRecurrencia,
+        completada: false,
+      })),
+      { ordered: true }
+    );
+    const items = await AgendaItem.find({ _id: { $in: creados.map((item) => item._id) } })
       .populate("creadoPor", "username nombre role")
+      .sort({ fechaClave: 1, hora: 1 })
       .lean();
-    return res.status(201).json({ ok: true, item: normalizarItem(creado, req.user.id) });
+    return res.status(201).json({
+      ok: true,
+      item: normalizarItem(items[0], req.user.id),
+      items: items.map((item) => normalizarItem(item, req.user.id)),
+      count: items.length,
+      serieId,
+    });
   } catch (error) {
     return res.status(400).json({ error: error?.message || "No se pudo crear la actividad" });
   }

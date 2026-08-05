@@ -115,7 +115,7 @@ function ownerScope(req) {
   const role = String(getRole(req) || "").toLowerCase();
   const onlyMine = String(req?.query?.onlyMine || "").toLowerCase() === "true";
   if (!userId) return {};
-  if (["admin", "super-admin", "superadmin"].includes(role) && !onlyMine) return {};
+  if (["capacitadora", "administracion", "supervisor", "super-admin"].includes(role) && !onlyMine) return {};
   return { propietario: new mongoose.Types.ObjectId(userId) };
 }
 
@@ -280,7 +280,8 @@ function inferOutboundMessageChannel(row) {
     "instancia legal prejudicial",
     "debido a su deuda con",
     "deuda pendiente que mantiene",
-    "comunicarse al estudio",
+    "comunicarse al estudio rdc",
+    "comunicarse a rdc collections",
   ];
   if (strongPhrases.some((phrase) => text.includes(phrase))) {
     return "Canal de envío correspondiente";

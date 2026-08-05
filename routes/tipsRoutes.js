@@ -7,10 +7,10 @@ import permitirRoles from "../middleware/permitirRoles.js";
 const router = Router();
 
 router.get("/", verifyToken, list);
-router.post("/", verifyToken, permitirRoles("super-admin"), create);
-router.put("/:id", verifyToken, permitirRoles("super-admin"), update);
-router.patch("/:id/toggle", verifyToken, permitirRoles("super-admin"), toggleActive);
+router.post("/", verifyToken, permitirRoles("administracion", "supervisor", "super-admin"), create);
+router.put("/:id", verifyToken, permitirRoles("administracion", "supervisor", "super-admin"), update);
+router.patch("/:id/toggle", verifyToken, permitirRoles("administracion", "supervisor", "super-admin"), toggleActive);
 /** ➕ NUEVO: eliminar */
-router.delete("/:id", verifyToken, permitirRoles("super-admin"), remove);
+router.delete("/:id", verifyToken, permitirRoles("administracion", "supervisor", "super-admin"), remove);
 
 export default router;

@@ -5,7 +5,12 @@ import permitirRoles from "../middleware/permitirRoles.js";
 
 const router = express.Router();
 
-// ✅ Ruta: obtener lista de usuarios (solo para super-admin)
-router.get("/", verifyToken, permitirRoles("super-admin"), obtenerUsuariosActivos);
+// Catálogo de usuarios activos para filtros globales y asignación de agenda.
+router.get(
+  "/",
+  verifyToken,
+  permitirRoles("cuotero", "capacitadora", "administracion", "supervisor", "super-admin"),
+  obtenerUsuariosActivos
+);
 
 export default router;

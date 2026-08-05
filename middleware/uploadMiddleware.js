@@ -10,9 +10,13 @@ const fileFilter = (req, file, cb) => {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.ms-excel",
     "text/csv",
+    "application/csv",
+    "text/plain",
+    "application/octet-stream",
   ];
+  const extensionValida = /\.(xlsx|xls|csv)$/i.test(String(file.originalname || ""));
 
-  if (allowedMimes.includes(file.mimetype)) {
+  if (extensionValida && allowedMimes.includes(file.mimetype)) {
     cb(null, true);
   } else {
     cb(

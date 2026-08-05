@@ -86,8 +86,11 @@ const ReporteGestionSchema = new Schema(
     // Observación de la gestión
     observacionGestion: { type: String, default: "", trim: true, maxlength: 3000 },
 
-    // Cartera/entidad (normalizada a MAYÚSCULAS desde el controlador)
+    // Cartera/entidad visible (normalizada a MAYÚSCULAS desde el controlador)
     entidad: { type: String, index: true, default: "", trim: true, maxlength: 120 },
+
+    // Identificador canónico de Entidad.numero. Es la clave usada para cruces con Pagos.
+    entidadNumero: { type: Number, index: true, default: null },
 
     // Derivados útiles (normalizados a minúsculas en pre-save)
     mailsDetectados: { type: [String], default: [] },
@@ -114,6 +117,8 @@ ReporteGestionSchema.set("collation", { locale: "es", strength: 2 });
 ReporteGestionSchema.index({ propietario: 1, fecha: -1 });
 ReporteGestionSchema.index({ propietario: 1, usuario: 1, fecha: -1 });
 ReporteGestionSchema.index({ propietario: 1, entidad: 1, fecha: -1 });
+ReporteGestionSchema.index({ propietario: 1, entidadNumero: 1, fecha: -1 });
+ReporteGestionSchema.index({ propietario: 1, dni: 1, entidadNumero: 1, fecha: -1 });
 ReporteGestionSchema.index({ propietario: 1, tipoContacto: 1, fecha: -1 });
 ReporteGestionSchema.index({ propietario: 1, estadoCuenta: 1, fecha: -1 });
 ReporteGestionSchema.index({ propietario: 1, resultadoGestion: 1, fecha: -1 });

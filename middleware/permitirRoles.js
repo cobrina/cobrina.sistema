@@ -1,8 +1,10 @@
-// verifyToken ya valida en MongoDB que el usuario exista, esté activo y tenga su rol actual.
-// Este middleware solo comprueba permisos; evita una segunda consulta y una escritura por request.
+import { normalizeStoredRole } from "../config/roles.js";
+
+// verifyToken ya valida en MongoDB que el usuario exista, esté activo y tenga su rol efectivo actual.
 export default function permitirRoles(...rolesPermitidos) {
+  const permitidos = rolesPermitidos.map(normalizeStoredRole);
   return (req, res, next) => {
-    const rolUsuario = String(req.user?.role || "").trim().toLowerCase();
+    const rolUsuario = normalizeStoredRole(req.user?.role);
 
     if (!req.user?.id || !rolUsuario) {
       return res
@@ -10,7 +12,7 @@ export default function permitirRoles(...rolesPermitidos) {
         .json({ error: "Token inválido o usuario no autenticado" });
     }
 
-    if (!rolesPermitidos.includes(rolUsuario)) {
+    if (!permitidos.includes(rolUsuario)) {
       return res.status(403).json({ error: "No tenés permiso para realizar esta acción" });
     }
 

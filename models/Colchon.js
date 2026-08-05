@@ -34,6 +34,14 @@ const PagoInformadoSchema = new Schema(
     operadorId: { type: Schema.Types.ObjectId, ref: "Empleado", required: true },
     marcadoPor: { type: Schema.Types.ObjectId, ref: "Empleado", default: null },
     marcadoEn: { type: Date, default: null },
+    estadoAplicacion: {
+      type: String,
+      enum: ["pendiente", "aplicado", "requiere-revision", "descartado"],
+      default: "pendiente",
+      index: true,
+    },
+    pagoRealId: { type: Schema.Types.ObjectId, ref: "Pago", default: null },
+    aplicadoEn: { type: Date, default: null },
   },
   { _id: true }
 );
@@ -61,6 +69,9 @@ const ColchonSchema = new Schema(
 
     // Identificaciones obligatorias
     entidadId: { type: Schema.Types.ObjectId, ref: "Entidad", required: true, index: true },
+    // Número operativo canónico de la entidad. Se agrega sin eliminar el
+    // ObjectId histórico para permitir una migración gradual y reversible.
+    entidadNumero: { type: Number, min: 1, default: null, index: true },
     subCesionId: { type: Schema.Types.ObjectId, ref: "SubCesion", required: true, index: true },
 
     // Datos del titular / asignación
@@ -118,6 +129,7 @@ ColchonSchema.index({ idCuotaLogico: 1 }, { unique: true, sparse: true });
 
 // Para filtros comunes
 ColchonSchema.index({ entidadId: 1, subCesionId: 1, dni: 1 });
+ColchonSchema.index({ entidadNumero: 1, subCesionId: 1, dni: 1 });
 ColchonSchema.index({ empleadoId: 1, vencimiento: 1 });
 ColchonSchema.index({ empleadoId: 1, estado: 1 });
 ColchonSchema.index({ entidadId: 1, subCesionId: 1, estado: 1 });

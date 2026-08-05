@@ -1,0 +1,727 @@
+import mongoose from "mongoose";
+import ExcelJS from "exceljs";
+import * as XLSX from "xlsx";
+import NovedadRRHH from "../models/NovedadRRHH.js";
+import AdelantoRRHH from "../models/AdelantoRRHH.js";
+import ObjetivoMensual from "../models/ObjetivoMensual.js";
+import Empleado from "../models/Empleado.js";
+import Asistencia from "../models/Asistencia.js";
+import Pago from "../models/Pago.js";
+import Entidad from "../models/Entidad.js";
+import SubCesion from "../models/SubCesion.js";
+import { minutosTrabajadosDesdeMarcas, minutosEsperadosHastaHoy, rangoMesLocal } from "../utils/calculoAsistencia.js";
+import { normalizarEntidadNumero } from "../utils/normalizacionNegocio.js";
+import { ROLES, normalizeStoredRole } from "../config/roles.js";
+import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
+
+const objectId = (value) =>
+  mongoose.Types.ObjectId.isValid(String(value || ""))
+    ? new mongoose.Types.ObjectId(String(value))
+    : null;
+
+const actorId = (req) => new mongoose.Types.ObjectId(req.user.id);
+
+function filtroFechaMes(campo, mes) {
+  const { desde, hasta } = rangoMesLocal(mes);
+  return { [campo]: { $gte: desde, $lte: hasta } };
+}
+
+function parseDate(value, fallback = null) {
+  if (!value) return fallback;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+const normalizarEncabezado = (value = "") =>
+  String(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+const leerFilasMasivas = (buffer) => {
+  const workbook = XLSX.read(buffer, { type: "buffer", cellDates: false });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  if (!sheet) return [];
+  const raw = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
+  return raw.map((row, index) => ({
+    filaExcel: index + 2,
+    datos: Object.fromEntries(
+      Object.entries(row).map(([key, value]) => [normalizarEncabezado(key), value])
+    ),
+  }));
+};
+
+const enviarWorkbook = async (res, workbook, filename) => {
+  const buffer = await workbook.xlsx.writeBuffer();
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  return res.send(Buffer.from(buffer));
+};
+
+const enviarCsv = (res, filas, filename) => {
+  const sheet = XLSX.utils.aoa_to_sheet(filas);
+  const csv = XLSX.utils.sheet_to_csv(sheet, { FS: ",", RS: "\n" });
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  // BOM para que Excel reconozca correctamente tildes y eñes.
+  return res.send(`\uFEFF${csv}`);
+};
+
+const quiereCsv = (req) =>
+  [req.query?.formato, req.query?.format]
+    .some((value) => String(value || "").trim().toLowerCase() === "csv");
+
+const parseDiasLaborales = (value) => {
+  const mapa = new Map([
+    ["DOM", 0], ["DOMINGO", 0], ["LUN", 1], ["LUNES", 1],
+    ["MAR", 2], ["MARTES", 2], ["MIE", 3], ["MIERCOLES", 3],
+    ["JUE", 4], ["JUEVES", 4], ["VIE", 5], ["VIERNES", 5],
+    ["SAB", 6], ["SABADO", 6],
+  ]);
+  const partes = String(value || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase().split(/[;,|/\s]+/).filter(Boolean);
+  const dias = partes.map((parte) => {
+    if (/^[0-6]$/.test(parte)) return Number(parte);
+    return mapa.get(parte);
+  });
+  if (!dias.length || dias.some((dia) => dia === undefined)) return null;
+  return [...new Set(dias)].sort((a, b) => a - b);
+};
+
+const horaValida = (value) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || "").trim());
+
+const fechaFinNoAnterior = (desde, hasta) => !hasta || hasta >= desde;
+
+function validarDatosNovedad(tipo, body, fechaDesde, fechaHasta) {
+  if (!fechaFinNoAnterior(fechaDesde, fechaHasta)) {
+    return "La fecha hasta no puede ser anterior a la fecha desde";
+  }
+  if (tipo === "cambio-horario") {
+    const entrada = String(body.horaEntradaNueva || "").trim();
+    const salida = String(body.horaSalidaNueva || "").trim();
+    if (!horaValida(entrada) || !horaValida(salida)) {
+      return "Completá un horario de entrada y salida válido";
+    }
+    const [eh, em] = entrada.split(":").map(Number);
+    const [sh, sm] = salida.split(":").map(Number);
+    if (sh * 60 + sm <= eh * 60 + em) return "La hora de salida debe ser posterior a la entrada";
+  }
+  return "";
+}
+
+export async function listarNovedades(req, res) {
+  try {
+    const query = {};
+    if (req.query.empleadoId) {
+      const id = objectId(req.query.empleadoId);
+      if (!id) return res.status(400).json({ error: "Empleado inválido" });
+      query.empleadoId = id;
+    }
+    if (req.query.tipo) query.tipo = req.query.tipo;
+    if (req.query.estado) query.estado = req.query.estado;
+    if (req.query.mes) Object.assign(query, filtroFechaMes("fechaDesde", req.query.mes));
+
+    const items = await NovedadRRHH.find(query)
+      .populate("empleadoId", "username nombre role")
+      .populate("creadoPor", "username nombre")
+      .populate("modificadoPor", "username nombre")
+      .sort({ fechaDesde: -1, createdAt: -1 })
+      .limit(1000)
+      .lean();
+    return res.json(items);
+  } catch (error) {
+    console.error("RRHH listar novedades:", error);
+    return res.status(500).json({ error: "No se pudieron obtener las novedades" });
+  }
+}
+
+export async function crearNovedad(req, res) {
+  try {
+    const empleadoId = objectId(req.body.empleadoId);
+    const tipo = String(req.body.tipo || "").trim();
+    const fechaDesde = parseDate(req.body.fechaDesde);
+    let fechaHasta = parseDate(req.body.fechaHasta);
+    const descripcion = String(req.body.descripcion || "").trim();
+    if (!empleadoId || !fechaDesde || !tipo || !descripcion) {
+      return res.status(400).json({ error: "Completá empleado, tipo, fecha y descripción" });
+    }
+
+    if (["cambio-horario", "licencia-medica"].includes(tipo) && !fechaHasta) {
+      fechaHasta = fechaDesde;
+    }
+    const errorDatos = validarDatosNovedad(tipo, req.body, fechaDesde, fechaHasta);
+    if (errorDatos) return res.status(400).json({ error: errorDatos });
+
+    const empleado = await Empleado.findById(empleadoId).select("_id horarioLaboral").lean();
+    if (!empleado) return res.status(404).json({ error: "Empleado no encontrado" });
+
+    const entradaNueva = tipo === "cambio-horario" ? String(req.body.horaEntradaNueva || "").trim() : "";
+    const salidaNueva = tipo === "cambio-horario" ? String(req.body.horaSalidaNueva || "").trim() : "";
+    const horarioAnterior = tipo === "cambio-horario"
+      ? `${empleado.horarioLaboral?.entrada || ""}-${empleado.horarioLaboral?.salida || ""}`
+      : String(req.body.horarioAnterior || "");
+    const horarioNuevo = tipo === "cambio-horario"
+      ? `${entradaNueva}-${salidaNueva}`
+      : String(req.body.horarioNuevo || "");
+
+    const item = await NovedadRRHH.create({
+      empleadoId,
+      tipo,
+      motivoApercibimiento:
+        tipo === "apercibimiento" ? req.body.motivoApercibimiento || "otro" : "",
+      fechaDesde,
+      fechaHasta,
+      horarioAnterior,
+      horarioNuevo,
+      horaEntradaNueva: entradaNueva,
+      horaSalidaNueva: salidaNueva,
+      toleranciaMinutosNueva: tipo === "cambio-horario"
+        ? Math.max(0, Math.min(180, Number(req.body.toleranciaMinutosNueva ?? empleado.horarioLaboral?.toleranciaMinutos ?? 10)))
+        : 10,
+      minutosTarde: Number(req.body.minutosTarde || 0),
+      justificado: Boolean(req.body.justificado || ["falta-justificada", "licencia-medica"].includes(tipo)),
+      descripcion,
+      accionTomada: String(req.body.accionTomada || "").trim(),
+      estado: req.body.estado || "vigente",
+      creadoPor: actorId(req),
+    });
+
+    await item.populate("empleadoId", "username nombre role");
+    if (["cambio-horario", "licencia-medica"].includes(tipo)) invalidateSeguimientoCache();
+    return res.status(201).json(item);
+  } catch (error) {
+    console.error("RRHH crear novedad:", error);
+    return res.status(400).json({ error: error.message || "No se pudo crear la novedad" });
+  }
+}
+
+export async function actualizarNovedad(req, res) {
+  try {
+    const actual = await NovedadRRHH.findById(req.params.id).lean();
+    if (!actual) return res.status(404).json({ error: "Novedad no encontrada" });
+
+    const update = { ...req.body, modificadoPor: actorId(req) };
+    delete update.empleadoId;
+    delete update.creadoPor;
+    if (update.fechaDesde) {
+      update.fechaDesde = parseDate(update.fechaDesde);
+      if (!update.fechaDesde) return res.status(400).json({ error: "Fecha inválida" });
+    }
+    if (update.fechaHasta !== undefined) update.fechaHasta = parseDate(update.fechaHasta);
+
+    const tipo = String(update.tipo || actual.tipo || "");
+    const fechaDesde = update.fechaDesde || actual.fechaDesde;
+    let fechaHasta = update.fechaHasta !== undefined ? update.fechaHasta : actual.fechaHasta;
+    if (["cambio-horario", "licencia-medica"].includes(tipo) && !fechaHasta) fechaHasta = fechaDesde;
+    update.fechaHasta = fechaHasta;
+    const datosCombinados = { ...actual, ...update };
+    const errorDatos = validarDatosNovedad(tipo, datosCombinados, fechaDesde, fechaHasta);
+    if (errorDatos) return res.status(400).json({ error: errorDatos });
+
+    if (tipo === "licencia-medica") update.justificado = true;
+    if (tipo === "cambio-horario") {
+      update.horarioNuevo = `${datosCombinados.horaEntradaNueva}-${datosCombinados.horaSalidaNueva}`;
+      update.toleranciaMinutosNueva = Math.max(0, Math.min(180, Number(datosCombinados.toleranciaMinutosNueva ?? 10)));
+    }
+
+    const item = await NovedadRRHH.findByIdAndUpdate(req.params.id, update, {
+      new: true,
+      runValidators: true,
+    }).populate("empleadoId", "username nombre role");
+    if (["cambio-horario", "licencia-medica"].includes(tipo)) invalidateSeguimientoCache();
+    return res.json(item);
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "No se pudo actualizar la novedad" });
+  }
+}
+
+export async function eliminarNovedad(req, res) {
+  try {
+    const item = await NovedadRRHH.findByIdAndDelete(req.params.id);
+    if (!item) return res.status(404).json({ error: "Novedad no encontrada" });
+    if (["cambio-horario", "licencia-medica"].includes(item.tipo)) invalidateSeguimientoCache();
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(400).json({ error: "No se pudo eliminar la novedad" });
+  }
+}
+
+export async function listarAdelantos(req, res) {
+  try {
+    const query = {};
+    if (req.query.empleadoId) {
+      const id = objectId(req.query.empleadoId);
+      if (!id) return res.status(400).json({ error: "Empleado inválido" });
+      query.empleadoId = id;
+    }
+    if (req.query.estado) query.estado = req.query.estado;
+    if (req.query.mes) Object.assign(query, filtroFechaMes("fechaSolicitud", req.query.mes));
+    const items = await AdelantoRRHH.find(query)
+      .populate("empleadoId", "username nombre role")
+      .populate("creadoPor", "username nombre")
+      .populate("modificadoPor", "username nombre")
+      .sort({ fechaSolicitud: -1, createdAt: -1 })
+      .limit(1000)
+      .lean();
+    return res.json(items);
+  } catch (error) {
+    return res.status(500).json({ error: "No se pudieron obtener los adelantos" });
+  }
+}
+
+export async function crearAdelanto(req, res) {
+  try {
+    const empleadoId = objectId(req.body.empleadoId);
+    const monto = Number(req.body.monto);
+    if (!empleadoId || !Number.isFinite(monto) || monto <= 0 || !String(req.body.motivo || "").trim()) {
+      return res.status(400).json({ error: "Completá empleado, monto y motivo" });
+    }
+    const item = await AdelantoRRHH.create({
+      empleadoId,
+      fechaSolicitud: parseDate(req.body.fechaSolicitud, new Date()),
+      monto,
+      motivo: String(req.body.motivo).trim(),
+      estado: req.body.estado || "solicitado",
+      fechaResolucion: parseDate(req.body.fechaResolucion),
+      fechaEntrega: parseDate(req.body.fechaEntrega),
+      periodoDescuento: req.body.periodoDescuento || "",
+      observaciones: req.body.observaciones || "",
+      creadoPor: actorId(req),
+    });
+    await item.populate("empleadoId", "username nombre role");
+    return res.status(201).json(item);
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "No se pudo registrar el adelanto" });
+  }
+}
+
+export async function actualizarAdelanto(req, res) {
+  try {
+    const update = { ...req.body, modificadoPor: actorId(req) };
+    delete update.empleadoId;
+    delete update.creadoPor;
+    if (["aprobado", "rechazado", "cancelado", "descontado"].includes(update.estado) && !update.fechaResolucion) {
+      update.fechaResolucion = new Date();
+    }
+    if (update.estado === "entregado" && !update.fechaEntrega) update.fechaEntrega = new Date();
+    const item = await AdelantoRRHH.findByIdAndUpdate(req.params.id, update, {
+      new: true,
+      runValidators: true,
+    }).populate("empleadoId", "username nombre role");
+    if (!item) return res.status(404).json({ error: "Adelanto no encontrado" });
+    return res.json(item);
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "No se pudo actualizar el adelanto" });
+  }
+}
+
+export async function listarObjetivos(req, res) {
+  try {
+    const query = {};
+    if (req.query.mes) query.mes = req.query.mes;
+    if (req.query.alcance) query.alcance = req.query.alcance;
+    const items = await ObjetivoMensual.find(query)
+      .populate("empleadoId", "username nombre role")
+      .populate("subCesionId", "nombre")
+      .sort({ mes: -1, alcance: 1, createdAt: -1 })
+      .lean();
+
+    const numeros = [...new Set(items.map((x) => x.entidadNumero).filter(Boolean))];
+    const entidades = await Entidad.find({ numero: { $in: numeros } }).select("numero nombre").lean();
+    const mapa = new Map(entidades.map((e) => [Number(e.numero), e.nombre]));
+    return res.json(items.map((item) => ({ ...item, entidadNombre: mapa.get(Number(item.entidadNumero)) || "" })));
+  } catch (error) {
+    return res.status(500).json({ error: "No se pudieron obtener los objetivos" });
+  }
+}
+
+export async function guardarObjetivo(req, res) {
+  try {
+    const alcance = req.body.alcance;
+    const mes = String(req.body.mes || "");
+    const montoObjetivo = Number(req.body.montoObjetivo);
+    if (!/^\d{4}-\d{2}$/.test(mes) || !["equipo", "operador", "entidad", "entidad-subcesion"].includes(alcance)) {
+      return res.status(400).json({ error: "Mes o alcance inválido" });
+    }
+    if (!Number.isFinite(montoObjetivo) || montoObjetivo < 0) {
+      return res.status(400).json({ error: "Objetivo inválido" });
+    }
+
+    const empleadoId = alcance === "operador" ? objectId(req.body.empleadoId) : null;
+    const entidadNumero = ["entidad", "entidad-subcesion"].includes(alcance)
+      ? normalizarEntidadNumero(req.body.entidadNumero)
+      : null;
+    const subCesionId = alcance === "entidad-subcesion" ? objectId(req.body.subCesionId) : null;
+
+    if (alcance === "operador" && !empleadoId) return res.status(400).json({ error: "Elegí un operador" });
+    if (["entidad", "entidad-subcesion"].includes(alcance) && !entidadNumero) {
+      return res.status(400).json({ error: "Elegí una entidad" });
+    }
+    if (alcance === "entidad-subcesion" && !subCesionId) {
+      return res.status(400).json({ error: "Elegí una subcesión" });
+    }
+
+    if (entidadNumero) {
+      const existe = await Entidad.exists({ numero: entidadNumero });
+      if (!existe) return res.status(400).json({ error: "La entidad no existe" });
+    }
+    if (subCesionId) {
+      const existe = await SubCesion.exists({ _id: subCesionId });
+      if (!existe) return res.status(400).json({ error: "La subcesión no existe" });
+    }
+
+    const filtro = { mes, alcance, empleadoId, entidadNumero, subCesionId };
+    const item = await ObjetivoMensual.findOneAndUpdate(
+      filtro,
+      {
+        $set: {
+          montoObjetivo,
+          observaciones: req.body.observaciones || "",
+          activo: req.body.activo !== false,
+          modificadoPor: actorId(req),
+        },
+        $setOnInsert: { creadoPor: actorId(req) },
+      },
+      { new: true, upsert: true, runValidators: true }
+    )
+      .populate("empleadoId", "username nombre role")
+      .populate("subCesionId", "nombre");
+    return res.status(201).json(item);
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "No se pudo guardar el objetivo" });
+  }
+}
+
+export async function eliminarObjetivo(req, res) {
+  try {
+    const item = await ObjetivoMensual.findByIdAndDelete(req.params.id);
+    if (!item) return res.status(404).json({ error: "Objetivo no encontrado" });
+    return res.json({ ok: true });
+  } catch {
+    return res.status(400).json({ error: "No se pudo eliminar el objetivo" });
+  }
+}
+
+export async function descargarPlantillaHorarios(req, res) {
+  try {
+    const empleados = await Empleado.find({ isActive: { $ne: false } })
+      .select("username email nombre horarioLaboral")
+      .sort({ username: 1 })
+      .lean();
+
+    const filasHorarios = empleados.map((empleado) => ({
+      usuario: empleado.username,
+      email: empleado.email,
+      nombre: empleado.nombre,
+      dias: (empleado.horarioLaboral?.dias || [1, 2, 3, 4, 5]).join(","),
+      entrada: empleado.horarioLaboral?.entrada || "09:00",
+      salida: empleado.horarioLaboral?.salida || "18:00",
+      tolerancia: empleado.horarioLaboral?.toleranciaMinutos ?? 10,
+    }));
+
+    if (quiereCsv(req)) {
+      return enviarCsv(
+        res,
+        [
+          ["USUARIO", "EMAIL", "NOMBRE", "DIAS_SEMANA", "ENTRADA", "SALIDA", "TOLERANCIA_MINUTOS"],
+          ...filasHorarios.map((fila) => [
+            fila.usuario,
+            fila.email,
+            fila.nombre,
+            fila.dias,
+            fila.entrada,
+            fila.salida,
+            fila.tolerancia,
+          ]),
+        ],
+        "modelo-horarios-rrhh.csv"
+      );
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Horarios");
+    sheet.columns = [
+      { header: "USUARIO", key: "usuario", width: 22 },
+      { header: "EMAIL", key: "email", width: 30 },
+      { header: "NOMBRE", key: "nombre", width: 30 },
+      { header: "DIAS_SEMANA", key: "dias", width: 20 },
+      { header: "ENTRADA", key: "entrada", width: 12 },
+      { header: "SALIDA", key: "salida", width: 12 },
+      { header: "TOLERANCIA_MINUTOS", key: "tolerancia", width: 22 },
+    ];
+    filasHorarios.forEach((fila) => sheet.addRow(fila));
+    sheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
+    sheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF29104F" } };
+    sheet.views = [{ state: "frozen", ySplit: 1 }];
+    sheet.addRow({});
+    sheet.addRow({ usuario: "AYUDA", email: "Usá 0=domingo, 1=lunes ... 6=sábado. Ejemplo: 1,2,3,4,5" });
+    return enviarWorkbook(res, workbook, "modelo-horarios-rrhh.xlsx");
+  } catch (error) {
+    console.error("RRHH plantilla horarios:", error);
+    return res.status(500).json({ error: "No se pudo generar el modelo de horarios" });
+  }
+}
+
+export async function importarHorariosMasivos(req, res) {
+  try {
+    if (!req.file?.buffer) return res.status(400).json({ error: "Seleccioná un archivo XLSX, XLS o CSV" });
+    const filas = leerFilasMasivas(req.file.buffer);
+    if (!filas.length) return res.status(400).json({ error: "El archivo no contiene filas" });
+    const empleados = await Empleado.find({}).select("_id username email").lean();
+    const porUsuario = new Map(empleados.map((e) => [String(e.username).toLowerCase(), e]));
+    const porEmail = new Map(empleados.map((e) => [String(e.email).toLowerCase(), e]));
+    const errores = [];
+    let actualizados = 0;
+    for (const { filaExcel, datos } of filas) {
+      const usuario = String(datos.USUARIO || "").trim().toLowerCase();
+      const email = String(datos.EMAIL || "").trim().toLowerCase();
+      if (usuario === "ayuda") continue;
+      const empleado = porUsuario.get(usuario) || porEmail.get(email);
+      const dias = parseDiasLaborales(datos.DIAS_SEMANA);
+      const entrada = String(datos.ENTRADA || "").trim();
+      const salida = String(datos.SALIDA || "").trim();
+      const tolerancia = Number(datos.TOLERANCIA_MINUTOS ?? 10);
+      const problemas = [];
+      if (!empleado) problemas.push("usuario o email no encontrado");
+      if (!dias) problemas.push("días inválidos");
+      if (!horaValida(entrada)) problemas.push("hora de entrada inválida");
+      if (!horaValida(salida)) problemas.push("hora de salida inválida");
+      if (!Number.isFinite(tolerancia) || tolerancia < 0 || tolerancia > 180) problemas.push("tolerancia inválida");
+      if (problemas.length) {
+        errores.push({ fila: filaExcel, usuario: usuario || email || "-", error: problemas.join(", ") });
+        continue;
+      }
+      await Empleado.updateOne({ _id: empleado._id }, {
+        $set: { horarioLaboral: { dias, entrada, salida, toleranciaMinutos: tolerancia } },
+      }, { runValidators: true });
+      actualizados += 1;
+    }
+    return res.json({ ok: true, actualizados, errores, totalFilas: filas.length });
+  } catch (error) {
+    console.error("RRHH importar horarios:", error);
+    return res.status(400).json({ error: error.message || "No se pudieron importar los horarios" });
+  }
+}
+
+export async function descargarPlantillaObjetivos(req, res) {
+  try {
+    const mes = new Date().toISOString().slice(0, 7);
+    const ejemplos = [
+      { mes, alcance: "equipo", empleado: "", entidad: "", subcesion: "", monto: 1000000, observaciones: "Objetivo general" },
+      { mes, alcance: "operador", empleado: "usuario.operador", entidad: "", subcesion: "", monto: 250000, observaciones: "" },
+      { mes, alcance: "entidad", empleado: "", entidad: 1, subcesion: "", monto: 500000, observaciones: "" },
+      { mes, alcance: "entidad-subcesion", empleado: "", entidad: 1, subcesion: "NOMBRE CARTERA", monto: 300000, observaciones: "" },
+    ];
+
+    if (quiereCsv(req)) {
+      return enviarCsv(
+        res,
+        [
+          ["MES", "ALCANCE", "EMPLEADO", "ENTIDAD_NUMERO", "SUBCESION", "MONTO_OBJETIVO", "OBSERVACIONES"],
+          ...ejemplos.map((fila) => [
+            fila.mes,
+            fila.alcance,
+            fila.empleado,
+            fila.entidad,
+            fila.subcesion,
+            fila.monto,
+            fila.observaciones,
+          ]),
+        ],
+        "modelo-objetivos-rrhh.csv"
+      );
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Objetivos");
+    sheet.columns = [
+      { header: "MES", key: "mes", width: 12 },
+      { header: "ALCANCE", key: "alcance", width: 22 },
+      { header: "EMPLEADO", key: "empleado", width: 24 },
+      { header: "ENTIDAD_NUMERO", key: "entidad", width: 18 },
+      { header: "SUBCESION", key: "subcesion", width: 24 },
+      { header: "MONTO_OBJETIVO", key: "monto", width: 20 },
+      { header: "OBSERVACIONES", key: "observaciones", width: 38 },
+    ];
+    sheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
+    sheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF29104F" } };
+    sheet.views = [{ state: "frozen", ySplit: 1 }];
+
+    const ayuda = workbook.addWorksheet("Ejemplos y ayuda");
+    ayuda.columns = sheet.columns.map((columna) => ({
+      header: columna.header,
+      key: columna.key,
+      width: columna.width,
+    }));
+    ayuda.addRows(ejemplos);
+    ayuda.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
+    ayuda.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF29104F" } };
+    ayuda.addRow({ observaciones: "Completá únicamente la hoja Objetivos. Esta hoja es de referencia y no se importa." });
+    return enviarWorkbook(res, workbook, "modelo-objetivos-rrhh.xlsx");
+  } catch (error) {
+    console.error("RRHH plantilla objetivos:", error);
+    return res.status(500).json({ error: "No se pudo generar el modelo de objetivos" });
+  }
+}
+
+export async function importarObjetivosMasivos(req, res) {
+  try {
+    if (!req.file?.buffer) return res.status(400).json({ error: "Seleccioná un archivo XLSX, XLS o CSV" });
+    const filas = leerFilasMasivas(req.file.buffer);
+    if (!filas.length) return res.status(400).json({ error: "El archivo no contiene filas" });
+    const [empleados, entidades, subcesiones] = await Promise.all([
+      Empleado.find({}).select("_id username email nombre").lean(),
+      Entidad.find({}).select("numero nombre").lean(),
+      SubCesion.find({}).select("_id nombre").lean(),
+    ]);
+    const empleadosMap = new Map();
+    empleados.forEach((e) => [e.username, e.email, e.nombre].filter(Boolean).forEach((v) => empleadosMap.set(String(v).trim().toLowerCase(), e)));
+    const entidadesMap = new Map(entidades.map((e) => [Number(e.numero), e]));
+    const subcesionesMap = new Map(subcesiones.map((s) => [String(s.nombre).trim().toUpperCase(), s]));
+    const errores = [];
+    let actualizados = 0;
+    for (const { filaExcel, datos } of filas) {
+      const mes = String(datos.MES || "").trim();
+      const alcance = String(datos.ALCANCE || "").trim().toLowerCase();
+      const montoObjetivo = Number(String(datos.MONTO_OBJETIVO || "0").replace(/[$.\s]/g, "").replace(",", "."));
+      const problemas = [];
+      let empleadoId = null;
+      let entidadNumero = null;
+      let subCesionId = null;
+      if (!/^\d{4}-\d{2}$/.test(mes)) problemas.push("mes inválido");
+      if (!["equipo", "operador", "entidad", "entidad-subcesion"].includes(alcance)) problemas.push("alcance inválido");
+      if (!Number.isFinite(montoObjetivo) || montoObjetivo < 0) problemas.push("monto inválido");
+      if (alcance === "operador") {
+        const empleado = empleadosMap.get(String(datos.EMPLEADO || "").trim().toLowerCase());
+        if (!empleado) problemas.push("empleado no encontrado"); else empleadoId = empleado._id;
+      }
+      if (["entidad", "entidad-subcesion"].includes(alcance)) {
+        entidadNumero = normalizarEntidadNumero(datos.ENTIDAD_NUMERO);
+        if (!entidadNumero || !entidadesMap.has(Number(entidadNumero))) problemas.push("entidad inexistente");
+      }
+      if (alcance === "entidad-subcesion") {
+        const sub = subcesionesMap.get(String(datos.SUBCESION || "").trim().toUpperCase());
+        if (!sub) problemas.push("subcesión inexistente"); else subCesionId = sub._id;
+      }
+      if (problemas.length) {
+        errores.push({ fila: filaExcel, error: problemas.join(", ") });
+        continue;
+      }
+      const filtro = { mes, alcance, empleadoId, entidadNumero, subCesionId };
+      await ObjetivoMensual.findOneAndUpdate(filtro, {
+        $set: {
+          montoObjetivo,
+          observaciones: String(datos.OBSERVACIONES || "").trim(),
+          activo: true,
+          modificadoPor: actorId(req),
+        },
+        $setOnInsert: { creadoPor: actorId(req) },
+      }, { upsert: true, new: true, runValidators: true });
+      actualizados += 1;
+    }
+    return res.json({ ok: true, actualizados, errores, totalFilas: filas.length });
+  } catch (error) {
+    console.error("RRHH importar objetivos:", error);
+    return res.status(400).json({ error: error.message || "No se pudieron importar los objetivos" });
+  }
+}
+
+export async function resumenEmpleados(req, res) {
+  try {
+    const role = normalizeStoredRole(req.user?.role || req.user?.rol);
+    const puedeVerAdelantos = [ROLES.ADMINISTRACION, ROLES.SUPERVISOR, ROLES.SUPER_ADMIN].includes(role);
+    const { mes, desde, hasta, desdeClave, hastaClave } = rangoMesLocal(req.query.mes);
+    const desdeNovedades = new Date(`${desdeClave}T00:00:00.000Z`);
+    const hastaNovedades = new Date(`${hastaClave}T23:59:59.999Z`);
+    const empleados = await Empleado.find({ isActive: { $ne: false } })
+      .select("username nombre role horarioLaboral")
+      .sort({ username: 1 })
+      .lean();
+    const ids = empleados.map((e) => e._id);
+    const usernames = empleados.map((e) => e.username);
+
+    const [pagosPorId, pagosPorUsername, asistencias, objetivos, novedades, adelantos] = await Promise.all([
+      Pago.aggregate([
+        { $match: { fechaPago: { $gte: desde, $lte: hasta }, operadorId: { $in: ids } } },
+        { $group: { _id: "$operadorId", total: { $sum: "$monto" }, cantidad: { $sum: 1 } } },
+      ]),
+      Pago.aggregate([
+        {
+          $match: {
+            fechaPago: { $gte: desde, $lte: hasta },
+            operadorUsername: { $in: usernames },
+            $or: [
+              { operadorId: null },
+              { operadorId: { $exists: false } },
+              { operadorId: { $nin: ids } },
+            ],
+          },
+        },
+        { $group: { _id: "$operadorUsername", total: { $sum: "$monto" }, cantidad: { $sum: 1 } } },
+      ]),
+      Asistencia.find({ empleado: { $in: ids }, fechaClave: { $gte: desdeClave, $lte: hastaClave } }).lean(),
+      ObjetivoMensual.find({ mes, alcance: "operador", activo: true }).lean(),
+      NovedadRRHH.find({
+        empleadoId: { $in: ids },
+        estado: { $ne: "anulado" },
+        fechaDesde: { $lte: hastaNovedades },
+        $or: [{ fechaHasta: null }, { fechaHasta: { $gte: desdeNovedades } }],
+      }).lean(),
+      puedeVerAdelantos
+        ? AdelantoRRHH.find({ empleadoId: { $in: ids }, fechaSolicitud: { $gte: desde, $lte: hasta }, estado: { $nin: ["rechazado", "cancelado"] } }).lean()
+        : Promise.resolve([]),
+    ]);
+
+    const pagoIdMap = new Map(pagosPorId.map((p) => [String(p._id), p]));
+    const pagoUserMap = new Map(pagosPorUsername.map((p) => [String(p._id), p]));
+    const asistenciaMap = new Map();
+    for (const a of asistencias) {
+      const key = String(a.empleado);
+      asistenciaMap.set(key, (asistenciaMap.get(key) || 0) + minutosTrabajadosDesdeMarcas(a.marcas));
+    }
+    const objetivoMap = new Map(objetivos.map((o) => [String(o.empleadoId), o]));
+
+    const resultado = empleados.map((empleado) => {
+      const id = String(empleado._id);
+      const porId = pagoIdMap.get(id);
+      const porUser = pagoUserMap.get(empleado.username);
+      const recaudacion = Number(porId?.total || 0) + Number(porUser?.total || 0);
+      const cantidadPagos = Number(porId?.cantidad || 0) + Number(porUser?.cantidad || 0);
+      const objetivo = objetivoMap.get(id);
+      const horasMinutos = asistenciaMap.get(id) || 0;
+      const novedadesEmp = novedades.filter((n) => String(n.empleadoId) === id);
+      const esperados = minutosEsperadosHastaHoy(empleado, mes, novedadesEmp);
+      const adelantosEmp = adelantos.filter((a) => String(a.empleadoId) === id);
+      const montoAdelantos = adelantosEmp.reduce((sum, a) => sum + Number(a.monto || 0), 0);
+      const montoObjetivo = Number(objetivo?.montoObjetivo || 0);
+      return {
+        empleado,
+        recaudacion,
+        cantidadPagos,
+        objetivo: montoObjetivo,
+        porcentajeObjetivo: montoObjetivo > 0 ? Math.round((recaudacion / montoObjetivo) * 1000) / 10 : null,
+        llegoObjetivo: montoObjetivo > 0 ? recaudacion >= montoObjetivo : null,
+        minutosTrabajados: horasMinutos,
+        minutosEsperados: esperados,
+        porcentajeHoras: esperados > 0 ? Math.round((horasMinutos / esperados) * 1000) / 10 : null,
+        faltas: novedadesEmp.filter((n) => n.tipo === "falta").length,
+        faltasJustificadas: novedadesEmp.filter((n) => n.tipo === "falta-justificada").length,
+        llegadasTarde: novedadesEmp.filter((n) => n.tipo === "llegada-tarde").length,
+        apercibimientos: novedadesEmp.filter((n) => ["apercibimiento", "error-grave-gestion"].includes(n.tipo)).length,
+        licenciasMedicas: novedadesEmp.filter((n) => n.tipo === "licencia-medica").length,
+        cambiosHorario: novedadesEmp.filter((n) => n.tipo === "cambio-horario").length,
+        adelantosCantidad: puedeVerAdelantos ? adelantosEmp.length : null,
+        adelantosMonto: puedeVerAdelantos ? montoAdelantos : null,
+      };
+    });
+
+    return res.json({ mes, empleados: resultado });
+  } catch (error) {
+    console.error("RRHH resumen empleados:", error);
+    return res.status(500).json({ error: "No se pudo preparar el resumen de Recursos Humanos" });
+  }
+}

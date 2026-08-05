@@ -7,17 +7,70 @@ import ExcelJS from "exceljs";
 import { formatearFecha } from "../utils/formatearFecha.js";
 import path from "path";
 import { fileURLToPath } from "url";
-import mongoose from "mongoose"; // Asegurate de tener esto al inicio
+import mongoose from "mongoose";
+import {
+  canConfirmColchonPayments,
+  getColchonScope,
+  getColchonWriteLevel,
+  ROLES,
+} from "../config/roles.js";
+import { resolverEntidadCanonica } from "../utils/normalizacionNegocio.js";
+import { buscarPagosMesVigente } from "../services/vinculacionPagosService.js";
+import ReporteGestion from "../models/ReporteGestion.js";
+import { PAGOS_FUENTE_UNICA_ACTIVA } from "../config/features.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const esSuper = (req) => (req.user.role || req.user.rol) === "super-admin";
-const esAdmin = (req) => (req.user.role || req.user.rol) === "admin";
-const esOperadorVip = (req) =>
-  (req.user.role || req.user.rol) === "operador-vip";
-const esOperador = (req) => (req.user.role || req.user.rol) === "operador";
-const esOperativo = (req) => esOperador(req) || esOperadorVip(req); // propios
+const rolDe = (req) => req.user.role || req.user.rol;
+const esSuperAdmin = (req) => rolDe(req) === ROLES.SUPER_ADMIN;
+const ambitoColchon = (req) => getColchonScope(rolDe(req));
+const nivelEscrituraColchon = (req) => getColchonWriteLevel(rolDe(req));
+const tieneAccesoColchon = (req) => ambitoColchon(req) !== "none";
+const esAmbitoGlobal = (req) => ambitoColchon(req) === "all";
+const esAmbitoPropio = (req) => ambitoColchon(req) === "own";
+const puedeEditarTodo = (req) => nivelEscrituraColchon(req) === "full";
+const puedeEditarPropio = (req) => ["full", "own-full"].includes(nivelEscrituraColchon(req));
+const esSoloInformador = (req) => nivelEscrituraColchon(req) === "inform-only";
+const puedeConfirmarPagos = (req) => canConfirmColchonPayments(rolDe(req));
+const esDuenoCuota = (req, cuota) =>
+  String(cuota?.empleadoId?._id || cuota?.empleadoId) === String(req.user.id);
+const puedeLeerCuota = (req, cuota) =>
+  tieneAccesoColchon(req) && (esAmbitoGlobal(req) || esDuenoCuota(req, cuota));
+const puedeModificarCuota = (req, cuota) =>
+  puedeEditarTodo(req) || (nivelEscrituraColchon(req) === "own-full" && esDuenoCuota(req, cuota));
+
+// Compatibilidad temporal: mantiene el comportamiento anterior mientras el
+// interruptor de fuente única está apagado. La Etapa 4B reemplazará este
+// cálculo por conciliación automática contra la colección Pago.
+const aplicarPagoLegacyEnCuota = (cuota, { monto, fecha, registradoPor }) => {
+  cuota.pagos.push({
+    monto,
+    fecha,
+    origen: "manual",
+    registradoPor,
+  });
+
+  const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
+  cuota.estado = estadoBase;
+  actualizarDeudaPorMes(cuota);
+  cuota.saldoPendiente = (cuota.deudaPorMes || []).reduce(
+    (acc, d) => acc + (Number(d.montoAdeudado) || 0),
+    0
+  );
+  cuota.estado = "A cuota";
+
+  const cuotasAdeudadas =
+    Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
+      ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0).length
+      : (() => {
+          const imp = Number(cuota.importeCuota) || 0;
+          return imp > 0
+            ? Math.floor(Number(cuota.saldoPendiente || 0) / imp)
+            : 0;
+        })();
+  cuota.alertaDeuda = cuotasAdeudadas > 1;
+};
 
 const normalizarTurno = (value) => {
   const texto = String(value || "").trim().toLowerCase();
@@ -25,6 +78,105 @@ const normalizarTurno = (value) => {
   if (texto === "m" || texto === "tm" || texto.includes("mañana") || texto.includes("manana")) return "M";
   if (texto === "t" || texto === "tt" || texto.includes("tarde")) return "T";
   return "";
+};
+
+const claveFechaPago = (value) => {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(
+    date.getDate()
+  ).padStart(2, "0")}`;
+};
+
+const montoEnCentavos = (value) => Math.round(Number(value || 0) * 100);
+
+/**
+ * Un aviso de operador/cuotería nunca descuenta saldo por sí mismo. Solo cambia
+ * a "aplicado" cuando se puede enlazar de forma inequívoca con un Pago real de
+ * la misma cuota (la cuota ya garantiza DNI + entidad + subcesión).
+ */
+const conciliarPagosInformados = (pagosInformados = [], pagosReales = []) => {
+  const usados = new Set();
+  let cambio = false;
+
+  const reales = (pagosReales || []).map((pago) => ({
+    ...pago,
+    _claveId: String(pago?._id || pago?.idPago || ""),
+    _fecha: claveFechaPago(pago?.fechaPago || pago?.fecha),
+    _monto: montoEnCentavos(pago?.monto),
+  }));
+
+  const avisos = (pagosInformados || []).map((pago) => {
+    const actual = typeof pago?.toObject === "function" ? pago.toObject() : { ...pago };
+    const anterior = actual.estadoAplicacion || "pendiente";
+    const anteriorReal = String(actual.pagoRealId || "");
+
+    if (actual.erroneo) {
+      const next = {
+        ...actual,
+        estadoAplicacion: "descartado",
+        pagoRealId: null,
+        aplicadoEn: null,
+      };
+      cambio ||= anterior !== "descartado" || Boolean(anteriorReal);
+      return next;
+    }
+
+    const monto = montoEnCentavos(actual.monto);
+    const fecha = claveFechaPago(actual.fecha);
+    const vinculada = anteriorReal
+      ? reales.find((real) => real._claveId === anteriorReal && !usados.has(real._claveId))
+      : null;
+
+    let elegida = vinculada || null;
+    let estado = "pendiente";
+
+    if (!elegida) {
+      const candidatasMonto = reales.filter(
+        (real) => real._monto === monto && !usados.has(real._claveId)
+      );
+      const candidatasExactas = fecha
+        ? candidatasMonto.filter((real) => real._fecha === fecha)
+        : [];
+
+      if (candidatasExactas.length === 1) elegida = candidatasExactas[0];
+      else if (candidatasExactas.length > 1) estado = "requiere-revision";
+      else if (candidatasMonto.length === 1) elegida = candidatasMonto[0];
+      else if (candidatasMonto.length > 1) estado = "requiere-revision";
+    }
+
+    if (elegida) {
+      usados.add(elegida._claveId);
+      estado = "aplicado";
+    }
+
+    const nextRealId = elegida?._id || null;
+    const next = {
+      ...actual,
+      estadoAplicacion: estado,
+      pagoRealId: nextRealId,
+      aplicadoEn: estado === "aplicado" ? actual.aplicadoEn || new Date() : null,
+      visto: estado === "aplicado" ? true : Boolean(actual.visto),
+    };
+
+    cambio ||=
+      anterior !== estado ||
+      anteriorReal !== String(nextRealId || "") ||
+      (estado === "aplicado" && actual.visto !== true);
+    return next;
+  });
+
+  return {
+    pagosInformados: avisos,
+    cambio,
+    resumen: {
+      pendientes: avisos.filter((p) => p.estadoAplicacion === "pendiente").length,
+      aplicados: avisos.filter((p) => p.estadoAplicacion === "aplicado").length,
+      requiereRevision: avisos.filter((p) => p.estadoAplicacion === "requiere-revision").length,
+      descartados: avisos.filter((p) => p.estadoAplicacion === "descartado").length,
+    },
+  };
 };
 
 // 🔁 Calcula saldo pendiente priorizando deudaPorMes
@@ -59,9 +211,8 @@ export const actualizarEstadoCuota = (cuota) => {
 // Crear manual
 export const crearCuota = async (req, res) => {
   try {
-    const rol = req.user.role || req.user.rol;
-    if (rol !== "super-admin") {
-      return res.status(403).json({ error: "No autorizado" });
+    if (!puedeEditarPropio(req)) {
+      return res.status(403).json({ error: "No autorizado para crear cuotas" });
     }
 
     const {
@@ -116,6 +267,11 @@ export const crearCuota = async (req, res) => {
       return res.status(400).json({ error: "Subcesión inválida" });
     }
 
+    const entidadCanonica = await resolverEntidadCanonica({ entidadId });
+    if (!entidadCanonica) {
+      return res.status(400).json({ error: "Entidad no encontrada" });
+    }
+
     const idCuotaLogico = `${dniN}-${entidadId}-${subCesionId}`;
     const yaExiste = await Colchon.findOne({ idCuotaLogico });
     if (yaExiste) {
@@ -135,12 +291,13 @@ export const crearCuota = async (req, res) => {
       observacionesOperador: observacionesOperador || "",
       fiduciario,
       entidadId: new mongoose.Types.ObjectId(entidadId),
+      entidadNumero: entidadCanonica.entidadNumero,
       subCesionId: new mongoose.Types.ObjectId(subCesionId),
       turno: turnoNormalizado,
       telefono,
       pagos: pagos || [],
       vencimientoCuotas: { desde: vencimientoDesde, hasta: vencimientoHasta },
-      empleadoId: empleadoId || req.user.id,
+      empleadoId: puedeEditarTodo(req) ? empleadoId || req.user.id : req.user.id,
       idCuotaLogico,
       creado: new Date(),
       ultimaModificacion: new Date(),
@@ -186,46 +343,16 @@ export const editarCuota = async (req, res) => {
     const cuota = await Colchon.findById(req.params.id);
     if (!cuota) return res.status(404).json({ error: "Cuota no encontrada" });
 
-    // 👷 Operador / operador-vip: sólo observación + teléfono
-    if (esOperativo(req)) {
-      const { observacionesOperador, telefono } = req.body;
-      if (observacionesOperador !== undefined)
-        cuota.observacionesOperador = observacionesOperador;
-      if (telefono !== undefined) cuota.telefono = telefono;
-
-      // recalcular vistas (no cambia base)
-      const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
-      cuota.estado = estadoBase;
-      actualizarDeudaPorMes(cuota);
-
-      cuota.saldoPendiente = (cuota.deudaPorMes || []).reduce(
-        (acc, d) => acc + (Number(d.montoAdeudado) || 0),
-        0
-      );
-
-      if (Array.isArray(cuota.pagos) && cuota.pagos.length > 0) {
-        cuota.estado = "A cuota";
-      }
-
-      // 🟨 sólo si >1 cuota adeudada
-      const cuotasAdeudadas =
-        Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
-          ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0)
-              .length
-          : (() => {
-              const imp = Number(cuota.importeCuota) || 0;
-              return imp > 0
-                ? Math.floor(Number(cuota.saldoPendiente || 0) / imp)
-                : 0;
-            })();
-      cuota.alertaDeuda = cuotasAdeudadas > 1;
-
-      cuota.ultimaModificacion = new Date();
-      await cuota.save();
-      return res.json(cuota);
+    if (esSoloInformador(req)) {
+      return res.status(403).json({
+        error: "Este perfil solo puede informar pagos como observación.",
+      });
+    }
+    if (!puedeModificarCuota(req, cuota)) {
+      return res.status(403).json({ error: "No autorizado para editar esta cuota" });
     }
 
-    // 🛡️ Super-admin: actualización parcial
+    // Actualización parcial para perfiles con edición completa.
     const {
       cartera,
       dni,
@@ -248,7 +375,14 @@ export const editarCuota = async (req, res) => {
       telefono,
     } = req.body;
 
-    if (entidadId !== undefined) cuota.entidadId = entidadId;
+    if (entidadId !== undefined) {
+      const entidadCanonica = await resolverEntidadCanonica({ entidadId });
+      if (!entidadCanonica) {
+        return res.status(400).json({ error: "Entidad no encontrada" });
+      }
+      cuota.entidadId = entidadCanonica.entidadId;
+      cuota.entidadNumero = entidadCanonica.entidadNumero;
+    }
     if (subCesionId !== undefined) cuota.subCesionId = subCesionId;
 
     if (cartera !== undefined) cuota.cartera = cartera;
@@ -271,7 +405,7 @@ export const editarCuota = async (req, res) => {
     }
     if (telefono !== undefined) cuota.telefono = telefono;
     if (Array.isArray(pagos)) cuota.pagos = pagos;
-    if (empleadoId !== undefined) cuota.empleadoId = empleadoId;
+    if (empleadoId !== undefined && puedeEditarTodo(req)) cuota.empleadoId = empleadoId;
 
     if (vencimientoDesde !== undefined || vencimientoHasta !== undefined) {
       cuota.vencimientoCuotas = {
@@ -342,9 +476,8 @@ export const eliminarCuota = async (req, res) => {
     const cuota = await Colchon.findById(req.params.id);
     if (!cuota) return res.status(404).json({ error: "Cuota no encontrada" });
 
-    const rol = req.user.role || req.user.rol;
-    if (rol !== "super-admin") {
-      return res.status(403).json({ error: "No autorizado" });
+    if (!puedeModificarCuota(req, cuota)) {
+      return res.status(403).json({ error: "No autorizado para eliminar esta cuota" });
     }
 
     await cuota.deleteOne();
@@ -357,7 +490,7 @@ export const eliminarCuota = async (req, res) => {
 
 export const eliminarCuotasSeleccionadas = async (req, res) => {
   try {
-    if (!esSuper(req)) {
+    if (!esSuperAdmin(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -413,15 +546,13 @@ export const filtrarCuotas = async (req, res) => {
       conPagosNoVistos,
     } = req.query;
 
-    const rol = req.user.role || req.user.rol;
-
-    if (esAdmin(req)) {
+    if (!tieneAccesoColchon(req)) {
       return res.status(403).json({ error: "Sin acceso al módulo Colchón" });
     }
 
     const filtrosBase = [];
 
-    if (esOperativo(req)) {
+    if (esAmbitoPropio(req)) {
       filtrosBase.push({ empleadoId: toObjId(req.user.id) });
     } else if (usuarioId) {
       filtrosBase.push({ empleadoId: toObjId(usuarioId) });
@@ -475,22 +606,10 @@ export const filtrarCuotas = async (req, res) => {
     const derivedStages = [
       {
         $addFields: {
-          estadoFinal: {
-            $cond: [
-              { $gt: [{ $size: { $ifNull: ["$pagos", []] } }, 0] },
-              "A cuota",
-              { $ifNull: ["$estadoOriginal", "$estado"] },
-            ],
-          },
-          pagadoTotal: {
-            $sum: {
-              $map: {
-                input: { $ifNull: ["$pagos", []] },
-                as: "pago",
-                in: { $ifNull: ["$$pago.monto", 0] },
-              },
-            },
-          },
+          // El estado y el total válido se terminan de calcular contra Pago,
+          // no contra registros manuales/históricos del Colchón.
+          estadoFinal: { $ifNull: ["$estadoOriginal", "$estado"] },
+          pagadoTotal: 0,
         },
       },
     ];
@@ -602,12 +721,11 @@ export const filtrarCuotas = async (req, res) => {
       },
     ];
 
-    const filtroGeneral =
-      rol === "operador" || rol === "operador-vip"
-        ? { empleadoId: toObjId(req.user.id) }
-        : usuarioId
-        ? { empleadoId: toObjId(usuarioId) }
-        : {};
+    const filtroGeneral = esAmbitoPropio(req)
+      ? { empleadoId: toObjId(req.user.id) }
+      : usuarioId
+      ? { empleadoId: toObjId(usuarioId) }
+      : {};
 
     const [conteoRes, resultadosAgg, totalGeneral] = await Promise.all([
       Colchon.aggregate(pipelineConteo).allowDiskUse(true),
@@ -616,21 +734,98 @@ export const filtrarCuotas = async (req, res) => {
     ]);
 
     const totalFiltrado = conteoRes?.[0]?.count || 0;
-    const resultados = resultadosAgg.map((cuota) => {
+    const actualizacionesConciliacion = [];
+    const resultados = await Promise.all(resultadosAgg.map(async (cuota) => {
+      let pagosReales = [];
+      let totalPagadoReal = 0;
+      let estadoVinculacionPagos = "sin-pagos";
+      try {
+        const entidadNumero = Number(cuota?.entidadId?.numero || 0);
+        const conciliacion = await buscarPagosMesVigente({
+          dni: cuota.dni,
+          entidadNumero,
+          subCesionId: cuota?.subCesionId?._id,
+        });
+        estadoVinculacionPagos = conciliacion?.estadoVinculacion || "sin-pagos";
+        if (estadoVinculacionPagos !== "requiere-revision") {
+          const pagosValidosMes = [
+            ...(Array.isArray(conciliacion?.pagosAplicables) ? conciliacion.pagosAplicables : []),
+            ...(Array.isArray(conciliacion?.pagosMismoDia) ? conciliacion.pagosMismoDia : []),
+          ];
+          pagosReales = pagosValidosMes.map((pago) => ({
+            _id: pago._id,
+            idPago: pago.idPago,
+            monto: Number(pago.monto || 0),
+            fecha: pago.fechaPago || pago.fecha || null,
+            fechaPago: pago.fechaPago || null,
+            operadorUsername: pago.operadorUsername || "",
+            origen: "pagos",
+          }));
+          totalPagadoReal =
+            Number(conciliacion.totalAplicable || 0) +
+            Number(conciliacion.totalMismoDia || 0);
+        }
+      } catch (error) {
+        console.warn("⚠️ No se pudo validar un pago de Colchón contra Cobrina:", error?.message);
+        estadoVinculacionPagos = "error-validacion";
+      }
+
+      const conciliacionAvisos = conciliarPagosInformados(
+        cuota.pagosInformados || [],
+        pagosReales
+      );
+      if (conciliacionAvisos.cambio) {
+        actualizacionesConciliacion.push({
+          updateOne: {
+            filter: { _id: cuota._id },
+            update: {
+              $set: {
+                pagosInformados: conciliacionAvisos.pagosInformados,
+                ultimaModificacion: new Date(),
+              },
+            },
+          },
+        });
+      }
+
+      const saldoAjustado = Math.max(0, Number(cuota.saldoPendiente || 0) - totalPagadoReal);
+      const estadoAjustado = totalPagadoReal > 0
+        ? "A cuota"
+        : (cuota.estadoOriginal || cuota.estado || "");
       const cuotasAdeudadas =
         Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
           ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0).length
           : (() => {
               const imp = Number(cuota.importeCuota) || 0;
-              const saldo = Number(cuota.saldoPendiente) || 0;
+              const saldo = saldoAjustado;
               return imp > 0 ? Math.floor(saldo / imp) : 0;
             })();
 
       return {
         ...cuota,
-        alertaDeuda: cuota.estado === "A cuota" && cuotasAdeudadas > 1,
+        pagos: pagosReales,
+        pagosHistoricosInformativos: Array.isArray(cuota.pagos) ? cuota.pagos : [],
+        pagosInformados: conciliacionAvisos.pagosInformados,
+        resumenPagosInformados: conciliacionAvisos.resumen,
+        pagadoTotal: totalPagadoReal,
+        saldoPendiente: saldoAjustado,
+        estado: estadoAjustado,
+        pagoValidadoCobrina: totalPagadoReal > 0,
+        estadoVinculacionPagos,
+        fuentePagoValido: "pagos-cobrina",
+        pagosOperadorModificanSaldo: false,
+        alertaDeuda: estadoAjustado === "A cuota" && cuotasAdeudadas > 1,
       };
-    });
+    }));
+
+    if (actualizacionesConciliacion.length) {
+      try {
+        await Colchon.bulkWrite(actualizacionesConciliacion, { ordered: false });
+      } catch (error) {
+        // La lectura sigue siendo válida aunque falle la persistencia del enlace.
+        console.warn("⚠️ No se pudo guardar toda la conciliación de avisos de Colchón:", error?.message);
+      }
+    }
 
     return res.json({
       resultados,
@@ -649,7 +844,7 @@ export const filtrarCuotas = async (req, res) => {
 
 // Importar desde Excel
 export const importarExcel = async (req, res) => {
-  if (!esSuper(req)) return res.status(403).json({ error: "No autorizado" });
+  if (!esSuperAdmin(req)) return res.status(403).json({ error: "No autorizado" });
   try {
     if (!req.file)
       return res.status(400).json({ error: "No se recibió archivo" });
@@ -817,6 +1012,7 @@ export const importarExcel = async (req, res) => {
         if (existente) {
           Object.assign(existente, {
             entidadId: fila.entidad._id,
+            entidadNumero: Number(fila.entidad.numero),
             dni: fila.dni,
             nombre: fila.nombre,
             empleadoId: fila.empleadoId,
@@ -862,6 +1058,7 @@ export const importarExcel = async (req, res) => {
         } else {
           const nueva = new Colchon({
             entidadId: fila.entidad._id,
+            entidadNumero: Number(fila.entidad.numero),
             dni: fila.dni,
             nombre: fila.nombre,
             empleadoId: fila.empleadoId,
@@ -964,12 +1161,12 @@ export const exportarExcel = async (req, res) => {
       conPagosNoVistos,
     } = req.query;
 
-    if (esAdmin(req)) {
+    if (!tieneAccesoColchon(req)) {
       return res.status(403).json({ error: "Sin acceso a exportación" });
     }
 
     const filtros = [];
-    if (esOperativo(req)) {
+    if (esAmbitoPropio(req)) {
       filtros.push({ empleadoId: req.user.id });
     } else if (usuarioId) {
       filtros.push({ empleadoId: usuarioId });
@@ -1176,73 +1373,64 @@ export const obtenerCarterasUnicas = async (req, res) => {
 };
 
 export const agregarPago = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { monto, fecha } = req.body;
+  if (PAGOS_FUENTE_UNICA_ACTIVA) {
+    return res.status(409).json({
+      error:
+        "Los pagos reales se cargan únicamente en el módulo Pagos. En Colchón solo se puede informar un pago pendiente de aplicación.",
+      codigo: "PAGOS_FUENTE_UNICA",
+    });
+  }
 
-    const montoNum = Number(monto);
+  try {
+    if (!puedeConfirmarPagos(req)) {
+      return res.status(403).json({ error: "No autorizado para registrar pagos reales" });
+    }
+    const { id } = req.params;
+    const montoNum = Number(req.body.monto);
+    const fechaObj = new Date(req.body.fecha);
     if (!Number.isFinite(montoNum) || montoNum <= 0) {
       return res.status(400).json({ error: "Monto inválido (debe ser > 0)." });
     }
-
-    const fechaObj = new Date(fecha);
-    if (isNaN(fechaObj.getTime())) {
+    if (Number.isNaN(fechaObj.getTime())) {
       return res.status(400).json({ error: "Fecha inválida." });
     }
 
     const cuota = await Colchon.findById(id);
     if (!cuota) return res.status(404).json({ error: "Cuota no encontrada" });
 
-    // 💸 Pago real
-    cuota.pagos.push({
+    aplicarPagoLegacyEnCuota(cuota, {
       monto: montoNum,
       fecha: fechaObj,
-      origen: "manual",
       registradoPor: req.user.id,
     });
-
-    // 🔄 Recalcular respetando el estado base
-    const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
-    cuota.estado = estadoBase;
-    actualizarDeudaPorMes(cuota);
-
-    // saldo
-    cuota.saldoPendiente = (cuota.deudaPorMes || []).reduce(
-      (acc, d) => acc + (Number(d.montoAdeudado) || 0),
-      0
-    );
-
-    // visible: si hay pagos reales, queda "A cuota"
-    cuota.estado = "A cuota";
-
-    // 🟨 Amarillo sólo si > 1 cuota adeudada (inline, sin helpers)
-    const cuotasAdeudadas =
-      Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
-        ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0)
-            .length
-        : (() => {
-            const imp = Number(cuota.importeCuota) || 0;
-            return imp > 0
-              ? Math.floor(Number(cuota.saldoPendiente || 0) / imp)
-              : 0;
-          })();
-    cuota.alertaDeuda = cuotasAdeudadas > 1;
-
     cuota.ultimaModificacion = new Date();
     await cuota.save();
-
     await cuota.populate([
       { path: "empleadoId", select: "username _id" },
-      { path: "entidadId", select: "nombre _id" },
+      { path: "entidadId", select: "nombre numero _id" },
       { path: "subCesionId", select: "nombre _id" },
       { path: "pagosInformados.operadorId", select: "username _id" },
     ]);
-
-    res.json({ mensaje: "Pago agregado correctamente", cuota });
+    return res.json({
+      mensaje: "Pago agregado con el modo compatible anterior",
+      modoCompatibilidad: true,
+      cuota,
+    });
   } catch (error) {
     console.error("❌ Error al agregar pago:", error);
-    res.status(500).json({ error: "Error al agregar pago" });
+    return res.status(500).json({ error: "Error al agregar pago" });
   }
+};
+
+export const rechazarImportacionPagosColchon = async (req, res) => {
+  if (!PAGOS_FUENTE_UNICA_ACTIVA) {
+    return importarPagosDesdeExcel(req, res);
+  }
+  return res.status(409).json({
+    error:
+      "La importación de pagos dentro de Colchón fue deshabilitada. Cargá el archivo en el módulo Pagos para que sea la única fuente de dinero real.",
+    codigo: "PAGOS_FUENTE_UNICA",
+  });
 };
 
 export const informarPago = async (req, res) => {
@@ -1260,64 +1448,51 @@ export const informarPago = async (req, res) => {
       return res.status(400).json({ error: "Fecha inválida." });
     }
 
-    const rol = req.user.role || req.user.rol;
-    const userId = req.user.id;
-
     const cuota = await Colchon.findById(id);
     if (!cuota) return res.status(404).json({ error: "Cuota no encontrada" });
 
-    if (rol === "super-admin") {
-      // 💸 Impacto real
-      cuota.pagos.push({
+    if (!puedeLeerCuota(req, cuota) || !tieneAccesoColchon(req)) {
+      return res.status(403).json({ error: "No autorizado para informar sobre esta cuota" });
+    }
+
+    if (!PAGOS_FUENTE_UNICA_ACTIVA && puedeConfirmarPagos(req)) {
+      aplicarPagoLegacyEnCuota(cuota, {
         monto: montoNum,
         fecha: fechaObj,
-        origen: "manual",
         registradoPor: req.user.id,
       });
-
-      const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
-      cuota.estado = estadoBase;
-      actualizarDeudaPorMes(cuota);
-
-      cuota.saldoPendiente = (cuota.deudaPorMes || []).reduce(
-        (acc, d) => acc + (Number(d.montoAdeudado) || 0),
-        0
-      );
-
-      // visible: con pagos → "A cuota"
-      cuota.estado = "A cuota";
-
-      // 🟨 sólo si >1 cuota adeudada
-      const cuotasAdeudadas =
-        Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
-          ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0)
-              .length
-          : (() => {
-              const imp = Number(cuota.importeCuota) || 0;
-              return imp > 0
-                ? Math.floor(Number(cuota.saldoPendiente || 0) / imp)
-                : 0;
-            })();
-      cuota.alertaDeuda = cuotasAdeudadas > 1;
-    } else if (rol === "operador" || rol === "operador-vip") {
-      // 📝 Sólo informativo
-      cuota.pagosInformados.push({
-        monto: montoNum,
-        fecha: fechaObj,
-        visto: false,
-        erroneo: false,
-        operadorId: userId,
+      cuota.ultimaModificacion = new Date();
+      await cuota.save();
+      await cuota.populate("pagosInformados.operadorId", "username _id");
+      return res.json({
+        mensaje: "Pago registrado con el modo compatible anterior",
+        modificaSaldo: true,
+        modoCompatibilidad: true,
+        cuota,
       });
-    } else {
-      return res.status(403).json({ error: "No autorizado" });
     }
+
+    // Con fuente única activa, o para perfiles que solo informan, la carga es
+    // una observación pendiente y nunca modifica saldo ni deudaPorMes.
+    cuota.pagosInformados.push({
+      monto: montoNum,
+      fecha: fechaObj,
+      visto: false,
+      erroneo: false,
+      operadorId: req.user.id,
+      estadoAplicacion: "pendiente",
+    });
 
     cuota.ultimaModificacion = new Date();
     await cuota.save();
-
     await cuota.populate("pagosInformados.operadorId", "username _id");
 
-    res.json({ mensaje: "Pago informado correctamente", cuota });
+    return res.json({
+      mensaje: "Pago informado como pendiente de aplicación. Se aplicará únicamente cuando figure en el módulo Pagos.",
+      modificaSaldo: false,
+      modoFuenteUnica: PAGOS_FUENTE_UNICA_ACTIVA,
+      cuota,
+    });
   } catch (error) {
     console.error("❌ Error al informar pago:", error);
     res.status(500).json({ error: "Error al informar pago" });
@@ -1326,64 +1501,32 @@ export const informarPago = async (req, res) => {
 
 export const marcarPagoInformadoComoVisto = async (req, res) => {
   try {
-    const rol = req.user.role || req.user.rol;
-    if (rol !== "super-admin") {
+    if (!puedeConfirmarPagos(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
-
     const { id, pagoId } = req.params;
     const cuota = await Colchon.findById(id);
     if (!cuota) return res.status(404).json({ error: "Cuota no encontrada" });
-
     const pagoInformado = cuota.pagosInformados.id(pagoId);
-    if (!pagoInformado) {
-      return res.status(404).json({ error: "Pago informado no encontrado" });
-    }
+    if (!pagoInformado) return res.status(404).json({ error: "Pago informado no encontrado" });
 
     pagoInformado.visto = true;
     cuota.ultimaModificacion = new Date();
-
-    const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
-    cuota.estado = estadoBase;
-    actualizarDeudaPorMes(cuota);
-
-    cuota.saldoPendiente = (cuota.deudaPorMes || []).reduce(
-      (acc, d) => acc + (d.montoAdeudado || 0),
-      0
-    );
-
-    if (cuota.pagos?.length > 0) {
-      cuota.estado = "A cuota";
-    } else {
-      cuota.estado = estadoBase;
-    }
-
-    const cuotasAdeudadas =
-      Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
-        ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0)
-            .length
-        : (() => {
-            const imp = Number(cuota.importeCuota) || 0;
-            return imp > 0
-              ? Math.floor(Number(cuota.saldoPendiente || 0) / imp)
-              : 0;
-          })();
-    cuota.alertaDeuda = cuotasAdeudadas > 1;
-
     await cuota.save();
-
-    res.json({ message: "Pago marcado como visto correctamente." });
+    return res.json({
+      ok: true,
+      message: "Pago revisado. Continúa pendiente hasta aparecer en el módulo Pagos.",
+      modificaSaldo: false,
+    });
   } catch (error) {
-    console.error("❌ Error al marcar pago informado como visto:", error);
-    res.status(500).json({ error: "Error al confirmar pago informado" });
+    console.error("❌ Error al revisar pago informado:", error);
+    return res.status(500).json({ error: "Error al revisar pago informado" });
   }
 };
 
-// ➕ Incluye subCesionId (y nombre) para dar contexto al admin
 export const obtenerPagosInformadosPendientes = async (req, res) => {
   try {
-    const rol = req.user.role || req.user.rol;
-    if (rol !== "super-admin") {
+    if (!puedeConfirmarPagos(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -1499,12 +1642,16 @@ export const marcarPagoComoErroneo = async (req, res) => {
     const colchon = await Colchon.findById(id);
     if (!colchon) return res.status(404).json({ error: "Cuota no encontrada" });
 
+    if (!puedeLeerCuota(req, colchon)) {
+      return res.status(403).json({ error: "No autorizado" });
+    }
+
     const pago = colchon.pagosInformados.id(pagoId);
     if (!pago)
       return res.status(404).json({ error: "Pago informado no encontrado" });
 
-    // Solo el operador que lo informó puede marcarlo como erróneo
-    if (esOperativo(req) && pago.operadorId.toString() !== req.user.id) {
+    const esAutor = String(pago.operadorId) === String(req.user.id);
+    if (!puedeConfirmarPagos(req) && !esAutor) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -1522,50 +1669,26 @@ export const marcarPagoComoErroneo = async (req, res) => {
 // ✅ Marcar pago informado como visto
 export const marcarPagoComoVisto = async (req, res) => {
   const { id, pagoId } = req.params;
-
   try {
-    const colchon = await Colchon.findById(id);
-    if (!colchon) return res.status(404).json({ error: "Cuota no encontrada" });
-
-    const pago = colchon.pagosInformados.id(pagoId);
-    if (!pago)
-      return res.status(404).json({ error: "Pago informado no encontrado" });
-
-    // Solo  super-admin puede marcar como visto
-    if (!["super-admin"].includes(req.user.role || req.user.rol)) {
+    if (!puedeConfirmarPagos(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
+    const colchon = await Colchon.findById(id);
+    if (!colchon) return res.status(404).json({ error: "Cuota no encontrada" });
+    const pago = colchon.pagosInformados.id(pagoId);
+    if (!pago) return res.status(404).json({ error: "Pago informado no encontrado" });
 
-    // ✅ Marcar como visto
     pago.visto = true;
     colchon.ultimaModificacion = new Date();
-
-    // ✅ Recalcular estado visual completo
-    const estadoBase = colchon.estadoOriginal || colchon.estado;
-    colchon.estado = estadoBase;
-
-    actualizarDeudaPorMes(colchon);
-
-    colchon.saldoPendiente = colchon.deudaPorMes.reduce(
-      (acc, d) => acc + (d.montoAdeudado || 0),
-      0
-    );
-
-    if (colchon.pagos?.length > 0) {
-      colchon.estado = "A cuota";
-    } else {
-      colchon.estado = estadoBase;
-    }
-
-    colchon.alertaDeuda =
-      colchon.estado === "A cuota" && colchon.saldoPendiente > 0;
-
     await colchon.save();
-
-    res.json({ ok: true });
+    return res.json({
+      ok: true,
+      message: "Pago revisado sin modificar el saldo.",
+      modificaSaldo: false,
+    });
   } catch (error) {
-    console.error("❌ Error al marcar pago como visto:", error);
-    res.status(500).json({ error: "Error interno del servidor" });
+    console.error("❌ Error al revisar pago informado:", error);
+    return res.status(500).json({ error: "Error interno del servidor" });
   }
 };
 
@@ -1576,17 +1699,16 @@ export const eliminarPagoInformado = async (req, res) => {
     const colchon = await Colchon.findById(id);
     if (!colchon) return res.status(404).json({ error: "Cuota no encontrada" });
 
+    if (!puedeLeerCuota(req, colchon)) {
+      return res.status(403).json({ error: "No autorizado" });
+    }
+
     const pago = colchon.pagosInformados.id(pagoId);
     if (!pago)
       return res.status(404).json({ error: "Pago informado no encontrado" });
 
-    // Solo el operador que lo informó y que NO fue visto
-    if (
-      !esSuper(req) &&
-      (!esOperativo(req) ||
-        pago.operadorId.toString() !== req.user.id ||
-        pago.visto)
-    ) {
+    const esAutor = String(pago.operadorId) === String(req.user.id);
+    if (!puedeConfirmarPagos(req) && (!esAutor || pago.visto)) {
       return res.status(403).json({ error: "No autorizado para eliminar" });
     }
 
@@ -1604,56 +1726,46 @@ export const eliminarPagoInformado = async (req, res) => {
 };
 
 export const eliminarPagoReal = async (req, res) => {
-  const { cuotaId, pagoId } = req.params;
+  if (PAGOS_FUENTE_UNICA_ACTIVA) {
+    return res.status(409).json({
+      error:
+        "Los pagos históricos del Colchón quedaron bloqueados. Las correcciones de dinero real deben realizarse en el módulo Pagos.",
+      codigo: "PAGOS_FUENTE_UNICA",
+    });
+  }
 
+  const { cuotaId, pagoId } = req.params;
   try {
-    const rol = req.user.role || req.user.rol;
-    if (rol !== "super-admin") {
+    if (!puedeConfirmarPagos(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
-
     const cuota = await Colchon.findById(cuotaId);
     if (!cuota) return res.status(404).json({ error: "Cuota no encontrada" });
-
-    const index = cuota.pagos.findIndex((p) => p._id.toString() === pagoId);
-    if (index === -1) {
-      return res.status(404).json({ error: "Pago no encontrado" });
-    }
+    const index = cuota.pagos.findIndex((p) => String(p._id) === String(pagoId));
+    if (index === -1) return res.status(404).json({ error: "Pago no encontrado" });
 
     cuota.pagos.splice(index, 1);
     cuota.ultimaModificacion = new Date();
-
     const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
     cuota.estado = estadoBase;
     actualizarDeudaPorMes(cuota);
-
     cuota.saldoPendiente = (cuota.deudaPorMes || []).reduce(
-      (acc, d) => acc + (d.montoAdeudado || 0),
+      (acc, d) => acc + Number(d.montoAdeudado || 0),
       0
     );
-
-    if (cuota.pagos.length > 0) {
-      cuota.estado = "A cuota";
-    } else {
-      cuota.estado = estadoBase;
-    }
-
+    cuota.estado = cuota.pagos.length > 0 ? "A cuota" : estadoBase;
     const imp = Number(cuota.importeCuota) || 0;
-    const cuotasAdeudadas =
-      Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
-        ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0)
-            .length
-        : imp > 0
-        ? Math.floor(Number(cuota.saldoPendiente || 0) / imp)
-        : 0;
+    const cuotasAdeudadas = Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
+      ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0).length
+      : imp > 0
+      ? Math.floor(Number(cuota.saldoPendiente || 0) / imp)
+      : 0;
     cuota.alertaDeuda = cuotasAdeudadas > 1;
-
     await cuota.save();
-
-    res.json({ message: "Pago eliminado correctamente", cuota });
+    return res.json({ message: "Pago eliminado con el modo compatible anterior", cuota });
   } catch (error) {
     console.error("❌ Error al eliminar pago real:", error);
-    res.status(500).json({ error: "Error al eliminar pago real" });
+    return res.status(500).json({ error: "Error al eliminar pago real" });
   }
 };
 
@@ -1711,13 +1823,6 @@ export const descargarModeloColchon = async (req, res) => {
 
 export const limpiarCuota = async (req, res) => {
   try {
-    const rol = req.user.role || req.user.rol;
-    if (rol !== "super-admin") {
-      return res
-        .status(403)
-        .json({ error: "No autorizado para limpiar cuotas" });
-    }
-
     const { id } = req.params;
     const tipo = String(
       req.query.tipo || req.body?.tipo || "todo"
@@ -1725,33 +1830,34 @@ export const limpiarCuota = async (req, res) => {
 
     const cuota = await Colchon.findById(id);
     if (!cuota) return res.status(404).json({ error: "Cuota no encontrada" });
-
-    const estadoBase = cuota.estadoOriginal || cuota.estado;
+    if (!puedeModificarCuota(req, cuota)) {
+      return res.status(403).json({ error: "No autorizado para limpiar esta cuota" });
+    }
 
     if (tipo === "pagos" || tipo === "todo") {
-      cuota.pagos = [];
-      cuota.pagosInformados = [];
-
-      cuota.estado = estadoBase;
-      actualizarDeudaPorMes(cuota);
-
-      cuota.saldoPendiente = (cuota.deudaPorMes || []).reduce(
-        (acc, d) => acc + (d.montoAdeudado || 0),
-        0
-      );
-
-      // visible: sin pagos → vuelve a base
-      cuota.estado = estadoBase;
-
-      const imp = Number(cuota.importeCuota) || 0;
-      const cuotasAdeudadas =
-        Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
-          ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0)
-              .length
+      if (PAGOS_FUENTE_UNICA_ACTIVA) {
+        // En modo fuente única se preserva el historial real y solo se limpian avisos.
+        cuota.pagosInformados = [];
+      } else {
+        // Compatibilidad con la versión anterior hasta completar la Etapa 4B.
+        const estadoBase = cuota.estadoOriginal || cuota.estado;
+        cuota.pagos = [];
+        cuota.pagosInformados = [];
+        cuota.estado = estadoBase;
+        actualizarDeudaPorMes(cuota);
+        cuota.saldoPendiente = (cuota.deudaPorMes || []).reduce(
+          (acc, d) => acc + Number(d.montoAdeudado || 0),
+          0
+        );
+        cuota.estado = estadoBase;
+        const imp = Number(cuota.importeCuota) || 0;
+        const cuotasAdeudadas = Array.isArray(cuota.deudaPorMes) && cuota.deudaPorMes.length
+          ? cuota.deudaPorMes.filter((m) => Number(m.montoAdeudado || 0) > 0).length
           : imp > 0
           ? Math.floor(Number(cuota.saldoPendiente || 0) / imp)
           : 0;
-      cuota.alertaDeuda = cuotasAdeudadas > 1;
+        cuota.alertaDeuda = cuotasAdeudadas > 1;
+      }
     }
 
     if (tipo === "observaciones" || tipo === "todo") {
@@ -1766,10 +1872,14 @@ export const limpiarCuota = async (req, res) => {
       ok: true,
       message:
         tipo === "pagos"
-          ? "Pagos limpiados"
+          ? PAGOS_FUENTE_UNICA_ACTIVA
+            ? "Pagos informados limpiados; el historial real fue preservado"
+            : "Pagos limpiados con el modo compatible anterior"
           : tipo === "observaciones"
           ? "Observaciones limpiadas"
-          : "Pagos y observaciones limpiados",
+          : PAGOS_FUENTE_UNICA_ACTIVA
+          ? "Pagos informados y observaciones limpiados; el historial real fue preservado"
+          : "Pagos y observaciones limpiados con el modo compatible anterior",
     });
   } catch (error) {
     console.error("❌ Error al limpiar cuota:", error);
@@ -1779,8 +1889,7 @@ export const limpiarCuota = async (req, res) => {
 
 export const importarPagosDesdeExcel = async (req, res) => {
   try {
-    const rol = req.user.role || req.user.rol;
-    if (rol !== "super-admin") {
+    if (!esSuperAdmin(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -2080,16 +2189,14 @@ export const descargarModeloPagos = async (req, res) => {
 // 📤 Exportar todos los pagos a Excel (incluye subcesión)
 export const exportarPagos = async (req, res) => {
   try {
-    const rol = req.user.role || req.user.rol;
     const usuarioId = req.user.id;
 
-    // Si es operador, solo ve sus cuotas
-    const filtro = { "pagos.0": { $exists: true } }; // hay al menos 1 pago
+    const filtro = { "pagos.0": { $exists: true } };
 
-    if (esAdmin(req)) {
+    if (!tieneAccesoColchon(req)) {
       return res.status(403).json({ error: "Sin acceso a exportación" });
     }
-    if (esOperativo(req)) {
+    if (esAmbitoPropio(req)) {
       filtro["empleadoId"] = usuarioId;
     }
 
@@ -2153,7 +2260,7 @@ export const exportarPagos = async (req, res) => {
 // Eliminar todas las cuotas del colchón
 export const eliminarTodasLasCuotas = async (req, res) => {
   try {
-    if (!esSuper(req)) return res.status(403).json({ error: "No autorizado" });
+    if (!esSuperAdmin(req)) return res.status(403).json({ error: "No autorizado" });
     await Colchon.deleteMany({});
     res.json({ mensaje: "Todas las cuotas fueron eliminadas correctamente" });
   } catch (error) {
@@ -2188,10 +2295,10 @@ export const obtenerEstadisticasColchon = async (req, res) => {
 
     const filtrosBase = [];
 
-    if (esAdmin(req)) {
+    if (!tieneAccesoColchon(req)) {
       return res.status(403).json({ error: "Sin acceso a estadísticas" });
     }
-    if (!esSuper(req)) {
+    if (esAmbitoPropio(req)) {
       filtrosBase.push({ empleadoId: req.user.id });
     } else if (usuarioId) {
       filtrosBase.push({ empleadoId: usuarioId });
@@ -2609,14 +2716,7 @@ export const getCuotaPorId = async (req, res) => {
       return res.status(404).json({ error: "Cuota no encontrada" });
     }
 
-    // Autorización de lectura
-    if (esAdmin(req)) {
-      return res.status(403).json({ error: "Sin acceso al módulo Colchón" });
-    }
-    if (
-      esOperativo(req) &&
-      String(cuota.empleadoId?._id || cuota.empleadoId) !== String(req.user.id)
-    ) {
+    if (!puedeLeerCuota(req, cuota)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -2629,13 +2729,15 @@ export const getCuotaPorId = async (req, res) => {
 
 export const registrarGestionCuota = async (req, res) => {
   try {
-    if (!esSuper(req)) return res.status(403).json({ error: "No autorizado" });
     const cuotaId = req.params.id;
     const usuario = req.user;
 
     const cuota = await Colchon.findById(cuotaId);
     if (!cuota) {
       return res.status(404).json({ error: "Cuota no encontrada" });
+    }
+    if (!puedeModificarCuota(req, cuota)) {
+      return res.status(403).json({ error: "No autorizado para registrar gestión" });
     }
 
     // ✅ Si no tiene vecesTocada aún, inicializalo en 0
@@ -2647,7 +2749,7 @@ export const registrarGestionCuota = async (req, res) => {
     cuota.ultimaGestion = new Date();
 
     // ✅ Asignar solo si es operador y no tiene aún
-    if (!cuota.empleadoId && (usuario.role || usuario.rol) === "operador") {
+    if (!cuota.empleadoId && !esAmbitoGlobal(req)) {
       cuota.empleadoId = usuario.id;
     }
 
@@ -2657,5 +2759,67 @@ export const registrarGestionCuota = async (req, res) => {
   } catch (error) {
     console.error("❌ Error al registrar gestión:", error);
     res.status(500).json({ error: "Error al registrar gestión" });
+  }
+};
+
+/**
+ * Validación del mes vigente contra el módulo Pago. Es la única fuente que
+ * se imputa en el saldo mostrado; cuotera y operadores quedan informativos.
+ */
+export const obtenerConciliacionPagosCuota = async (req, res) => {
+  try {
+    const cuota = await Colchon.findById(req.params.id)
+      .populate("entidadId", "numero nombre")
+      .lean();
+    if (!cuota) return res.status(404).json({ error: "Cuota no encontrada" });
+    if (!puedeLeerCuota(req, cuota)) {
+      return res.status(403).json({ error: "No autorizado para consultar esta cuota" });
+    }
+
+    const entidadNumero = Number(cuota.entidadNumero) || Number(cuota.entidadId?.numero);
+    const conciliacion = await buscarPagosMesVigente({
+      dni: cuota.dni,
+      entidadNumero,
+      subCesionId: cuota.subCesionId,
+    });
+
+    const filtroUltimaGestion = {
+      dni: String(cuota.dni || "").replace(/\D/g, ""),
+      borrado: { $ne: true },
+      $or: [
+        { entidadNumero },
+        ...(cuota.entidadId?.nombre ? [{ entidad: String(cuota.entidadId.nombre).toUpperCase() }] : []),
+      ],
+    };
+    const ultimaGestion = await ReporteGestion.findOne(filtroUltimaGestion)
+      .sort({ fecha: -1, hora: -1, createdAt: -1 })
+      .select("fecha hora usuario resultadoGestion estadoCuenta entidad entidadNumero")
+      .lean();
+
+    return res.json({
+      ok: true,
+      modo: "validacion-cobrina",
+      modificaSaldosPersistidos: false,
+      aplicaEnSaldoMostrado: true,
+      cuotaId: cuota._id,
+      saldoHistoricoActual: cuota.saldoPendiente,
+      pagosHistoricosColchon: Array.isArray(cuota.pagos) ? cuota.pagos.length : 0,
+      pagosInformadosPendientes: (cuota.pagosInformados || []).filter(
+        (p) => !p.erroneo && (p.estadoAplicacion || "pendiente") === "pendiente"
+      ).length,
+      ultimaGestion: ultimaGestion
+        ? {
+            fecha: ultimaGestion.fecha,
+            hora: ultimaGestion.hora,
+            usuario: ultimaGestion.usuario,
+            resultadoGestion: ultimaGestion.resultadoGestion,
+            estadoCuenta: ultimaGestion.estadoCuenta,
+          }
+        : null,
+      ...conciliacion,
+    });
+  } catch (error) {
+    console.error("❌ Error conciliando pagos del Colchón:", error);
+    return res.status(500).json({ error: "No se pudo conciliar la cuota con Pagos" });
   }
 };

@@ -19,9 +19,14 @@ import stickiesRoutes from "./routes/stickiesRoutes.js";
 import reportesGestionesRoutes from "./routes/reportesGestiones.js";
 import auditoriasRoutes from "./routes/auditorias.js";
 import asistenciaRoutes from "./routes/asistenciaRoutes.js";
-import { procesarCierresAutomaticos } from "./controllers/asistenciaController.js";
 import agendaRoutes from "./routes/agendaRoutes.js";
+import pagosRoutes from "./routes/pagosRoutes.js";
+import acuerdosPagoRoutes from "./routes/acuerdosPagoRoutes.js";
 import tipsRoutes from "./routes/tipsRoutes.js";
+import rrhhRoutes from "./routes/rrhhRoutes.js";
+import poderBiaRoutes from "./routes/poderBiaRoutes.js";
+import supervisionRoutes from "./routes/supervisionRoutes.js";
+import { procesarCierresAutomaticos } from "./controllers/asistenciaController.js";
 
 dotenv.config();
 
@@ -33,6 +38,7 @@ if (missingEnv.length) {
 }
 
 const app = express();
+const BUILD_ID = "rdc-pagos-rrhh-supervision-2026-08-05.4";
 const PORT = Number(process.env.PORT) || 5000;
 let httpServer = null;
 let shuttingDown = false;
@@ -71,7 +77,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-// Reportes e importaciones pueden enviar lotes grandes.
+// Pagos e importaciones pueden enviar lotes grandes. Se conserva el límite histórico.
 app.use(express.json({ limit: "100mb" }));
 app.use(
   express.urlencoded({
@@ -119,11 +125,36 @@ app.get("/health", (_req, res) => {
   });
 });
 
+app.get("/api/version", (_req, res) => {
+  return res.json({
+    ok: true,
+    service: "cobrina-rdc-backend",
+    build: BUILD_ID,
+    modulos: {
+      rrhh: true,
+      supervision: true,
+      pagosInternos: true,
+      poderesBia: true,
+      acuerdosMango: true,
+      misTareas: true,
+    },
+    rutasCriticas: [
+      "/api/pagos",
+      "/api/rrhh/resumen-empleados",
+      "/api/supervision/resumen",
+      "/api/poderes-bia/generar",
+      "/proyecciones/acuerdos-mango",
+      "/api/stickies",
+    ],
+  });
+});
+
 app.use("/auth", authRoutes);
 app.use("/empleados", empleadosRoutes);
 app.use("/api/empleados", empleadosRoutes);
 app.use("/certificados", certificadosRoutes);
 app.use("/proyecciones", proyeccionRoutes);
+app.use("/api/proyecciones", proyeccionRoutes); // alias de compatibilidad
 app.use("/usuarios", usuarioRoutes);
 app.use("/colchon", colchonRoutes);
 app.use("/subcesiones", subcesionRoutes);
@@ -136,9 +167,20 @@ app.use("/api/reportes-gestiones", reportesGestionesRoutes);
 app.use("/api/auditorias", auditoriasRoutes);
 app.use("/api/asistencia", asistenciaRoutes);
 app.use("/api/agenda", agendaRoutes);
+app.use("/api/rrhh", rrhhRoutes);
+app.use("/rrhh", rrhhRoutes); // alias de compatibilidad
+app.use("/api/poderes-bia", poderBiaRoutes);
+app.use("/poderes-bia", poderBiaRoutes); // alias de compatibilidad
+app.use("/api/supervision", supervisionRoutes);
+app.use("/supervision", supervisionRoutes); // alias de compatibilidad
+
+// Pagos internos habilitados en RDC, con la misma lógica operativa de Procob.
+app.use("/api/pagos", pagosRoutes);
+app.use("/pagos", pagosRoutes); // alias de compatibilidad
+app.use("/api/acuerdos-pago", acuerdosPagoRoutes);
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, message: "API de Cobrina RDC funcionando" });
+  res.json({ ok: true, message: "API de Cobrina RDC funcionando", build: BUILD_ID });
 });
 
 app.use((req, res) => {
@@ -171,9 +213,15 @@ app.use((error, _req, res, _next) => {
 
 const mongoOptions = {
   family: 4,
-  serverSelectionTimeoutMS: 15000,
-  connectTimeoutMS: 15000,
-  socketTimeoutMS: 45000,
+  serverSelectionTimeoutMS: 20000,
+  connectTimeoutMS: 20000,
+  socketTimeoutMS: 90000,
+  heartbeatFrequencyMS: 10000,
+  maxPoolSize: 25,
+  minPoolSize: 2,
+  maxIdleTimeMS: 60000,
+  retryReads: true,
+  retryWrites: true,
 };
 
 async function start() {
@@ -186,8 +234,6 @@ async function start() {
       console.log(`✅ API RDC lista en el puerto ${PORT}`);
     });
 
-    // Presentismo: procesa cierres de navegador y cierra toda jornada abierta
-    // a las 21:00 (hora Argentina). También se ejecuta al abrir el panel.
     await procesarCierresAutomaticos();
     const asistenciaTimer = setInterval(() => {
       procesarCierresAutomaticos();

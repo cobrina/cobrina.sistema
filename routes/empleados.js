@@ -1,15 +1,25 @@
-// routes/empleadosRoutes.js
 import express from "express";
 import mongoose from "mongoose";
 import bcrypt from "bcrypt";
 import { check, validationResult } from "express-validator";
 import Empleado from "../models/Empleado.js";
+import NovedadRRHH from "../models/NovedadRRHH.js";
 import verifyToken from "../middleware/verifyToken.js";
-import permitirRoles from "../middleware/permitirRoles.js";
+import permitirModulos from "../middleware/permitirModulos.js";
+import {
+  ROLES,
+  ASSIGNABLE_ROLES,
+  buildEffectiveRoleFilter,
+  canAssignElevatedRoles,
+  canManageTargetUser,
+  getEffectiveRole,
+  isDesignatedSuperAdmin,
+  normalizeAssignableRole,
+} from "../config/roles.js";
 
 const router = express.Router();
+const gestoresUsuarios = [verifyToken, permitirModulos("usuarios")];
 
-// Helpers
 const validar = (req, res) => {
   const errores = validationResult(req);
   if (!errores.isEmpty()) {
@@ -18,265 +28,287 @@ const validar = (req, res) => {
   }
   return true;
 };
+
 const isObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
 
-// 🔐 Todas estas rutas son solo para super-admin
-const soloSuper = [verifyToken, permitirRoles("super-admin")];
+function empleadoSeguro(empleado) {
+  const raw = empleado?.toObject ? empleado.toObject() : { ...empleado };
+  delete raw.password;
+  raw.role = getEffectiveRole(raw.role, raw.username);
+  return raw;
+}
 
-/* ────────────────────────────────────────────────────────────
-   Crear empleado (solo super-admin)
-   - Evita duplicados (username / email)
-   - Encripta password
-   - role: operador o admin (no crear super-admin por acá)
-──────────────────────────────────────────────────────────── */
+function rolSolicitadoParaActor(req, rawRole) {
+  const role = normalizeAssignableRole(rawRole || ROLES.OPERADOR);
+  if (!role) throw new Error("Rol inválido");
+
+  if (!canAssignElevatedRoles(req.user.role, req.user.username) && role !== ROLES.OPERADOR) {
+    throw new Error("Solo los super-admin autorizados pueden asignar perfiles especiales");
+  }
+  return role;
+}
+
 router.post(
   "/crear",
-  ...soloSuper,
+  ...gestoresUsuarios,
   [
     check("username").trim().notEmpty().withMessage("El nombre de usuario es obligatorio"),
     check("password").notEmpty().withMessage("La contraseña es obligatoria"),
     check("email").trim().notEmpty().isEmail().withMessage("El correo no es válido"),
-    check("role").isIn(["operador", "operador-vip", "admin"]).withMessage("Rol inválido"),
+    check("role").optional().isString().withMessage("Rol inválido"),
   ],
   async (req, res) => {
     if (!validar(req, res)) return;
 
     try {
-      const { username, password, email, role } = req.body;
+      const username = String(req.body.username || "").trim().toLowerCase();
+      const email = String(req.body.email || "").trim().toLowerCase();
+      const role = rolSolicitadoParaActor(req, req.body.role);
 
-      const dupUser = await Empleado.findOne({ username }).lean();
+      if (
+        isDesignatedSuperAdmin(username) &&
+        !canAssignElevatedRoles(req.user.role, req.user.username)
+      ) {
+        return res.status(403).json({
+          error: "Ese nombre de usuario está reservado para un super-admin autorizado",
+        });
+      }
+
+      const [dupUser, dupEmail] = await Promise.all([
+        Empleado.findOne({ username }).lean(),
+        Empleado.findOne({ email }).lean(),
+      ]);
       if (dupUser) return res.status(409).json({ error: "Ese nombre de usuario ya existe" });
-
-      const dupEmail = await Empleado.findOne({ email }).lean();
       if (dupEmail) return res.status(409).json({ error: "Ese correo ya existe" });
 
-      const hashed = await bcrypt.hash(password, 10);
-
       const nuevo = await Empleado.create({
-        username: username.trim(),
-        password: hashed,
-        email: email.trim(),
+        username,
+        password: await bcrypt.hash(String(req.body.password), 10),
+        email,
         role,
       });
 
-      res.status(201).json({
+      return res.status(201).json({
         message: "✅ Empleado creado exitosamente",
-        empleado: { id: nuevo._id, username: nuevo.username, email: nuevo.email, role: nuevo.role },
+        empleado: empleadoSeguro(nuevo),
       });
     } catch (error) {
+      if (error?.message?.includes("super-admin") || error?.message === "Rol inválido") {
+        return res.status(403).json({ error: error.message });
+      }
       if (process.env.NODE_ENV === "development") console.error("❌ crear empleado:", error);
-      // manejar posibles errores de índice único si habilitás unique en email
       if (error?.code === 11000) {
         const campo = Object.keys(error.keyPattern || {})[0] || "campo";
         return res.status(409).json({ error: `Duplicado: ${campo} ya está en uso` });
       }
-      res.status(500).json({ error: "Error interno del servidor al crear empleado" });
+      return res.status(500).json({ error: "Error interno del servidor al crear empleado" });
     }
   }
 );
 
-/* ────────────────────────────────────────────────────────────
-   Listado paginado (solo super-admin)
-   - Filtro por búsqueda y role
-   - Campos seguros (sin password)
-──────────────────────────────────────────────────────────── */
-router.get("/paginated", ...soloSuper, async (req, res) => {
+router.get("/paginated", ...gestoresUsuarios, async (req, res) => {
   try {
-    const page = Math.max(parseInt(req.query.page) || 1, 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit) || 15, 1), 100);
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 15, 1), 100);
     const skip = (page - 1) * limit;
-
     const filtro = {};
+
     if (req.query.busqueda) {
-      const q = String(req.query.busqueda).trim();
+      const q = String(req.query.busqueda).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       filtro.$or = [
         { username: { $regex: q, $options: "i" } },
         { email: { $regex: q, $options: "i" } },
       ];
     }
+
     if (req.query.role && req.query.role !== "todos") {
-      filtro.role = req.query.role;
+      const roleFilter = buildEffectiveRoleFilter(req.query.role);
+      if (!roleFilter) return res.status(400).json({ error: "Perfil inválido" });
+      Object.assign(filtro, roleFilter);
     }
+
+    if (req.query.includeInactive !== "true") filtro.isActive = { $ne: false };
 
     const [total, empleados] = await Promise.all([
       Empleado.countDocuments(filtro),
       Empleado.find(filtro).select("-password").sort({ username: 1 }).skip(skip).limit(limit).lean(),
     ]);
 
-    res.json({ total, page, limit, empleados });
+    const hoy = new Date();
+    const hoyClave = `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, "0")}-${String(hoy.getDate()).padStart(2, "0")}`;
+    const hoyDesde = new Date(`${hoyClave}T00:00:00.000Z`);
+    const hoyHasta = new Date(`${hoyClave}T23:59:59.999Z`);
+    const licencias = empleados.length
+      ? await NovedadRRHH.find({
+          empleadoId: { $in: empleados.map((empleado) => empleado._id) },
+          tipo: "licencia-medica",
+          estado: "vigente",
+          fechaDesde: { $lte: hoyHasta },
+          $or: [{ fechaHasta: null }, { fechaHasta: { $gte: hoyDesde } }],
+        }).sort({ fechaDesde: -1, createdAt: -1 }).lean()
+      : [];
+    const licenciaPorEmpleado = new Map();
+    for (const licencia of licencias) {
+      const key = String(licencia.empleadoId);
+      if (!licenciaPorEmpleado.has(key)) licenciaPorEmpleado.set(key, licencia);
+    }
+
+    return res.json({
+      total,
+      page,
+      limit,
+      assignableRoles: canAssignElevatedRoles(req.user.role, req.user.username)
+        ? ASSIGNABLE_ROLES
+        : [ROLES.OPERADOR],
+      empleados: empleados.map((empleado) => ({
+        ...empleadoSeguro(empleado),
+        licenciaMedicaActual: licenciaPorEmpleado.get(String(empleado._id)) || null,
+      })),
+    });
   } catch (error) {
     if (process.env.NODE_ENV === "development") console.error("❌ paginated:", error);
-    res.status(500).json({ error: "Error al obtener empleados paginados" });
+    return res.status(500).json({ error: "Error al obtener empleados paginados" });
   }
 });
 
-/* ────────────────────────────────────────────────────────────
-   Actualizar empleado (solo super-admin)
-   - Parcial (email/username opcionales)
-   - Evita cambiar rol si el objetivo es super-admin
-   - Evita duplicados de username/email
-   - Permite cambio de password
-──────────────────────────────────────────────────────────── */
 router.put(
   "/:id",
-  ...soloSuper,
+  ...gestoresUsuarios,
   [
     check("id").custom(isObjectId).withMessage("ID inválido"),
     check("email").optional().isEmail().withMessage("El correo no es válido"),
-    check("role").optional().isIn(["operador", "operador-vip", "admin", "super-admin"]).withMessage("Rol inválido"),
+    check("role").optional().isString().withMessage("Rol inválido"),
   ],
   async (req, res) => {
     if (!validar(req, res)) return;
 
     try {
-      const { id } = req.params;
-      const { username, email, role, password } = req.body;
-
-      const target = await Empleado.findById(id);
+      const target = await Empleado.findById(req.params.id);
       if (!target) return res.status(404).json({ error: "Empleado no encontrado" });
-
-      // No permitir modificar a super-admin (salvo password/propios datos no sensibles)
-      if (target.role === "super-admin" && (role || username)) {
-        return res.status(403).json({ error: "No se puede cambiar username/rol de un super-admin" });
+      if (!canManageTargetUser(req.user, target)) {
+        return res.status(403).json({ error: "No tenés permiso para modificar este usuario" });
       }
 
       const update = {};
+      const username = req.body.username !== undefined
+        ? String(req.body.username || "").trim().toLowerCase()
+        : "";
+      const email = req.body.email !== undefined
+        ? String(req.body.email || "").trim().toLowerCase()
+        : "";
 
       if (username && username !== target.username) {
-        const dupUser = await Empleado.findOne({ username }).lean();
+        if (isDesignatedSuperAdmin(username)) {
+          return res.status(403).json({
+            error: "Los nombres de super-admin están reservados y no pueden reasignarse",
+          });
+        }
+        const dupUser = await Empleado.findOne({ username, _id: { $ne: target._id } }).lean();
         if (dupUser) return res.status(409).json({ error: "Ese nombre de usuario ya existe" });
-        update.username = username.trim();
+        update.username = username;
       }
 
       if (email && email !== target.email) {
-        const dupEmail = await Empleado.findOne({ email }).lean();
+        const dupEmail = await Empleado.findOne({ email, _id: { $ne: target._id } }).lean();
         if (dupEmail) return res.status(409).json({ error: "Ese correo ya existe" });
-        update.email = email.trim();
+        update.email = email;
       }
 
-      if (role && target.role !== "super-admin") {
-        update.role = role;
+      if (req.body.role !== undefined) {
+        update.role = rolSolicitadoParaActor(req, req.body.role);
       }
 
-      if (password) {
-        update.password = await bcrypt.hash(password, 10);
-      }
+      if (req.body.password) update.password = await bcrypt.hash(String(req.body.password), 10);
 
-      const actualizado = await Empleado.findByIdAndUpdate(id, update, {
+      const actualizado = await Empleado.findByIdAndUpdate(target._id, update, {
         new: true,
         runValidators: true,
       }).select("-password");
 
-      res.json({ message: "✅ Empleado actualizado", empleado: actualizado });
+      return res.json({ message: "✅ Empleado actualizado", empleado: empleadoSeguro(actualizado) });
     } catch (error) {
+      if (error?.message?.includes("super-admin") || error?.message === "Rol inválido") {
+        return res.status(403).json({ error: error.message });
+      }
       if (process.env.NODE_ENV === "development") console.error("❌ actualizar empleado:", error);
       if (error?.code === 11000) {
         const campo = Object.keys(error.keyPattern || {})[0] || "campo";
         return res.status(409).json({ error: `Duplicado: ${campo} ya está en uso` });
       }
-      res.status(500).json({ error: "Error al actualizar el empleado" });
+      return res.status(500).json({ error: "Error al actualizar el empleado" });
     }
   }
 );
 
-/* ────────────────────────────────────────────────────────────
-   Eliminar empleado (solo super-admin)
-   - Bloquear eliminarse a sí mismo (opcional pero sano)
-   - Bloquear eliminar super-admin
-──────────────────────────────────────────────────────────── */
-router.delete("/:id", ...soloSuper, async (req, res) => {
+router.delete("/:id", ...gestoresUsuarios, async (req, res) => {
   try {
-    const { id } = req.params;
-    if (!isObjectId(id)) return res.status(400).json({ error: "ID inválido" });
-
-    // Evitar autodestrucción
-    if (String(req.user.id) === String(id)) {
+    if (!isObjectId(req.params.id)) return res.status(400).json({ error: "ID inválido" });
+    if (String(req.user.id) === String(req.params.id)) {
       return res.status(400).json({ error: "No podés eliminar tu propio usuario" });
     }
 
-    const target = await Empleado.findById(id);
+    const target = await Empleado.findById(req.params.id);
     if (!target) return res.status(404).json({ error: "Empleado no encontrado" });
-    if (target.role === "super-admin") {
-      return res.status(403).json({ error: "No se puede eliminar un super-admin" });
+    if (!canManageTargetUser(req.user, target)) {
+      return res.status(403).json({ error: "No tenés permiso para eliminar este usuario" });
     }
 
     await target.deleteOne();
-    res.json({ message: "✅ Empleado eliminado correctamente" });
+    return res.json({ message: "✅ Empleado eliminado correctamente" });
   } catch (error) {
     if (process.env.NODE_ENV === "development") console.error("❌ eliminar empleado:", error);
-    res.status(500).json({ error: "Error al eliminar empleado" });
+    return res.status(500).json({ error: "Error al eliminar empleado" });
   }
 });
 
-/* ────────────────────────────────────────────────────────────
-   Perfil propio
-──────────────────────────────────────────────────────────── */
 router.get("/mi-perfil", verifyToken, async (req, res) => {
   try {
     const empleado = await Empleado.findById(req.user.id).select("-password").lean();
     if (!empleado) return res.status(404).json({ error: "Empleado no encontrado" });
-    res.json(empleado);
+    return res.json(empleadoSeguro(empleado));
   } catch (error) {
     if (process.env.NODE_ENV === "development") console.error(error);
-    res.status(500).json({ error: "Error al obtener perfil" });
+    return res.status(500).json({ error: "Error al obtener perfil" });
   }
 });
 
-/* ────────────────────────────────────────────────────────────
-   Listar todos (solo super-admin)
-──────────────────────────────────────────────────────────── */
-router.get("/todos", ...soloSuper, async (req, res) => {
+router.get("/todos", ...gestoresUsuarios, async (req, res) => {
   try {
     const empleados = await Empleado.find().select("-password").sort({ username: 1 }).lean();
-    res.json(empleados);
+    return res.json(empleados.map(empleadoSeguro));
   } catch (error) {
     if (process.env.NODE_ENV === "development") console.error(error);
-    res.status(500).json({ error: "Error al obtener empleados" });
+    return res.status(500).json({ error: "Error al obtener empleados" });
   }
 });
 
-/* ────────────────────────────────────────────────────────────
-   Activar / Inactivar empleado (solo super-admin)
-   Body: { isActive: boolean }
-──────────────────────────────────────────────────────────── */
 router.patch(
   "/:id/estado",
-  ...soloSuper,
+  ...gestoresUsuarios,
   [
     check("id").custom(isObjectId).withMessage("ID inválido"),
-    check("isActive")
-      .isBoolean()
-      .withMessage("isActive debe ser booleano"),
+    check("isActive").isBoolean().withMessage("isActive debe ser booleano"),
   ],
   async (req, res) => {
     if (!validar(req, res)) return;
 
     try {
-      const { id } = req.params;
-      const { isActive } = req.body;
-
-      const empleado = await Empleado.findById(id);
-      if (!empleado) return res.status(404).json({ error: "Empleado no encontrado" });
-
-      if (empleado.role === "super-admin") {
-        return res.status(403).json({ error: "No se puede inactivar un super-admin" });
+      if (String(req.user.id) === String(req.params.id) && req.body.isActive === false) {
+        return res.status(400).json({ error: "No podés inactivar tu propio usuario" });
       }
 
-      empleado.isActive = Boolean(isActive);
+      const empleado = await Empleado.findById(req.params.id);
+      if (!empleado) return res.status(404).json({ error: "Empleado no encontrado" });
+      if (!canManageTargetUser(req.user, empleado)) {
+        return res.status(403).json({ error: "No tenés permiso para cambiar el estado de este usuario" });
+      }
+
+      empleado.isActive = Boolean(req.body.isActive);
       await empleado.save();
 
-      return res.json({
-        message: "Estado actualizado",
-        empleado: {
-          id: empleado._id,
-          username: empleado.username,
-          role: empleado.role,
-          isActive: empleado.isActive,
-          ultimaActividad: empleado.ultimaActividad,
-        },
-      });
+      return res.json({ message: "Estado actualizado", empleado: empleadoSeguro(empleado) });
     } catch (error) {
-      console.error("❌ PATCH /empleados/:id/estado:", error);
+      if (process.env.NODE_ENV === "development") console.error("❌ PATCH /empleados/:id/estado:", error);
       return res.status(500).json({ error: "Error al cambiar estado del empleado" });
     }
   }

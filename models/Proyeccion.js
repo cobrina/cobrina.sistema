@@ -13,6 +13,16 @@ const PagoInformadoSchema = new mongoose.Schema(
     motivoError: { type: String, default: "" },
     marcadoPor:  { type: mongoose.Schema.Types.ObjectId, ref: "Empleado", default: null },
     marcadoEn:   { type: Date, default: null },
+
+    // Un pago informado nunca modifica dinero real por sí solo.
+    estadoAplicacion: {
+      type: String,
+      enum: ["pendiente", "aplicado", "requiere-revision", "descartado"],
+      default: "pendiente",
+      index: true,
+    },
+    pagoRealId: { type: mongoose.Schema.Types.ObjectId, ref: "Pago", default: null },
+    aplicadoEn: { type: Date, default: null },
   },
   { _id: true }
 );
@@ -39,7 +49,7 @@ const proyeccionSchema = new mongoose.Schema(
     fechaPromesaInicial: { type: Date }, // para detectar Reprogramado
     fechaProximoLlamado: { type: Date, index: true },
 
-    // Cobrado (se recalcula desde pagosInformados al informar pago)
+    // Dinero real conciliado exclusivamente con el módulo Pagos
     importePagado: { type: Number, default: 0, min: 0 },
 
     // Estado de la promesa
@@ -57,6 +67,7 @@ const proyeccionSchema = new mongoose.Schema(
         "Cerrada cumplida",
         "Cerrada pago parcial",
         "Cerrada incumplida",
+        "Cerrada por acuerdo Mango",
       ],
       default: "Pendiente",
       index: true,
@@ -72,6 +83,14 @@ const proyeccionSchema = new mongoose.Schema(
       ref: "Entidad",
       required: true,
       index: true,
+    },
+    // Número operativo definido en Administración > Entidades.
+    // Convive con entidadId para no romper documentos históricos.
+    entidadNumero: {
+      type: Number,
+      min: 1,
+      index: true,
+      default: null,
     },
     // Fiduciario → SubCesión
     subCesionId: {
@@ -94,6 +113,22 @@ const proyeccionSchema = new mongoose.Schema(
 
     // Observaciones
     observaciones: { type: String, default: "", trim: true },
+
+    // Las proyecciones siguen siendo controles personales. Los acuerdos de
+    // Mango se consultan como referencia, pero no crean ni pisan registros.
+    origen: {
+      type: String,
+      enum: ["control-personal", "mango-confirmado"],
+      default: "control-personal",
+      index: true,
+    },
+    acuerdoMangoReferenciadoId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AcuerdoPago",
+      default: null,
+      index: true,
+    },
+    advertenciaMangoConfirmada: { type: Boolean, default: false },
 
     // Propietario / creador
     empleadoId: {
@@ -132,6 +167,7 @@ proyeccionSchema.index({ "pagosInformados.fecha": -1 });
 
 // búsquedas frecuentes por documento (nuevo esquema)
 proyeccionSchema.index({ dni: 1, entidadId: 1, subCesionId: 1 });
+proyeccionSchema.index({ dni: 1, entidadNumero: 1, subCesionId: 1 });
 
 // combinación común para listados/estadísticas (nuevo esquema)
 proyeccionSchema.index({ estado: 1, entidadId: 1 });

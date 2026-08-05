@@ -5,15 +5,27 @@ import Entidad from "../models/Entidad.js";
 import SubCesion from "../models/SubCesion.js";
 import Empleado from "../models/Empleado.js";
 import mongoose from "mongoose";
+import { getProyeccionesScope, ROLES } from "../config/roles.js";
+import {
+  normalizarDni,
+  resolverEntidadCanonica,
+  variantesTextoEntidad,
+} from "../utils/normalizacionNegocio.js";
+import { buscarPagosReales } from "../services/vinculacionPagosService.js";
+import { PAGOS_FUENTE_UNICA_ACTIVA } from "../config/features.js";
+import ReporteGestion from "../models/ReporteGestion.js";
+import Pago from "../models/Pago.js";
+import PagoInformadoMango from "../models/PagoInformadoMango.js";
+import { transformarGestionEnAcuerdo, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
 
 const rolDe = (req) => req.user.role || req.user.rol;
-const esSuper = (req) => rolDe(req) === "super-admin";
-const esAdmin = (req) => rolDe(req) === "admin";
-const esOp = (req) => rolDe(req) === "operador";
-const esVip = (req) => rolDe(req) === "operador-vip";
-const esOperativo = (req) => esOp(req) || esVip(req); // ambos operadores
+const esSuperAdmin = (req) => rolDe(req) === ROLES.SUPER_ADMIN;
+const esAmbitoGlobal = (req) => getProyeccionesScope(rolDe(req)) === "all";
+const esAmbitoPropio = (req) => getProyeccionesScope(rolDe(req)) === "own";
+const tieneAccesoProyecciones = (req) => getProyeccionesScope(rolDe(req)) !== "none";
+const esDueno = (req, proyeccion) => String(proyeccion?.empleadoId?._id || proyeccion?.empleadoId) === String(req.user.id);
 
-const recalcularImportePagado = (proy) =>
+const calcularTotalInformado = (proy) =>
   (proy.pagosInformados || [])
     .filter((p) => !p.erroneo)
     .reduce((acc, p) => acc + Number(p.monto || 0), 0);
@@ -32,17 +44,18 @@ const toISODate = (v) => {
 
 const buildLabelMaps = async () => {
   const [ents, subs] = await Promise.all([
-    Entidad.find({}, "nombre").sort({ nombre: 1 }).lean(),
+    Entidad.find({}, "nombre numero").sort({ numero: 1, nombre: 1 }).lean(),
     SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
   ]);
   const entLabelById = new Map();
   const subLabelById = new Map();
-  ents.forEach((e, i) =>
-    entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`)
+  ents.forEach((e) =>
+    entLabelById.set(
+      String(e._id),
+      Number.isFinite(Number(e.numero)) ? `${e.numero} - ${e.nombre}` : e.nombre
+    )
   );
-  subs.forEach((s, i) =>
-    subLabelById.set(String(s._id), `${i + 1} - ${s.nombre}`)
-  );
+  subs.forEach((s) => subLabelById.set(String(s._id), s.nombre));
   const entLabel = (id, fallbackName) =>
     id
       ? entLabelById.get(String(id)) ||
@@ -58,7 +71,8 @@ const buildLabelMaps = async () => {
 
 const determinarEstadoCierre = (proy) => {
   const importe = Number(proy.importe || 0);
-  const pagadoReal = recalcularImportePagado(proy); // solo pagos NO erróneos
+  // importePagado queda reservado al dinero conciliado con el módulo Pagos.
+  const pagadoReal = Number(proy.importePagado || 0);
 
   if (pagadoReal >= importe && importe > 0) return "Cerrada cumplida";
   if (pagadoReal > 0 && pagadoReal < importe) return "Cerrada pago parcial";
@@ -80,6 +94,347 @@ const crearFechaLocal = (fechaStr, finDelDia = false) => {
 
 
 const escapeRegexSafe = (value = "") => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const esErrorMongoTransitorio = (error) => {
+  const codigo = String(error?.code || error?.cause?.code || "").toUpperCase();
+  const nombre = String(error?.name || error?.cause?.name || "").toLowerCase();
+  const mensaje = String(error?.message || error?.cause?.message || "").toLowerCase();
+  return ["ECONNRESET", "ETIMEDOUT", "EPIPE", "ENETUNREACH", "ECONNREFUSED"].includes(codigo) ||
+    nombre.includes("mongonetwork") ||
+    nombre.includes("mongoserverselection") ||
+    mensaje.includes("read econnreset") ||
+    mensaje.includes("connection closed") ||
+    mensaje.includes("socket hang up");
+};
+
+const esperar = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const lecturaMongoConReintento = async (operacion, etiqueta = "lectura") => {
+  let ultimoError;
+  for (let intento = 1; intento <= 2; intento += 1) {
+    try {
+      return await operacion();
+    } catch (error) {
+      ultimoError = error;
+      if (intento >= 2 || !esErrorMongoTransitorio(error)) throw error;
+      console.warn(`⚠️ ${etiqueta}: conexión Mongo interrumpida; reintento único en curso.`);
+      await esperar(280);
+    }
+  }
+  throw ultimoError;
+};
+
+const claveDniEntidad = (dni, entidadNumero) => {
+  const dniNormalizado = normalizarDni(dni);
+  const numero = Number(entidadNumero || 0);
+  return dniNormalizado && Number.isInteger(numero) && numero > 0 ? `${dniNormalizado}|${numero}` : "";
+};
+
+const variantesOperador = (empleado = {}, fallbackUsername = "") => {
+  const username = String(empleado?.username || fallbackUsername || "").trim().toLowerCase();
+  const nombre = String(empleado?.nombre || "").trim().toLowerCase();
+  const usernameComoNombre = username.replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim();
+  const partes = usernameComoNombre.split(" ").filter(Boolean);
+  return [...new Set([username, nombre, usernameComoNombre, partes.length > 1 ? [...partes].reverse().join(" ") : "", nombre.split(/\s+/).filter(Boolean).reverse().join(" ")].filter(Boolean))];
+};
+
+const queryOperadorMango = async (req, usuarioId = "") => {
+  const idObjetivo = usuarioId || (!esAmbitoGlobal(req) ? req.user.id : "");
+  if (!idObjetivo || !mongoose.isValidObjectId(idObjetivo)) return null;
+  const empleado = await Empleado.findById(idObjetivo).select("username nombre").lean();
+  const variantes = variantesOperador(empleado, String(req.user?.username || ""));
+  return variantes.length
+    ? { usuario: { $in: variantes.map((valor) => new RegExp(`^${escapeRegexSafe(valor)}$`, "i")) } }
+    : { usuario: "__sin_coincidencias__" };
+};
+
+const variantesOperadorObjetivo = async (req, usuarioId = "") => {
+  const idObjetivo = usuarioId || (!esAmbitoGlobal(req) ? req.user.id : "");
+  if (!idObjetivo) return null;
+  if (!mongoose.isValidObjectId(idObjetivo)) return [];
+  const empleado = await Empleado.findById(idObjetivo).select("username nombre").lean();
+  return variantesOperador(empleado, String(req.user?.username || ""));
+};
+
+const acuerdoPerteneceAOperador = (acuerdo = {}, variantes = null) => {
+  if (variantes === null) return true;
+  if (!variantes.length) return false;
+  const propietario = String(
+    acuerdo.operadorPago || acuerdo.operador || acuerdo.operadorGestion || acuerdo.usuario || ""
+  ).trim().toLowerCase();
+  const propietarioComoNombre = propietario.replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim();
+  return variantes.includes(propietario) || variantes.includes(propietarioComoNombre);
+};
+
+const fechaHoraGestionISO = (fecha, hora = "00:00:00") => {
+  if (!fecha) return null;
+  const d = new Date(fecha);
+  if (Number.isNaN(d.getTime())) return null;
+  const isoFecha = d.toISOString().slice(0, 10);
+  const horaSegura = /^\d{2}:\d{2}:\d{2}$/.test(String(hora || ""))
+    ? String(hora)
+    : "00:00:00";
+  return `${isoFecha}T${horaSegura}.000Z`;
+};
+
+let mapasEntidadesCache = null;
+let mapasEntidadesCacheAt = 0;
+const MAPAS_ENTIDADES_TTL_MS = 5 * 60 * 1000;
+
+const construirMapasEntidades = async ({ force = false } = {}) => {
+  const ahora = Date.now();
+  if (!force && mapasEntidadesCache && ahora - mapasEntidadesCacheAt < MAPAS_ENTIDADES_TTL_MS) {
+    return mapasEntidadesCache;
+  }
+
+  const entidades = await Entidad.find({}, "numero nombre").lean();
+  const numeroPorNombre = new Map();
+  const nombrePorNumero = new Map();
+  for (const entidad of entidades) {
+    const numero = Number(entidad?.numero || 0);
+    const nombre = String(entidad?.nombre || "").trim();
+    if (!numero || !nombre) continue;
+    numeroPorNombre.set(nombre.toUpperCase(), numero);
+    nombrePorNumero.set(numero, nombre);
+  }
+  mapasEntidadesCache = { entidades, numeroPorNombre, nombrePorNumero };
+  mapasEntidadesCacheAt = ahora;
+  return mapasEntidadesCache;
+};
+
+const resolverNumeroEntidadGestion = (gestion = {}, numeroPorNombre = new Map()) =>
+  Number(
+    gestion?.entidadNumero ||
+      numeroPorNombre.get(String(gestion?.entidad || "").trim().toUpperCase()) ||
+      0
+  );
+
+const mapearGestionAacuerdoMango = (gestion = {}, numeroPorNombre = new Map()) => {
+  const transformado = transformarGestionEnAcuerdo(gestion);
+  if (!transformado) return null;
+  const entidadNumero = resolverNumeroEntidadGestion(gestion, numeroPorNombre);
+  return {
+    _id: gestion?._id || transformado.id,
+    id: String(gestion?._id || transformado.id || ""),
+    dni: transformado.dni,
+    entidad: transformado.entidad,
+    entidadNumero,
+    nombreDeudor: transformado.nombreDeudor,
+    operador: transformado.usuario,
+    usuario: transformado.usuario,
+    fecha: transformado.fecha,
+    fechaHora: fechaHoraGestionISO(gestion?.fecha, gestion?.hora),
+    hora: transformado.hora,
+    tipoAcuerdo: transformado.tipoAcuerdo,
+    resultado: transformado.resultadoGestion,
+    estadoCuenta: transformado.estadoCuenta,
+    anticipoMonto: transformado.montoAnticipo,
+    anticipoVto: transformado.fechaAnticipo || null,
+    montoCuota: transformado.montoCuota,
+    primerVto: transformado.primerVencimiento || null,
+    cuotasCantidad: transformado.cuotas,
+    primerPago: transformado.primerPago,
+    montoTotalAcuerdo: transformado.montoTotalAcuerdo,
+    deudaMin: transformado.deudaMaxima,
+    observacionResumen: transformado.observacionGestion,
+    telefonoGestion: transformado.telefonoGestion,
+    tipoContacto: transformado.tipoContacto,
+    observacionGestion: transformado.observacionGestion,
+  };
+};
+
+const condicionesMangoPorProyecciones = (proyecciones = []) => {
+  const condiciones = [];
+  const vistas = new Set();
+  for (const p of proyecciones) {
+    const dni = normalizarDni(p?.dni);
+    const numero = Number(p?.entidadNumero || p?.entidadId?.numero || 0);
+    const nombre = String(p?.entidadId?.nombre || p?.entidadNombre || "").trim();
+    const clave = `${dni}|${numero}|${nombre.toUpperCase()}`;
+    if (!dni || (!numero && !nombre) || vistas.has(clave)) continue;
+    vistas.add(clave);
+    const opcionesEntidad = [];
+    if (numero) opcionesEntidad.push({ entidadNumero: numero });
+    if (nombre) opcionesEntidad.push({ entidad: new RegExp(`^${escapeRegexSafe(nombre)}$`, "i") });
+    const dniNumero = Number(dni);
+    const dniVariantes = Number.isSafeInteger(dniNumero) ? [dni, dniNumero] : [dni];
+    condiciones.push({ dni: { $in: dniVariantes }, $or: opcionesEntidad });
+  }
+  return condiciones;
+};
+
+/**
+ * Los acuerdos confirmados de Mango se obtienen del mismo Reporte de Gestiones
+ * que alimenta "Gestiones con acuerdo". No usa la colección histórica de
+ * acuerdos importados, porque esa no siempre está cargada.
+ */
+const buscarAcuerdosMangoDeProyecciones = async (proyecciones = []) => {
+  const condiciones = condicionesMangoPorProyecciones(proyecciones);
+  if (!condiciones.length) return new Map();
+
+  const { numeroPorNombre } = await construirMapasEntidades();
+  const gestiones = await ReporteGestion.find({
+    borrado: { $ne: true },
+    resultadoGestion: /acuerdo/i,
+    $or: condiciones,
+  })
+    .sort({ fecha: -1, hora: -1, _id: -1 })
+    .select(
+      "dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero"
+    )
+    .maxTimeMS(30000)
+    .lean();
+
+  const mapa = new Map();
+  for (const gestion of gestiones) {
+    const acuerdo = mapearGestionAacuerdoMango(gestion, numeroPorNombre);
+    if (!acuerdo) continue;
+    const clave = claveDniEntidad(acuerdo.dni, acuerdo.entidadNumero);
+    if (!clave) continue;
+    const lista = mapa.get(clave) || [];
+    lista.push(acuerdo);
+    mapa.set(clave, lista);
+  }
+  return mapa;
+};
+
+const enriquecerProyeccionesConFuentes = async (docs = []) => {
+  if (!docs.length) return docs;
+
+  const condicionesGestiones = condicionesMangoPorProyecciones(docs);
+  const condicionesPagos = [];
+  const clavesPagos = new Set();
+  for (const p of docs) {
+    const dni = normalizarDni(p?.dni);
+    const numero = Number(p?.entidadNumero || p?.entidadId?.numero || 0);
+    const subId = String(p?.subCesionId?._id || p?.subCesionId || "");
+    if (!dni || !numero || !mongoose.isValidObjectId(subId)) continue;
+    const clave = `${dni}|${numero}|${subId}`;
+    if (clavesPagos.has(clave)) continue;
+    clavesPagos.add(clave);
+    condicionesPagos.push({
+      dni,
+      entidadId: numero,
+      subCesionId: new mongoose.Types.ObjectId(subId),
+    });
+  }
+
+  const [gestiones, pagos, mapasEntidad] = await Promise.all([
+    condicionesGestiones.length
+      ? ReporteGestion.find({ borrado: { $ne: true }, $or: condicionesGestiones })
+          .sort({ fecha: -1, hora: -1, _id: -1 })
+          .select(
+            "dni fecha hora usuario resultadoGestion estadoCuenta tipoContacto observacionGestion entidad entidadNumero"
+          )
+          .maxTimeMS(30000)
+          .lean()
+      : [],
+    condicionesPagos.length
+      ? Pago.find({ $or: condicionesPagos })
+          .sort({ fechaPago: 1, idPago: 1, _id: 1 })
+          .select(
+            "idPago dni entidadId subCesionId fechaPago monto conceptoCodigo estado operadorUsername"
+          )
+          .maxTimeMS(30000)
+          .lean()
+      : [],
+    construirMapasEntidades(),
+  ]);
+
+  const ultimaGestionPorCaso = new Map();
+  for (const gestion of gestiones) {
+    const numero = resolverNumeroEntidadGestion(gestion, mapasEntidad.numeroPorNombre);
+    const clave = claveDniEntidad(gestion?.dni, numero);
+    if (!clave || ultimaGestionPorCaso.has(clave)) continue;
+    ultimaGestionPorCaso.set(clave, {
+      fecha: gestion.fecha,
+      hora: gestion.hora || "",
+      usuario: gestion.usuario || "",
+      resultado: gestion.resultadoGestion || "",
+      estadoCuenta: gestion.estadoCuenta || "",
+      tipoContacto: gestion.tipoContacto || "",
+      observacion: gestion.observacionGestion || "",
+    });
+  }
+
+  const pagosPorClave = new Map();
+  for (const pago of pagos) {
+    const clave = `${normalizarDni(pago?.dni)}|${Number(pago?.entidadId || 0)}|${String(
+      pago?.subCesionId || ""
+    )}`;
+    const lista = pagosPorClave.get(clave) || [];
+    lista.push(pago);
+    pagosPorClave.set(clave, lista);
+  }
+
+  return docs.map((p) => {
+    const entidadNumero = Number(p?.entidadNumero || p?.entidadId?.numero || 0);
+    const claveCaso = claveDniEntidad(p?.dni, entidadNumero);
+    const subId = String(p?.subCesionId?._id || p?.subCesionId || "");
+    const clavePago = `${normalizarDni(p?.dni)}|${entidadNumero}|${subId}`;
+    const pagosCaso = pagosPorClave.get(clavePago) || [];
+    const fechaSoloISO = (raw) => {
+      if (!raw) return "";
+      const fecha = new Date(raw);
+      return Number.isNaN(fecha.getTime()) ? "" : fecha.toISOString().slice(0, 10);
+    };
+    const corteISO = fechaSoloISO(
+      p?.creado || p?.createdAt || p?.fechaPromesaInicial || p?.fechaPromesa
+    );
+
+    let totalAplicable = 0;
+    let totalMismoDia = 0;
+    let totalAnterior = 0;
+    let cantidadAplicables = 0;
+    let ultimoPagoAplicable = null;
+    const pagosValidos = [];
+    for (const pago of pagosCaso) {
+      const fechaPagoISO = fechaSoloISO(pago?.fechaPago);
+      if (!fechaPagoISO) continue;
+      const monto = Number(pago?.monto || 0);
+      if (!corteISO || fechaPagoISO > corteISO) {
+        totalAplicable += monto;
+        cantidadAplicables += 1;
+        ultimoPagoAplicable = pago;
+        pagosValidos.push(pago);
+      } else if (fechaPagoISO === corteISO) {
+        totalMismoDia += monto;
+        pagosValidos.push(pago);
+      } else {
+        totalAnterior += monto;
+      }
+    }
+
+    return {
+      ...p,
+      ultimaGestionMango: ultimaGestionPorCaso.get(claveCaso) || null,
+      pagosRealesResumen: {
+        estadoVinculacion: pagosCaso.length ? "coincidencia-exacta" : "sin-pagos",
+        cantidadEncontrados: pagosCaso.length,
+        cantidadAplicables,
+        totalAplicable,
+        totalMismoDia,
+        totalValido: totalAplicable + totalMismoDia,
+        totalAnterior,
+        operadorPago: ultimoPagoAplicable?.operadorUsername || pagosValidos.at(-1)?.operadorUsername || "",
+        pagosValidos: pagosValidos.map((pago) => ({
+          idPago: pago.idPago,
+          fechaPago: pago.fechaPago,
+          monto: pago.monto,
+          operadorUsername: pago.operadorUsername,
+        })),
+        ultimoPagoAplicable: ultimoPagoAplicable
+          ? {
+              idPago: ultimoPagoAplicable.idPago,
+              fechaPago: ultimoPagoAplicable.fechaPago,
+              monto: ultimoPagoAplicable.monto,
+              operadorUsername: ultimoPagoAplicable.operadorUsername,
+            }
+          : null,
+      },
+    };
+  });
+};
 
 const construirQueryProyeccionesAdmin = (source = {}, { ids = [] } = {}) => {
   const filtros = [];
@@ -243,8 +598,7 @@ export const actualizarEstadoAutomaticamente = async (proy) => {
 
 export const crearProyeccion = async (req, res) => {
   try {
-    if (esAdmin(req)) return res.status(403).json({ error: "Sin acceso" });
-    if (!esSuper(req) && !esOperativo(req)) {
+    if (!tieneAccesoProyecciones(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -258,6 +612,11 @@ export const crearProyeccion = async (req, res) => {
       concepto,
       entidadId,
       subCesionId,
+      importePagado: _importePagadoIgnorado,
+      pagosInformados: _pagosInformadosIgnorados,
+      entidadNumero: _entidadNumeroIgnorado,
+      origen: _origenIgnorado,
+      acuerdoMangoReferenciadoId: _acuerdoIgnorado,
       ...otrosCampos
     } = req.body;
 
@@ -304,7 +663,8 @@ export const crearProyeccion = async (req, res) => {
       return res.status(400).json({ error: "subCesionId inválido" });
     }
 
-    const entidad = await Entidad.findById(entidadId);
+    const entidadCanonica = await resolverEntidadCanonica({ entidadId });
+    const entidad = entidadCanonica?.entidad;
     if (!entidad)
       return res.status(400).json({ error: "Entidad no encontrada" });
 
@@ -317,6 +677,7 @@ export const crearProyeccion = async (req, res) => {
     const activaPrevia = await Proyeccion.findOne({
       dni,
       entidadId,
+      entidadNumero: entidadCanonica.entidadNumero,
       subCesionId,
       $or: [{ isActiva: true }, { isActiva: { $exists: false } }],
     });
@@ -353,6 +714,7 @@ export const crearProyeccion = async (req, res) => {
 
       // 🔵 Campos normalizados
       entidadId,
+      entidadNumero: entidadCanonica.entidadNumero,
       subCesionId,
       idProyeccionLogico,
 
@@ -362,11 +724,14 @@ export const crearProyeccion = async (req, res) => {
       anio,
       mes,
       ...otrosCampos,
+      importePagado: 0,
+      pagosInformados: [],
 
       empleadoId: req.user.id,
       creado: new Date(),
       ultimaModificacion: new Date(),
       isActiva: true,
+      origen: "control-personal",
     });
 
     // Ajuste de estado “en caliente”
@@ -394,12 +759,12 @@ export const crearProyeccion = async (req, res) => {
 // 2. Obtener proyecciones propias
 export const obtenerProyeccionesPropias = async (req, res) => {
   try {
-    if (esAdmin(req)) return res.status(403).json({ error: "Sin acceso" });
+    if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso" });
 
     const campos =
       "empleadoId dni nombreTitular importe importePagado estado concepto " +
-      "entidadId subCesionId fechaPromesa fechaProximoLlamado creado ultimaModificacion " +
-      "vecesTocada ultimaGestion observaciones";
+      "entidadId entidadNumero subCesionId fechaPromesa fechaProximoLlamado creado ultimaModificacion " +
+      "vecesTocada ultimaGestion observaciones origen acuerdoMangoReferenciadoId advertenciaMangoConfirmada isActiva pagosInformados";
 
     const docs = await Proyeccion.find({ empleadoId: req.user.id })
       .select(campos)
@@ -455,13 +820,10 @@ export const actualizarProyeccion = async (req, res) => {
         .json({ error: "La proyección está cerrada y no puede editarse." });
     }
 
-    if (esAdmin(req)) {
+    if (!tieneAccesoProyecciones(req)) {
       return res.status(403).json({ error: "Sin acceso" });
     }
-    if (
-      esOperativo(req) &&
-      String(proyeccion.empleadoId) !== String(req.user.id)
-    ) {
+    if (esAmbitoPropio(req) && !esDueno(req, proyeccion)) {
       return res.status(403).json({ error: "No autorizado para editar" });
     }
 
@@ -474,6 +836,13 @@ export const actualizarProyeccion = async (req, res) => {
       subCesionId,
       fechaPromesa,
       fechaProximoLlamado,
+      empleadoId: _empleadoIdIgnorado,
+      importePagado: _importePagadoIgnorado,
+      pagosInformados: _pagosInformadosIgnorados,
+      entidadNumero: _entidadNumeroIgnorado,
+      origen: _origenIgnorado,
+      acuerdoMangoReferenciadoId: _acuerdoIgnorado,
+      advertenciaMangoConfirmada: _advertenciaIgnorada,
       ...resto
     } = req.body;
 
@@ -516,10 +885,11 @@ export const actualizarProyeccion = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(subCesionId)) {
       return res.status(400).json({ error: "subCesionId inválido" });
     }
-    const [entidad, subCesion] = await Promise.all([
-      Entidad.findById(entidadId),
+    const [entidadCanonica, subCesion] = await Promise.all([
+      resolverEntidadCanonica({ entidadId }),
       SubCesion.findById(subCesionId),
     ]);
+    const entidad = entidadCanonica?.entidad;
     if (!entidad)
       return res.status(400).json({ error: "Entidad no encontrada" });
     if (!subCesion)
@@ -554,6 +924,7 @@ export const actualizarProyeccion = async (req, res) => {
       importe: importeNumerico,
       concepto,
       entidadId,
+      entidadNumero: entidadCanonica.entidadNumero,
       subCesionId,
       fechaPromesa,
       fechaProximoLlamado,
@@ -605,11 +976,8 @@ export const eliminarProyeccion = async (req, res) => {
       return res.status(404).json({ error: "Proyección no encontrada" });
     }
 
-    if (esAdmin(req)) return res.status(403).json({ error: "Sin acceso" });
-    if (
-      String(proyeccion.empleadoId) !== String(req.user.id) &&
-      !esSuper(req)
-    ) {
+    if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso" });
+    if (!esDueno(req, proyeccion) && !esAmbitoGlobal(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -655,15 +1023,14 @@ export const registrarGestion = async (req, res) => {
       });
     }
 
-    const rol = rolDe(req);
-    if (esOperativo(req) && String(proy.empleadoId) !== String(req.user.id)) {
+    if (esAmbitoPropio(req) && !esDueno(req, proy)) {
       return res
         .status(403)
         .json({ error: "Solo el dueño puede registrar esta gestión" });
     }
 
-    // Para admin / super-admin: solo visualizan (no suman)
-    if (esAdmin(req) || esSuper(req)) {
+    // Los perfiles globales supervisan, pero no registran gestión como operador.
+    if (esAmbitoGlobal(req)) {
       return res.status(403).json({
         error: "Los administradores no pueden registrar gestiones aquí",
       });
@@ -690,7 +1057,7 @@ export const registrarGestion = async (req, res) => {
 // 5. Obtener por operador
 export const obtenerProyeccionesPorOperadorId = async (req, res) => {
   try {
-    if (!esSuper(req)) return res.status(403).json({ error: "No autorizado" });
+    if (!esAmbitoGlobal(req)) return res.status(403).json({ error: "No autorizado" });
     const proyecciones = await Proyeccion.find({
       empleadoId: req.params.id,
     }).sort({ creado: -1 });
@@ -730,10 +1097,10 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
     } = req.query;
 
     const filtros = [];
-    if (esAdmin(req)) {
+    if (!tieneAccesoProyecciones(req)) {
       return res.status(403).json({ error: "Sin acceso" });
     }
-    if (esSuper(req)) {
+    if (esAmbitoGlobal(req)) {
       if (usuarioId) filtros.push({ empleadoId: usuarioId });
     } else {
       filtros.push({ empleadoId: req.user.id });
@@ -776,7 +1143,7 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
 
     // Búsqueda libre
     if (buscar) {
-      const regex = new RegExp(buscar, "i");
+      const regex = new RegExp(escapeRegexSafe(buscar), "i");
       const posibleDni = parseInt(buscar, 10);
       const condiciones = [{ nombreTitular: regex }, { concepto: regex }, { estado: regex }];
       if (!isNaN(posibleDni)) condiciones.push({ dni: posibleDni });
@@ -795,21 +1162,45 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
 
     const campos =
       "empleadoId dni nombreTitular importe importePagado estado concepto " +
-      "entidadId subCesionId fechaPromesa fechaProximoLlamado creado ultimaModificacion " +
-      "vecesTocada ultimaGestion observaciones";
+      "entidadId entidadNumero subCesionId fechaPromesa fechaProximoLlamado creado ultimaModificacion " +
+      "vecesTocada ultimaGestion observaciones origen acuerdoMangoReferenciadoId advertenciaMangoConfirmada isActiva pagosInformados";
 
-    // Traemos con nombres ya resueltos
-    const docs = await Proyeccion.find(query)
-      .select(campos)
-      .populate("empleadoId", "username")
-      .populate("entidadId", "nombre numero")
-      .populate("subCesionId", "nombre")
-      .sort(sortObj)
-      .skip(skip)
-      .limit(pageSize)
-      .lean();
-
+    const { docs, acuerdosPorCaso, total } = await lecturaMongoConReintento(
+      async () => {
+        const [docsBase, totalDocumentos] = await Promise.all([
+          Proyeccion.find(query)
+            .select(campos)
+            .populate("empleadoId", "username nombre")
+            .populate("entidadId", "nombre numero")
+            .populate("subCesionId", "nombre")
+            .sort(sortObj)
+            .skip(skip)
+            .limit(pageSize)
+            .maxTimeMS(30000)
+            .lean(),
+          Proyeccion.countDocuments(query).maxTimeMS(30000),
+        ]);
+        const docsEnriquecidos = await enriquecerProyeccionesConFuentes(docsBase);
+        const acuerdos = await buscarAcuerdosMangoDeProyecciones(docsEnriquecidos);
+        return {
+          docs: docsEnriquecidos,
+          acuerdosPorCaso: acuerdos,
+          total: totalDocumentos,
+        };
+      },
+      "/proyecciones/filtrar"
+    );
     const resultados = docs.map((p) => {
+      const pagosInformadosActivos = (Array.isArray(p?.pagosInformados) ? p.pagosInformados : [])
+        .filter((pago) => !pago?.erroneo);
+      const totalPagosInformados = pagosInformadosActivos.reduce(
+        (acumulado, pago) => acumulado + Number(pago?.monto || 0),
+        0
+      );
+      const ultimoPagoInformado = pagosInformadosActivos
+        .slice()
+        .sort((a, b) => new Date(b?.fecha || 0) - new Date(a?.fecha || 0))[0] || null;
+
       const esEstadoFijo =
         /^Pagado(?: parcial)?$/i.test(p.estado || "") || /^Cerrada/i.test(p.estado || "");
       const estadoVista = esEstadoFijo
@@ -817,29 +1208,140 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
         : (typeof clasificarEstado === "function" && p.fechaPromesa
             ? clasificarEstado(new Date(p.fechaPromesa))
             : p.estado);
+      const entidadNumero = Number(p?.entidadNumero || p?.entidadId?.numero || 0);
+      const acuerdosMango = acuerdosPorCaso.get(claveDniEntidad(p.dni, entidadNumero)) || [];
+      const acuerdoMango = acuerdosMango[0] || null;
 
       return {
-        ...p, // ← `estado` queda intacto (lo que guardaste después del pago)
-        empleadoUsername: p?.empleadoId?.username || "-",
+        ...p,
+        // La tabla solo necesita un resumen visual; el detalle completo se consulta en su endpoint.
+        pagosInformados: undefined,
+        pagosInformadosResumen: {
+          cantidad: pagosInformadosActivos.length,
+          total: totalPagosInformados,
+          ultimoPago: ultimoPagoInformado
+            ? {
+                fecha: ultimoPagoInformado.fecha || null,
+                monto: Number(ultimoPagoInformado.monto || 0),
+              }
+            : null,
+        },
+        empleadoUsernameOriginal: p?.empleadoId?.username || "-",
+        empleadoUsername:
+          p?.pagosRealesResumen?.operadorPago || p?.empleadoId?.username || "-",
+        propietarioSegunPago: Boolean(p?.pagosRealesResumen?.operadorPago),
         entidadNombre: p?.entidadId?.nombre || "-",
+        entidadNumero,
         subCesionNombre: p?.subCesionId?.nombre || "-",
-        estadoVista, // ← opcional para UI
+        estadoVista,
+        tieneAcuerdoMango: acuerdosMango.length > 0,
+        cantidadAcuerdosMango: acuerdosMango.length,
+        acuerdoMangoResumen: acuerdoMango ? {
+          _id: acuerdoMango._id,
+          fecha: acuerdoMango.fecha || acuerdoMango.fechaHora,
+          tipo: acuerdoMango.tipoAcuerdo || acuerdoMango.resultado || "Acuerdo",
+          operador: acuerdoMango.operador || "",
+          estado: acuerdoMango.estadoCuenta || "Confirmado",
+        } : null,
       };
     });
 
-    const total = await Proyeccion.countDocuments(query);
     return res.json({ total, resultados });
   } catch (error) {
     console.error("❌ Error en /proyecciones/filtrar:", error);
-    res.status(500).json({ error: "Error al filtrar proyecciones" });
+    res.status(500).json({
+      error: esErrorMongoTransitorio(error)
+        ? "La conexión con la base de datos se interrumpió. Reintentá en unos segundos."
+        : "Error al filtrar proyecciones",
+      codigo: esErrorMongoTransitorio(error) ? "DB_CONNECTION_RESET" : "PROYECCIONES_FILTER_ERROR",
+    });
   }
 };
 
 
 // 7. Estadísticas propias
+
+/**
+ * Cierra un control personal cuando el mismo DNI + entidad ya está confirmado
+ * en el módulo de Acuerdos Mango. No elimina el registro: conserva el historial
+ * y evita que vuelva a computarse como un acuerdo personal activo.
+ */
+export const cerrarProyeccionPorAcuerdoMango = async (req, res) => {
+  try {
+    if (!tieneAccesoProyecciones(req)) {
+      return res.status(403).json({ error: "Sin acceso a Proyecciones" });
+    }
+
+    const proyeccion = await Proyeccion.findById(req.params.id)
+      .populate("entidadId", "nombre numero")
+      .populate("empleadoId", "username nombre");
+
+    if (!proyeccion) {
+      return res.status(404).json({ error: "Proyección no encontrada" });
+    }
+    if (esAmbitoPropio(req) && !esDueno(req, proyeccion)) {
+      return res.status(403).json({ error: "No tenés permiso sobre esta proyección" });
+    }
+
+    const acuerdosPorCaso = await buscarAcuerdosMangoDeProyecciones([proyeccion.toObject()]);
+    const entidadNumero = Number(
+      proyeccion.entidadNumero || proyeccion.entidadId?.numero || 0
+    );
+    const acuerdos =
+      acuerdosPorCaso.get(claveDniEntidad(proyeccion.dni, entidadNumero)) || [];
+    const acuerdo = acuerdos[0];
+
+    if (!acuerdo) {
+      return res.status(409).json({
+        error:
+          "No se encontró un acuerdo de Mango para el mismo DNI y entidad. Actualizá la tabla y volvé a intentar.",
+      });
+    }
+
+    proyeccion.isActiva = false;
+    proyeccion.estado = "Cerrada por acuerdo Mango";
+    proyeccion.origen = "control-personal";
+    proyeccion.advertenciaMangoConfirmada = true;
+    proyeccion.acuerdoMangoReferenciadoId = acuerdo._id;
+    proyeccion.ultimaModificacion = new Date();
+    await proyeccion.save();
+
+    const resultado = await Proyeccion.findById(proyeccion._id)
+      .populate("empleadoId", "username nombre")
+      .populate("entidadId", "nombre numero")
+      .populate("subCesionId", "nombre")
+      .lean();
+
+    return res.json({
+      ok: true,
+      mensaje: "El acuerdo manual quedó cerrado porque ya está confirmado en Mango.",
+      proyeccion: {
+        ...resultado,
+        entidadNumero: Number(
+          resultado?.entidadNumero || resultado?.entidadId?.numero || 0
+        ),
+        tieneAcuerdoMango: true,
+        cantidadAcuerdosMango: acuerdos.length,
+        acuerdoMangoResumen: {
+          _id: acuerdo._id,
+          fecha: acuerdo.fechaHora || acuerdo.fecha,
+          tipo: acuerdo.tipoAcuerdo || acuerdo.resultado || "Acuerdo",
+          operador: acuerdo.operador || "",
+          estado: acuerdo.estadoCuenta || "Confirmado",
+        },
+      },
+    });
+  } catch (error) {
+    console.error("❌ Error cerrando proyección por acuerdo Mango:", error);
+    return res.status(500).json({
+      error: "No se pudo cerrar el acuerdo manual por acuerdo Mango",
+    });
+  }
+};
+
 export const obtenerEstadisticasPropias = async (req, res) => {
   try {
-    if (esAdmin(req)) return res.status(403).json({ error: "Sin acceso" });
+    if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso" });
     const proyecciones = await Proyeccion.find({ empleadoId: req.user.id });
     const actualizadas = await Promise.all(
       proyecciones.map(actualizarEstadoAutomaticamente)
@@ -871,7 +1373,7 @@ export const obtenerEstadisticasPropias = async (req, res) => {
 
 export const obtenerEstadisticasAdmin = async (req, res) => {
   try {
-    if (!esSuper(req)) return res.status(403).json({ error: "No autorizado" });
+    if (!esAmbitoGlobal(req)) return res.status(403).json({ error: "No autorizado" });
     const proyecciones = await Proyeccion.find();
     const actualizadas = await Promise.all(
       proyecciones.map(actualizarEstadoAutomaticamente)
@@ -906,7 +1408,7 @@ export const obtenerEstadisticasAdmin = async (req, res) => {
 
 export const obtenerResumenGlobal = async (req, res) => {
   try {
-    if (!esSuper(req)) return res.status(403).json({ error: "No autorizado" });
+    if (!esAmbitoGlobal(req)) return res.status(403).json({ error: "No autorizado" });
     const proyecciones = await Proyeccion.find().populate(
       "empleadoId",
       "username"
@@ -963,8 +1465,8 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
     const {
       estado,
       concepto,
-      entidadId, // ← reemplaza cartera
-      subCesionId, // ← reemplaza fiduciario
+      entidadId,
+      subCesionId,
       tipoFecha = "fechaPromesa",
       fechaDesde,
       fechaHasta,
@@ -976,16 +1478,17 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
       anio,
       promesaHoy,
       llamadoHoy,
+      sinGestion,
     } = req.query;
 
-    const filtros = [];
-    if (esAdmin(req)) {
+    if (!tieneAccesoProyecciones(req)) {
       return res.status(403).json({ error: "Sin acceso" });
     }
-    const rol = rolDe(req);
-    if (esSuper(req) && usuarioId) {
+
+    const filtros = [];
+    if (esAmbitoGlobal(req) && usuarioId) {
       filtros.push({ empleadoId: usuarioId });
-    } else if (!esSuper(req)) {
+    } else if (!esAmbitoGlobal(req)) {
       filtros.push({ empleadoId: req.user.id });
     }
 
@@ -993,59 +1496,63 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
     if (concepto) filtros.push({ concepto });
     if (entidadId) filtros.push({ entidadId });
     if (subCesionId) filtros.push({ subCesionId });
-    if (mes) filtros.push({ mes: parseInt(mes) });
-    if (anio) filtros.push({ anio: parseInt(anio) });
+    if (mes) filtros.push({ mes: Number.parseInt(mes, 10) });
+    if (anio) filtros.push({ anio: Number.parseInt(anio, 10) });
+    if (sinGestion === "true") {
+      filtros.push({
+        $or: [
+          { vecesTocada: { $exists: false } },
+          { vecesTocada: null },
+          { vecesTocada: { $lte: 0 } },
+        ],
+      });
+    }
 
-    // ----- rango para el campo elegido -----
-    let rangoDesde = null,
-      rangoHasta = null;
+    let rangoDesde = null;
+    let rangoHasta = null;
     if (
       fechaDesde &&
       fechaHasta &&
-      !isNaN(Date.parse(fechaDesde)) &&
-      !isNaN(Date.parse(fechaHasta))
+      !Number.isNaN(Date.parse(fechaDesde)) &&
+      !Number.isNaN(Date.parse(fechaHasta))
     ) {
       rangoDesde = crearFechaLocal(fechaDesde);
       rangoHasta = crearFechaLocal(fechaHasta, true);
-
       const campoFecha =
         {
           fechaPromesa: "fechaPromesa",
           creado: "creado",
           modificado: "ultimaModificacion",
         }[tipoFecha] || "fechaPromesa";
-
       filtros.push({ [campoFecha]: { $gte: rangoDesde, $lte: rangoHasta } });
     }
 
-    // rango para PAGOS (mismo del filtro si viene)
-    const pagosDesde = rangoDesde;
-    const pagosHasta = rangoHasta;
-
     const hoy = new Date();
     hoy.setHours(0, 0, 0, 0);
-    const mañana = new Date(hoy);
-    mañana.setDate(hoy.getDate() + 1);
+    const manana = new Date(hoy);
+    manana.setDate(hoy.getDate() + 1);
+    if (promesaHoy === "true") {
+      filtros.push({ fechaPromesa: { $gte: hoy, $lt: manana } });
+    }
+    if (llamadoHoy === "true") {
+      filtros.push({ fechaProximoLlamado: { $gte: hoy, $lt: manana } });
+    }
 
-    if (promesaHoy === "true")
-      filtros.push({ fechaPromesa: { $gte: hoy, $lt: mañana } });
-    if (llamadoHoy === "true")
-      filtros.push({ fechaProximoLlamado: { $gte: hoy, $lt: mañana } });
-
-    // IMPORTANTE: la búsqueda libre ahora se hace post-query para poder
-    // incluir nombres de Entidad/SubCesión (campos poblados).
     const query = filtros.length ? { $and: filtros } : {};
-
-    let proyecciones = await Proyeccion.find(query)
-      .populate("empleadoId", "username")
-      .populate("entidadId", "nombre")
-      .populate("subCesionId", "nombre")
-      .sort(ordenPor ? { [ordenPor]: orden === "asc" ? 1 : -1 } : {});
+    let proyecciones = await lecturaMongoConReintento(
+      () =>
+        Proyeccion.find(query)
+          .populate("empleadoId", "username nombre")
+          .populate("entidadId", "nombre numero")
+          .populate("subCesionId", "nombre")
+          .sort(ordenPor ? { [ordenPor]: orden === "asc" ? 1 : -1 } : {})
+          .maxTimeMS(30000),
+      "/proyecciones/resumen/data"
+    );
 
     if (buscar) {
-      const regex = new RegExp(buscar, "i");
-      const posibleDni = parseInt(buscar, 10);
-
+      const regex = new RegExp(escapeRegexSafe(buscar), "i");
+      const posibleDni = Number.parseInt(buscar, 10);
       proyecciones = proyecciones.filter((p) => {
         const matchTexto =
           regex.test(p.nombreTitular || "") ||
@@ -1053,12 +1560,227 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
           regex.test(p.estado || "") ||
           regex.test(p.entidadId?.nombre || "") ||
           regex.test(p.subCesionId?.nombre || "");
-        const matchDni = !isNaN(posibleDni) && Number(p.dni) === posibleDni;
+        const matchDni =
+          !Number.isNaN(posibleDni) && Number(p.dni) === posibleDni;
         return matchTexto || matchDni;
       });
     }
 
-    // ===== acumuladores =====
+    /*
+     * Los acuerdos de Mango forman parte de las estadísticas, pero nunca se
+     * suman dos veces. Si existe Mango para DNI + entidad, el control personal
+     * equivalente queda fuera del resumen (sigue visible en su tabla).
+     * Mango no posee subcesión, próximo llamado ni cantidad de gestiones; por
+     * eso se excluye solamente cuando alguno de esos filtros está activo.
+     */
+    const motivosExclusionMango = [];
+    if (subCesionId) motivosExclusionMango.push("subcesión");
+    if (llamadoHoy === "true") motivosExclusionMango.push("llamados de hoy");
+    if (sinGestion === "true") motivosExclusionMango.push("sin gestión");
+    if (estado) motivosExclusionMango.push("estado personal");
+    if (tipoFecha && tipoFecha !== "fechaPromesa") {
+      motivosExclusionMango.push("tipo de fecha");
+    }
+
+    let acuerdosMango = [];
+    let entidadesCatalogo = [];
+    if (!motivosExclusionMango.length) {
+      const condicionesMango = [
+        { borrado: { $ne: true } },
+        { resultadoGestion: /acuerdo/i },
+      ];
+
+      if (rangoDesde && rangoHasta) {
+        condicionesMango.push({ fecha: { $gte: rangoDesde, $lte: rangoHasta } });
+      } else if (promesaHoy === "true") {
+        condicionesMango.push({ fecha: { $gte: hoy, $lt: manana } });
+      } else if (mes && anio) {
+        const inicioMes = new Date(Number(anio), Number(mes) - 1, 1, 0, 0, 0, 0);
+        const finMes = new Date(Number(anio), Number(mes), 0, 23, 59, 59, 999);
+        condicionesMango.push({ fecha: { $gte: inicioMes, $lte: finMes } });
+      }
+
+      if (entidadId) {
+        const canonica = await resolverEntidadCanonica({ entidadId });
+        if (canonica) {
+          const variantes = variantesTextoEntidad(canonica.entidad).map(
+            (valor) => new RegExp(`^${escapeRegexSafe(valor)}$`, "i")
+          );
+          condicionesMango.push({
+            $or: [
+              { entidadNumero: canonica.entidadNumero },
+              { entidad: { $in: variantes } },
+            ],
+          });
+        }
+      }
+
+      if (concepto) {
+        const regexConcepto = new RegExp(escapeRegexSafe(concepto), "i");
+        condicionesMango.push({
+          $or: [
+            { resultadoGestion: regexConcepto },
+            { observacionGestion: regexConcepto },
+          ],
+        });
+      }
+
+      if (buscar) {
+        const regexBuscar = new RegExp(escapeRegexSafe(buscar), "i");
+        condicionesMango.push({
+          $or: [
+            { dni: regexBuscar },
+            { nombreDeudor: regexBuscar },
+            { entidad: regexBuscar },
+            { usuario: regexBuscar },
+            { resultadoGestion: regexBuscar },
+            { observacionGestion: regexBuscar },
+          ],
+        });
+      }
+
+      const queryMango = condicionesMango.length === 1
+        ? condicionesMango[0]
+        : { $and: condicionesMango };
+
+      const [gestionesMango, catalogo] = await lecturaMongoConReintento(
+        () =>
+          Promise.all([
+            ReporteGestion.find(queryMango)
+              .sort({ fecha: -1, hora: -1, _id: -1 })
+              .select(
+                "dni entidad entidadNumero nombreDeudor usuario fecha hora tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion"
+              )
+              .maxTimeMS(30000)
+              .lean(),
+            Entidad.find({}, "numero nombre").maxTimeMS(30000).lean(),
+          ]),
+        "/proyecciones/resumen/data · acuerdos Mango"
+      );
+      entidadesCatalogo = catalogo;
+      const numeroPorNombreTemporal = new Map(
+        catalogo.map((entidad) => [
+          String(entidad.nombre || "").trim().toUpperCase(),
+          Number(entidad.numero || 0),
+        ])
+      );
+      acuerdosMango = gestionesMango
+        .map((gestion) => mapearGestionAacuerdoMango(gestion, numeroPorNombreTemporal))
+        .filter(Boolean);
+    }
+
+    const numeroPorNombre = new Map(
+      entidadesCatalogo.map((entidad) => [
+        String(entidad.nombre || "").trim().toUpperCase(),
+        Number(entidad.numero || 0),
+      ])
+    );
+    const nombrePorNumero = new Map(
+      entidadesCatalogo.map((entidad) => [
+        Number(entidad.numero || 0),
+        String(entidad.nombre || "").trim(),
+      ])
+    );
+
+    const variantesObjetivo = await variantesOperadorObjetivo(req, usuarioId);
+    const acuerdosMangoVinculados = (await vincularAcuerdosMangoConPagos(acuerdosMango))
+      .filter((acuerdo) => acuerdoPerteneceAOperador(acuerdo, variantesObjetivo));
+
+    const clavesMango = new Set();
+    const acuerdosMangoConPagos = [];
+    for (const acuerdo of acuerdosMangoVinculados) {
+      const entidadNumero = Number(
+        acuerdo.entidadNumero ||
+          numeroPorNombre.get(String(acuerdo.entidad || "").trim().toUpperCase()) ||
+          0
+      );
+      const clave = claveDniEntidad(acuerdo.dni, entidadNumero);
+      if (!clave) continue;
+      clavesMango.add(clave);
+      acuerdosMangoConPagos.push({ ...acuerdo, entidadNumero });
+    }
+
+    let personalesOmitidosPorMango = 0;
+    const personalesIncluidosBase = proyecciones.filter((proyeccion) => {
+      const entidadNumero = Number(
+        proyeccion.entidadNumero || proyeccion.entidadId?.numero || 0
+      );
+      const duplicada = clavesMango.has(
+        claveDniEntidad(proyeccion.dni, entidadNumero)
+      );
+      if (duplicada) personalesOmitidosPorMango += 1;
+      return !duplicada;
+    });
+
+    const personalesIncluidos = await enriquecerProyeccionesConFuentes(
+      personalesIncluidosBase.map((proyeccion) => proyeccion.toObject())
+    );
+
+    const registrosResumen = [
+      ...personalesIncluidos.map((proyeccion) => {
+        const importe = Number(proyeccion.importe || 0);
+        const pagadoReal = Number(proyeccion?.pagosRealesResumen?.totalValido || 0);
+        const estadoReal = pagadoReal > 0
+          ? (importe > 0 && pagadoReal >= importe ? "Pagado" : "Pagado parcial")
+          : proyeccion.estado;
+        return {
+          ...proyeccion,
+          importePagado: pagadoReal,
+          estado: estadoReal,
+          empleadoId: {
+            ...(proyeccion.empleadoId || {}),
+            username:
+              proyeccion?.pagosRealesResumen?.operadorPago ||
+              proyeccion?.empleadoId?.username ||
+              "Sin usuario",
+          },
+          pagosEstadistica: proyeccion?.pagosRealesResumen?.pagosValidos || [],
+          _fuenteResumen: "manual",
+        };
+      }),
+      ...acuerdosMangoConPagos.map((acuerdo) => {
+        const importe = Number(
+          acuerdo.primerPago ||
+            acuerdo.anticipoMonto ||
+            acuerdo.montoCuota ||
+            acuerdo.montoTotalAcuerdo ||
+            acuerdo.deudaMin ||
+            0
+        );
+        const importePagado = Number(
+          acuerdo.montoPagosValidos || acuerdo.montoPagosPosteriores || 0
+        );
+        const fechaAcuerdo = acuerdo.fecha || acuerdo.fechaHora || null;
+        const estado = importePagado > 0
+          ? (importe > 0 && importePagado >= importe ? "Pagado" : "Pagado parcial")
+          : acuerdo.requiereRevisionPagos
+          ? "Requiere revisión"
+          : "Acuerdo Mango";
+        return {
+          _id: acuerdo._id,
+          dni: acuerdo.dni,
+          nombreTitular: acuerdo.nombreDeudor || "",
+          importe,
+          importePagado,
+          estado,
+          concepto: acuerdo.tipoAcuerdo || acuerdo.resultado || "Acuerdo",
+          fechaPromesa: fechaAcuerdo,
+          creado: fechaAcuerdo,
+          empleadoId: { username: acuerdo.operadorPago || acuerdo.operador || acuerdo.operadorGestion || "Sin usuario" },
+          entidadId: {
+            nombre:
+              nombrePorNumero.get(Number(acuerdo.entidadNumero || 0)) ||
+              acuerdo.entidad ||
+              "Sin entidad",
+            numero: acuerdo.entidadNumero,
+          },
+          subCesionId: { nombre: "Sin subcesión informada" },
+          pagosEstadistica: acuerdo.pagosValidos || [],
+          _fuenteResumen: "mango",
+        };
+      }),
+    ];
+
     const resumen = {
       totalImporte: 0,
       totalPagado: 0,
@@ -1066,136 +1788,118 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
       pagadas: 0,
       total: 0,
       porEstado: {},
-      porEntidad: {}, // ← reemplaza porCartera
+      porEntidad: {},
       porDia: {},
       porDiaCreacion: {},
-      porUsuario: {}, // para % simple
-      subCesiones: {}, // ← reemplaza fiduciarios
-      // 👇 nombres que espera el front
-      pagosPorDia: {}, // cantidad de pagos por día
-      montosPagosPorDia: {}, // monto de pagos por día
+      porUsuario: {},
+      subCesiones: {},
+      pagosPorDia: {},
+      montosPagosPorDia: {},
       totalPagos: 0,
       montoPagos: 0,
-      // para ranking extendido
-      _detUsuarios: {}, // { [usuario]: {total, importeTotal, pagadas, cantPagos, pagadoTotal} }
+      _detUsuarios: {},
     };
 
     const hoyDate = new Date();
     hoyDate.setHours(0, 0, 0, 0);
-
-    const normalizarFecha = (raw) => {
+    const normalizarFechaResumen = (raw) => {
       if (!raw) return null;
-      const d = new Date(raw);
-      return isNaN(d) ? null : d;
+      const date = new Date(raw);
+      return Number.isNaN(date.getTime()) ? null : date;
     };
-    const estaEnRango = (d) =>
-      !pagosDesde || !pagosHasta || (d >= pagosDesde && d <= pagosHasta);
+    const estaEnRangoPagos = (date) =>
+      !rangoDesde || !rangoHasta || (date >= rangoDesde && date <= rangoHasta);
+    const claveFecha = (date) =>
+      `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
+        2,
+        "0"
+      )}-${String(date.getDate()).padStart(2, "0")}`;
 
-    for (const p of proyecciones) {
-      const importe = Number(p.importe || 0) || 0;
-      const pagado = Number(p.importePagado || 0) || 0;
-      const estadoP = (p.estado || "Sin estado").trim();
-
+    for (const registro of registrosResumen) {
+      const importe = Number(registro.importe || 0) || 0;
+      const pagado = Number(registro.importePagado || 0) || 0;
+      const estadoRegistro = String(registro.estado || "Sin estado").trim();
       const entidadNombre =
-        (p.entidadId && (p.entidadId.nombre || "").trim()) || "Sin entidad";
+        String(registro.entidadId?.nombre || "").trim() || "Sin entidad";
       const subCesionNombre =
-        (p.subCesionId && (p.subCesionId.nombre || "").trim()) ||
-        "Sin subcesión";
+        String(registro.subCesionId?.nombre || "").trim() || "Sin subcesión";
+      const usuario = registro.empleadoId?.username || "Sin usuario";
 
-      const usuario = p.empleadoId?.username || "Sin usuario";
-
-      resumen.total++;
+      resumen.total += 1;
       resumen.totalImporte += importe;
       resumen.totalPagado += pagado;
 
-      const cumplida = estadoP === "Pagado" || estadoP === "Pagado parcial";
-      if (cumplida) resumen.pagadas++;
+      const cumplida =
+        estadoRegistro === "Pagado" || estadoRegistro === "Pagado parcial";
+      if (cumplida) resumen.pagadas += 1;
 
-      const fProm = normalizarFecha(p.fechaPromesa);
+      const fechaPromesa = normalizarFechaResumen(registro.fechaPromesa);
       if (
-        estadoP === "Promesa caída" &&
+        estadoRegistro === "Promesa caída" &&
         pagado === 0 &&
-        fProm &&
-        fProm < hoyDate
+        fechaPromesa &&
+        fechaPromesa < hoyDate
       ) {
-        resumen.vencidasSinPago++;
+        resumen.vencidasSinPago += 1;
       }
 
-      resumen.porEstado[estadoP] = (resumen.porEstado[estadoP] || 0) + 1;
+      resumen.porEstado[estadoRegistro] =
+        (resumen.porEstado[estadoRegistro] || 0) + 1;
       resumen.porEntidad[entidadNombre] =
         (resumen.porEntidad[entidadNombre] || 0) + 1;
+      resumen.subCesiones[subCesionNombre] =
+        (resumen.subCesiones[subCesionNombre] || 0) + 1;
 
-      if (fProm) {
-        const k = `${fProm.getFullYear()}-${String(
-          fProm.getMonth() + 1
-        ).padStart(2, "0")}-${String(fProm.getDate()).padStart(2, "0")}`;
-        resumen.porDia[k] = (resumen.porDia[k] || 0) + 1;
+      if (fechaPromesa) {
+        const key = claveFecha(fechaPromesa);
+        resumen.porDia[key] = (resumen.porDia[key] || 0) + 1;
+      }
+      const fechaCreacion = normalizarFechaResumen(registro.creado);
+      if (fechaCreacion) {
+        const key = claveFecha(fechaCreacion);
+        resumen.porDiaCreacion[key] =
+          (resumen.porDiaCreacion[key] || 0) + 1;
       }
 
-      const fCrea = normalizarFecha(p.creado);
-      if (fCrea) {
-        const k = `${fCrea.getFullYear()}-${String(
-          fCrea.getMonth() + 1
-        ).padStart(2, "0")}-${String(fCrea.getDate()).padStart(2, "0")}`;
-        resumen.porDiaCreacion[k] = (resumen.porDiaCreacion[k] || 0) + 1;
-      }
-
-      // por usuario (simple)
       resumen.porUsuario[usuario] = resumen.porUsuario[usuario] || {
         total: 0,
         pagadas: 0,
       };
-      resumen.porUsuario[usuario].total++;
-      if (cumplida) resumen.porUsuario[usuario].pagadas++;
+      resumen.porUsuario[usuario].total += 1;
+      if (cumplida) resumen.porUsuario[usuario].pagadas += 1;
 
-      // por usuario (detallado)
-      const det = (resumen._detUsuarios[usuario] = resumen._detUsuarios[
-        usuario
-      ] || {
-        total: 0,
-        importeTotal: 0,
-        pagadas: 0,
-        cantPagos: 0,
-        pagadoTotal: 0,
-      });
-      det.total += 1;
-      det.importeTotal += importe;
-      if (cumplida) det.pagadas += 1;
+      const detalle = (resumen._detUsuarios[usuario] =
+        resumen._detUsuarios[usuario] || {
+          total: 0,
+          importeTotal: 0,
+          pagadas: 0,
+          cantPagos: 0,
+          pagadoTotal: 0,
+        });
+      detalle.total += 1;
+      detalle.importeTotal += importe;
+      if (cumplida) detalle.pagadas += 1;
 
-      // SubCesiones
-      resumen.subCesiones[subCesionNombre] =
-        (resumen.subCesiones[subCesionNombre] || 0) + 1;
-
-      // pagos informados (en rango)
-      for (const pago of p.pagosInformados || []) {
-        if (!pago || pago.erroneo) continue;
-        const fPago = normalizarFecha(
+      for (const pago of registro.pagosEstadistica || []) {
+        const fechaPago = normalizarFechaResumen(
           pago.fecha || pago.fechaPago || pago.creado || pago.createdAt
         );
-        if (!fPago || !estaEnRango(fPago)) continue;
-
-        const key = `${fPago.getFullYear()}-${String(
-          fPago.getMonth() + 1
-        ).padStart(2, "0")}-${String(fPago.getDate()).padStart(2, "0")}`;
-        const monto = Number(pago.monto ?? pago.importe ?? 0) || 0;
-
+        if (!fechaPago || !estaEnRangoPagos(fechaPago)) continue;
+        const key = claveFecha(fechaPago);
+        const montoPago = Number(pago.monto ?? pago.importe ?? 0) || 0;
         resumen.pagosPorDia[key] = (resumen.pagosPorDia[key] || 0) + 1;
         resumen.montosPagosPorDia[key] =
-          (resumen.montosPagosPorDia[key] || 0) + monto;
-
-        resumen.totalPagos++;
-        resumen.montoPagos += monto;
-
-        // por usuario (detallado)
-        det.cantPagos += 1;
-        det.pagadoTotal += monto;
+          (resumen.montosPagosPorDia[key] || 0) + montoPago;
+        resumen.totalPagos += 1;
+        resumen.montoPagos += montoPago;
+        detalle.cantPagos += 1;
+        detalle.pagadoTotal += montoPago;
       }
     }
 
     const porcentajeCumplimiento = resumen.total
       ? ((resumen.pagadas / resumen.total) * 100).toFixed(1)
       : "0.0";
-
     const porcentajeVencidas = resumen.total
       ? ((resumen.vencidasSinPago / resumen.total) * 100).toFixed(1)
       : "0.0";
@@ -1204,7 +1908,6 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
       .map(([usuario, data]) => ({ usuario, total: data.total }))
       .sort((a, b) => b.total - a.total)
       .slice(0, 3);
-
     const rankingCumplimiento = Object.entries(resumen.porUsuario)
       .map(([usuario, data]) => ({
         usuario,
@@ -1213,50 +1916,64 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
             ? ((data.pagadas / data.total) * 100).toFixed(1)
             : "0.0",
       }))
-      .sort((a, b) => b.porcentaje - a.porcentaje);
-
-    // 🏆 Ranking extendido con todo lo que pediste
+      .sort((a, b) => Number(b.porcentaje) - Number(a.porcentaje));
     const rankingDetallado = Object.entries(resumen._detUsuarios)
-      .map(([usuario, d]) => ({
+      .map(([usuario, data]) => ({
         usuario,
-        total: d.total, // # promesas
-        importeTotal: d.importeTotal, // $ comprometido
-        pagadas: d.pagadas, // # promesas cumplidas
-        cantPagos: d.cantPagos, // # pagos en el rango
-        pagadoTotal: d.pagadoTotal, // $ pagado (en el rango)
+        total: data.total,
+        importeTotal: data.importeTotal,
+        pagadas: data.pagadas,
+        cantPagos: data.cantPagos,
+        pagadoTotal: data.pagadoTotal,
         porcentaje:
-          d.total > 0 ? ((d.pagadas / d.total) * 100).toFixed(1) : "0.0",
+          data.total > 0
+            ? ((data.pagadas / data.total) * 100).toFixed(1)
+            : "0.0",
       }))
-      .sort((a, b) => parseFloat(b.porcentaje) - parseFloat(a.porcentaje));
+      .sort((a, b) => Number(b.porcentaje) - Number(a.porcentaje));
 
-    res.json({
+    return res.json({
       totalImporte: resumen.totalImporte,
       totalPagado: resumen.totalPagado,
       porcentajeVencidas,
       porcentajeCumplimiento,
       porEstado: resumen.porEstado,
-      porEntidad: resumen.porEntidad, // ← nuevo nombre
+      porEntidad: resumen.porEntidad,
       porDia: resumen.porDia,
       porDiaCreacion: resumen.porDiaCreacion,
       topUsuarios,
-      rankingCumplimiento, // compatibilidad
-      rankingDetallado, // 👈 usado por el front nuevo
-      subCesiones: resumen.subCesiones, // ← nuevo nombre
+      rankingCumplimiento,
+      rankingDetallado,
+      subCesiones: resumen.subCesiones,
       pagadas: resumen.pagadas,
       total: resumen.total,
       vencidasSinPago: resumen.vencidasSinPago,
-      // 👇 nombres que espera el front para el gráfico
       pagosPorDia: resumen.pagosPorDia,
       montosPagosPorDia: resumen.montosPagosPorDia,
       totalPagos: resumen.totalPagos,
       montoPagos: resumen.montoPagos,
+      fuentes: {
+        acuerdosMango: acuerdosMangoConPagos.length,
+        acuerdosManualesIncluidos: personalesIncluidos.length,
+        acuerdosPersonalesIncluidos: personalesIncluidos.length,
+        personalesOmitidosPorMango,
+        criterioDeduplicacion: "DNI + entidad",
+        mangoIncluido: motivosExclusionMango.length === 0,
+        motivosExclusionMango,
+      },
     });
   } catch (error) {
     console.error("❌ Error en obtenerProyeccionesParaResumen:", error);
-    res.status(500).json({ error: "Error al obtener resumen" });
+    return res.status(500).json({
+      error: esErrorMongoTransitorio(error)
+        ? "La conexión con la base de datos se interrumpió al calcular las estadísticas. Reintentá en unos segundos."
+        : "Error al obtener resumen",
+      codigo: esErrorMongoTransitorio(error)
+        ? "DB_CONNECTION_RESET"
+        : "PROYECCIONES_SUMMARY_ERROR",
+    });
   }
 };
-
 export const informarPago = async (req, res) => {
   try {
     const { id } = req.params; // proyeccionId
@@ -1287,8 +2004,8 @@ export const informarPago = async (req, res) => {
       });
     }
 
-    if (esAdmin(req)) return res.status(403).json({ error: "Sin acceso" });
-    if (esOperativo(req) && String(proy.empleadoId) !== String(req.user.id)) {
+    if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso" });
+    if (esAmbitoPropio(req) && !esDueno(req, proy)) {
       return res
         .status(403)
         .json({ error: "No autorizado para informar pago" });
@@ -1321,14 +2038,15 @@ export const informarPago = async (req, res) => {
       operadorId: req.user.id,
     });
 
-    // Recalcular importePagado desde pagosInformados (solo válidos)
-    proy.importePagado = recalcularImportePagado(proy);
+    if (!PAGOS_FUENTE_UNICA_ACTIVA) {
+      // Compatibilidad temporal con el funcionamiento anterior.
+      proy.importePagado = calcularTotalInformado(proy);
+    }
     proy.ultimaModificacion = new Date();
-
     await proy.save();
-
-    // Actualizar estado (Pagado / Pagado parcial / etc.)
-    await actualizarEstadoAutomaticamente(proy);
+    if (!PAGOS_FUENTE_UNICA_ACTIVA) {
+      await actualizarEstadoAutomaticamente(proy);
+    }
 
     // Devolver proyección actualizada (con operador y creador para el front)
     const actualizado = await Proyeccion.findById(id)
@@ -1346,7 +2064,7 @@ export const listarPagosInformados = async (req, res) => {
   try {
     const { id } = req.params;
 
-    if (esAdmin(req)) return res.status(403).json({ error: "Sin acceso" });
+    if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso" });
 
     const proy = await Proyeccion.findById(id)
       .select("empleadoId pagosInformados")
@@ -1357,7 +2075,7 @@ export const listarPagosInformados = async (req, res) => {
     if (!proy)
       return res.status(404).json({ error: "Proyección no encontrada" });
 
-    if (esOperativo(req) && String(proy.empleadoId) !== String(req.user.id)) {
+    if (esAmbitoPropio(req) && !esDueno(req, proy)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -1392,8 +2110,8 @@ export const marcarPagoErroneo = async (req, res) => {
       });
     }
 
-    if (esAdmin(req)) return res.status(403).json({ error: "Sin acceso" });
-    if (esOperativo(req) && String(proy.empleadoId) !== String(req.user.id)) {
+    if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso" });
+    if (esAmbitoPropio(req) && !esDueno(req, proy)) {
       return res
         .status(403)
         .json({ error: "No autorizado para marcar este pago" });
@@ -1411,16 +2129,14 @@ export const marcarPagoErroneo = async (req, res) => {
     pago.marcadoPor = req.user.id;
     pago.marcadoEn = new Date();
 
-    // Recalcular importePagado (solo los NO erróneos)
-    proy.importePagado = (proy.pagosInformados || [])
-      .filter((p) => !p.erroneo)
-      .reduce((acc, p) => acc + Number(p.monto || 0), 0);
-
+    if (!PAGOS_FUENTE_UNICA_ACTIVA) {
+      proy.importePagado = calcularTotalInformado(proy);
+    }
     proy.ultimaModificacion = new Date();
     await proy.save();
-
-    // Reajustar estado automático (Pagado / Parcial / Promesa activa/caída)
-    await actualizarEstadoAutomaticamente(proy);
+    if (!PAGOS_FUENTE_UNICA_ACTIVA) {
+      await actualizarEstadoAutomaticamente(proy);
+    }
 
     // Responder con datos enriquecidos para el front
     const actualizado = await Proyeccion.findById(id)
@@ -1462,15 +2178,22 @@ export const limpiarPagosProyeccion = async (req, res) => {
 
     const rol = rolDe(req);
 
+    if (!tieneAccesoProyecciones(req)) {
+      return res.status(403).json({ error: "Sin acceso" });
+    }
+    if (esAmbitoPropio(req) && !esDueno(req, proyeccion)) {
+      return res.status(403).json({ error: "No autorizado para limpiar pagos" });
+    }
+
     // Asegurar array
     proyeccion.pagosInformados = proyeccion.pagosInformados || [];
 
-    if (esOperativo(req)) {
+    if (esAmbitoPropio(req)) {
       // Operador: limpia SOLO sus propios pagos
       proyeccion.pagosInformados = proyeccion.pagosInformados.filter(
         (p) => String(p.operadorId) !== String(req.user.id)
       );
-    } else if (esSuper(req)) {
+    } else if (esAmbitoGlobal(req)) {
       // Admin / Super-admin: limpia TODOS los pagos
       proyeccion.pagosInformados = [];
     } else {
@@ -1480,12 +2203,14 @@ export const limpiarPagosProyeccion = async (req, res) => {
         .json({ error: "No autorizado para limpiar pagos" });
     }
 
-    // Recalcular importePagado a partir de pagos NO erróneos
-    proyeccion.importePagado = recalcularImportePagado(proyeccion);
+    if (!PAGOS_FUENTE_UNICA_ACTIVA) {
+      proyeccion.importePagado = calcularTotalInformado(proyeccion);
+    }
     proyeccion.ultimaModificacion = new Date();
-
     await proyeccion.save();
-    await actualizarEstadoAutomaticamente(proyeccion);
+    if (!PAGOS_FUENTE_UNICA_ACTIVA) {
+      await actualizarEstadoAutomaticamente(proyeccion);
+    }
 
     // Devolver proyección actualizada con datos útiles
     const actualizado = await Proyeccion.findById(proyeccion._id)
@@ -1495,8 +2220,8 @@ export const limpiarPagosProyeccion = async (req, res) => {
     return res.json({
       ok: true,
       mensaje:
-        rol === "operador"
-          ? "Pagos del operador actual limpiados correctamente"
+        esAmbitoPropio(req)
+          ? "Pagos del usuario actual limpiados correctamente"
           : "Se limpiaron todos los pagos informados",
       proyeccion: actualizado?.toObject?.() || actualizado,
     });
@@ -1525,18 +2250,15 @@ export const limpiarObservacionesProyeccion = async (req, res) => {
     }
 
     // 👤 Permisos
-    if (esAdmin(req)) {
+    if (!tieneAccesoProyecciones(req)) {
       return res.status(403).json({ error: "Sin acceso" });
     }
-    if (
-      esOperativo(req) &&
-      String(proyeccion.empleadoId) !== String(req.user.id)
-    ) {
+    if (esAmbitoPropio(req) && !esDueno(req, proyeccion)) {
       return res
         .status(403)
         .json({ error: "No autorizado para limpiar observaciones" });
     }
-    if (!esOperativo(req) && !esSuper(req)) {
+    if (!tieneAccesoProyecciones(req)) {
       return res.status(403).json({ error: "Rol no autorizado" });
     }
 
@@ -1567,8 +2289,7 @@ export const limpiarObservacionesProyeccion = async (req, res) => {
 export const importarPagosMasivo = async (req, res) => {
   try {
     // 1) Seguridad por rol (la ruta igual debería tener el middleware)
-    const rol = req.user.role || req.user.rol;
-    if (!["admin", "super-admin"].includes(rol)) {
+    if (!esSuperAdmin(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -1630,13 +2351,16 @@ export const importarPagosMasivo = async (req, res) => {
     // etiquetas: Entidad "n - NOMBRE" / SubCesión "NOMBRE"
     const buildLabelMaps = async () => {
       const [ents, subs] = await Promise.all([
-        Entidad.find({}, "nombre").sort({ nombre: 1 }).lean(),
+        Entidad.find({}, "nombre numero").sort({ numero: 1, nombre: 1 }).lean(),
         SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
       ]);
       const entLabelById = new Map(); // id -> "n - NOMBRE"
       const subNameById = new Map(); // id -> "NOMBRE"
-      ents.forEach((e, i) =>
-        entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`)
+      ents.forEach((e) =>
+        entLabelById.set(
+          String(e._id),
+          Number.isFinite(Number(e.numero)) ? `${e.numero} - ${e.nombre}` : e.nombre
+        )
       );
       subs.forEach((s) => subNameById.set(String(s._id), s.nombre));
       const entLabel = (id, fallbackName) =>
@@ -1920,12 +2644,14 @@ export const importarPagosMasivo = async (req, res) => {
         observacion: rawObs ? String(rawObs) : undefined,
       });
 
-      // Recalcular importePagado solo con NO erróneos
-      proy.importePagado = recalcularImportePagado(proy);
+      if (!PAGOS_FUENTE_UNICA_ACTIVA) {
+        proy.importePagado = calcularTotalInformado(proy);
+      }
       proy.ultimaModificacion = new Date();
-
       await proy.save();
-      await actualizarEstadoAutomaticamente(proy);
+      if (!PAGOS_FUENTE_UNICA_ACTIVA) {
+        await actualizarEstadoAutomaticamente(proy);
+      }
 
       ok++;
     }
@@ -1973,7 +2699,7 @@ export const importarPagosMasivo = async (req, res) => {
 
 export const eliminarProyeccionesMasivo = async (req, res) => {
   try {
-    if (!esSuper(req)) return res.status(403).json({ error: "Solo super-admin puede eliminar proyecciones masivamente" });
+    if (!esSuperAdmin(req)) return res.status(403).json({ error: "Solo super-admin puede eliminar proyecciones masivamente" });
     const confirmacion = String(req.body?.confirmacion || "").trim();
     if (confirmacion !== "ELIMINAR PROYECCIONES") {
       return res.status(400).json({ error: "Confirmación inválida" });
@@ -2012,20 +2738,23 @@ export const exportarProyeccionesExcel = async (req, res) => {
       ids,
     } = req.query;
 
-    if (esAdmin(req)) {
+    if (!tieneAccesoProyecciones(req)) {
       return res.status(403).json({ error: "Sin acceso a exportación" });
     }
 
     // etiquetas: Entidad "n - NOMBRE" / SubCesión "NOMBRE"
     const buildLabelMaps = async () => {
       const [ents, subs] = await Promise.all([
-        Entidad.find({}, "nombre").sort({ nombre: 1 }).lean(),
+        Entidad.find({}, "nombre numero").sort({ numero: 1, nombre: 1 }).lean(),
         SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
       ]);
       const entLabelById = new Map(); // id -> "n - NOMBRE"
       const subNameById = new Map(); // id -> "NOMBRE"
-      ents.forEach((e, i) =>
-        entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`)
+      ents.forEach((e) =>
+        entLabelById.set(
+          String(e._id),
+          Number.isFinite(Number(e.numero)) ? `${e.numero} - ${e.nombre}` : e.nombre
+        )
       );
       subs.forEach((s) => subNameById.set(String(s._id), s.nombre));
       const entLabel = (id, fallbackName) =>
@@ -2045,7 +2774,7 @@ export const exportarProyeccionesExcel = async (req, res) => {
     const filtros = [];
     const idsSeleccionados = String(ids || "").split(",").map((value) => value.trim()).filter((value) => mongoose.isValidObjectId(value));
     if (idsSeleccionados.length) filtros.push({ _id: { $in: idsSeleccionados } });
-    if (esSuper(req)) {
+    if (esAmbitoGlobal(req)) {
       if (usuarioId) filtros.push({ empleadoId: usuarioId });
     } else {
       filtros.push({ empleadoId: req.user.id });
@@ -2213,16 +2942,14 @@ export const exportarPagosExcel = async (req, res) => {
       soloNoErroneos = "false",
     } = req.query;
 
-    const rol = rolDe(req);
-
     // --- filtros sobre PROYECCIONES ---
     const filtros = [];
 
     // operador: solo sus proyecciones
-    if (esAdmin(req)) {
+    if (!tieneAccesoProyecciones(req)) {
       return res.status(403).json({ error: "Sin acceso a exportación" });
     }
-    if (esOperativo(req)) {
+    if (esAmbitoPropio(req)) {
       filtros.push({ empleadoId: req.user.id });
     } else if (usuarioId) {
       // super-admin: puede pasar usuarioId para filtrar
@@ -2283,13 +3010,16 @@ export const exportarPagosExcel = async (req, res) => {
     // etiquetas: Entidad "n - NOMBRE" / SubCesión "NOMBRE"
     const buildLabelMaps = async () => {
       const [ents, subs] = await Promise.all([
-        Entidad.find({}, "nombre").sort({ nombre: 1 }).lean(),
+        Entidad.find({}, "nombre numero").sort({ numero: 1, nombre: 1 }).lean(),
         SubCesion.find({}, "nombre").sort({ nombre: 1 }).lean(),
       ]);
       const entLabelById = new Map(); // id -> "n - NOMBRE"
       const subNameById = new Map(); // id -> "NOMBRE"
-      ents.forEach((e, i) =>
-        entLabelById.set(String(e._id), `${i + 1} - ${e.nombre}`)
+      ents.forEach((e) =>
+        entLabelById.set(
+          String(e._id),
+          Number.isFinite(Number(e.numero)) ? `${e.numero} - ${e.nombre}` : e.nombre
+        )
       );
       subs.forEach((s) => subNameById.set(String(s._id), s.nombre));
       const entLabel = (id, fallbackName) =>
@@ -2377,7 +3107,7 @@ export const exportarPagosExcel = async (req, res) => {
 
 export const importarProyeccionesMasivo = async (req, res) => {
   try {
-    if (!esSuper(req)) {
+    if (!esSuperAdmin(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -2634,6 +3364,8 @@ export const importarProyeccionesMasivo = async (req, res) => {
           doc.anio = anio;
           doc.mes = mes;
           doc.empleadoId = ownerId;
+          doc.entidadNumero = Number(entidad.numero);
+          doc.origen = "control-personal";
           doc.ultimaModificacion = new Date();
           await doc.save();
 
@@ -2692,8 +3424,10 @@ export const importarProyeccionesMasivo = async (req, res) => {
           creado: new Date(),
           ultimaModificacion: new Date(),
           entidadId: entidad._id,
+          entidadNumero: Number(entidad.numero),
           subCesionId: sub._id,
           idProyeccionLogico: `${dni}-${entidad._id}-${sub._id}`,
+          origen: "control-personal",
         });
 
         try {
@@ -2716,7 +3450,9 @@ export const importarProyeccionesMasivo = async (req, res) => {
               actual.mes = mes;
               actual.empleadoId = ownerId;
               actual.entidadId = entidad._id;
+              actual.entidadNumero = Number(entidad.numero);
               actual.subCesionId = sub._id;
+              actual.origen = "control-personal";
               actual.idProyeccionLogico = `${dni}-${entidad._id}-${sub._id}`;
               actual.ultimaModificacion = new Date();
               await actual.save();
@@ -2812,5 +3548,715 @@ export const importarProyeccionesMasivo = async (req, res) => {
   } catch (err) {
     console.error("Error en importarProyeccionesMasivo:", err);
     res.status(500).json({ error: "Error interno al importar proyecciones" });
+  }
+};
+
+/**
+ * Referencia informativa: muestra acuerdos confirmados importados desde Mango
+ * antes de guardar un control personal. No crea ni modifica proyecciones.
+ */
+export const buscarCoincidenciasAcuerdosMango = async (req, res) => {
+  try {
+    if (!tieneAccesoProyecciones(req)) {
+      return res.status(403).json({ error: "Sin acceso" });
+    }
+
+    const dni = normalizarDni(req.query?.dni);
+    const entidadCanonica = await resolverEntidadCanonica({
+      entidadId: req.query?.entidadId,
+      entidadNumero: req.query?.entidadNumero,
+    });
+
+    if (!dni || !entidadCanonica) {
+      return res.status(400).json({
+        error: "Para revisar acuerdos se necesita DNI y una entidad válida.",
+      });
+    }
+
+    const variantes = variantesTextoEntidad(entidadCanonica.entidad);
+    const filtrosEntidad = variantes.map(
+      (valor) => new RegExp(`^${escapeRegexSafe(valor)}$`, "i")
+    );
+
+    const filtroControles = {
+      dni: Number(dni),
+      $or: [
+        { entidadNumero: entidadCanonica.entidadNumero },
+        { entidadId: entidadCanonica.entidadId },
+      ],
+    };
+    if (esAmbitoPropio(req)) filtroControles.empleadoId = req.user.id;
+
+    const [gestionesAcuerdo, controlesPersonales, mapasEntidad] = await Promise.all([
+      ReporteGestion.find({
+        dni,
+        borrado: { $ne: true },
+        resultadoGestion: /acuerdo/i,
+        $or: [
+          { entidadNumero: entidadCanonica.entidadNumero },
+          { entidad: { $in: filtrosEntidad } },
+        ],
+      })
+        .sort({ fecha: -1, hora: -1, _id: -1 })
+        .limit(25)
+        .select(
+          "dni entidad entidadNumero nombreDeudor usuario fecha hora tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion"
+        )
+        .lean(),
+      Proyeccion.find(filtroControles)
+        .sort({ isActiva: -1, fechaPromesa: -1, createdAt: -1 })
+        .limit(5)
+        .populate("empleadoId", "username nombre")
+        .populate("subCesionId", "nombre")
+        .select(
+          "dni nombreTitular importe concepto fechaPromesa fechaProximoLlamado estado isActiva observaciones origen empleadoId subCesionId"
+        )
+        .lean(),
+      construirMapasEntidades(),
+    ]);
+
+    const acuerdos = gestionesAcuerdo
+      .map((gestion) => mapearGestionAacuerdoMango(gestion, mapasEntidad.numeroPorNombre))
+      .filter(Boolean)
+      .slice(0, 5);
+
+    return res.json({
+      ok: true,
+      coincidencias: acuerdos.length + controlesPersonales.length,
+      coincidenciasMango: acuerdos.length,
+      coincidenciasControles: controlesPersonales.length,
+      entidad: {
+        _id: entidadCanonica.entidadId,
+        numero: entidadCanonica.entidadNumero,
+        nombre: entidadCanonica.entidadNombre,
+      },
+      acuerdos,
+      controlesPersonales,
+      mensaje:
+        acuerdos.length || controlesPersonales.length
+          ? "Ya existe información para este DNI y entidad. Los acuerdos de Mango y los acuerdos manuales se mantienen separados."
+          : "No se encontraron acuerdos de Mango ni acuerdos manuales para este DNI y entidad.",
+    });
+  } catch (error) {
+    console.error("❌ Error buscando acuerdos Mango para proyección:", error);
+    return res.status(500).json({ error: "No se pudo revisar los acuerdos confirmados" });
+  }
+};
+
+/**
+ * Conciliación de solo lectura. No cambia importePagado ni estado.
+ * Permite validar la futura fuente única antes de activarla.
+ */
+export const obtenerConciliacionPagosProyeccion = async (req, res) => {
+  try {
+    const proyeccion = await Proyeccion.findById(req.params.id)
+      .populate("entidadId", "numero nombre")
+      .lean();
+    if (!proyeccion) return res.status(404).json({ error: "Proyección no encontrada" });
+
+    if (esAmbitoPropio(req) && !esDueno(req, proyeccion)) {
+      return res.status(403).json({ error: "No autorizado" });
+    }
+
+    const entidadNumero =
+      Number(proyeccion.entidadNumero) || Number(proyeccion.entidadId?.numero);
+    const conciliacion = await buscarPagosReales({
+      dni: proyeccion.dni,
+      entidadNumero,
+      subCesionId: proyeccion.subCesionId,
+      fechaCorte:
+        proyeccion.creado ||
+        proyeccion.createdAt ||
+        proyeccion.fechaPromesaInicial ||
+        proyeccion.fechaPromesa,
+    });
+
+    return res.json({
+      ok: true,
+      modo: "solo-lectura",
+      modificaSaldos: false,
+      proyeccionId: proyeccion._id,
+      importeComprometido: proyeccion.importe,
+      importeInformadoHistorico: calcularTotalInformado(proyeccion),
+      ...conciliacion,
+    });
+  } catch (error) {
+    console.error("❌ Error conciliando pagos de proyección:", error);
+    return res.status(500).json({ error: "No se pudo conciliar la proyección con Pagos" });
+  }
+};
+
+let moduloPagosDisponibleCache = { value: null, at: 0 };
+const MODULO_PAGOS_TTL_MS = 60_000;
+
+const vincularAcuerdosMangoConPagos = async (acuerdos = []) => {
+  if (!acuerdos.length) return acuerdos;
+  const dnis = [...new Set(acuerdos.map((item) => normalizarDni(item.dni)).filter(Boolean))];
+  const fechas = acuerdos.map((item) => new Date(item.fecha)).filter((date) => !Number.isNaN(date.getTime()));
+  const fechaMinima = fechas.length ? new Date(Math.min(...fechas.map((date) => date.getTime()))) : null;
+  const paymentQuery = { dni: { $in: dnis } };
+  if (fechaMinima) paymentQuery.fechaPago = { $gte: new Date(fechaMinima.getTime() - 90 * 86400000) };
+
+  const ahora = Date.now();
+  const necesitaConsultarDisponibilidad =
+    moduloPagosDisponibleCache.value == null ||
+    ahora - moduloPagosDisponibleCache.at >= MODULO_PAGOS_TTL_MS;
+
+  const [pagos, mapas, existeModuloPagos] = await Promise.all([
+    dnis.length
+      ? Pago.find(paymentQuery)
+          .select("idPago dni entidadId subCesionId fechaPago monto conceptoCodigo estado operadorUsername operadorId")
+          .sort({ fechaPago: 1, _id: 1 })
+          .lean()
+          .maxTimeMS(20000)
+      : [],
+    construirMapasEntidades(),
+    necesitaConsultarDisponibilidad
+      ? Pago.exists({}).then((value) => {
+          moduloPagosDisponibleCache = { value: Boolean(value), at: Date.now() };
+          return Boolean(value);
+        })
+      : moduloPagosDisponibleCache.value,
+  ]);
+
+  return vincularPagosPosteriores(acuerdos, pagos, mapas.entidades, {
+    disponible: Boolean(existeModuloPagos),
+    motivo: existeModuloPagos ? "" : "SIN_PAGOS_CARGADOS",
+  });
+};
+
+const enriquecerAcuerdosMangoConPagosInformados = async (acuerdos = []) => {
+  const ids = acuerdos
+    .map((item) => String(item?._id || item?.id || ""))
+    .filter((id) => mongoose.isValidObjectId(id));
+  if (!ids.length) return acuerdos;
+
+  const avisos = await PagoInformadoMango.find({
+    acuerdoGestionId: { $in: ids },
+    erroneo: { $ne: true },
+  })
+    .select("acuerdoGestionId fecha monto operadorId createdAt")
+    .sort({ fecha: -1, createdAt: -1 })
+    .lean()
+    .maxTimeMS(15000);
+
+  const resumenPorAcuerdo = new Map();
+  for (const aviso of avisos) {
+    const key = String(aviso.acuerdoGestionId || "");
+    const actual = resumenPorAcuerdo.get(key) || {
+      cantidad: 0,
+      total: 0,
+      ultimaFecha: null,
+    };
+    actual.cantidad += 1;
+    actual.total += Number(aviso.monto || 0);
+    if (!actual.ultimaFecha || new Date(aviso.fecha) > new Date(actual.ultimaFecha)) {
+      actual.ultimaFecha = aviso.fecha;
+    }
+    resumenPorAcuerdo.set(key, actual);
+  }
+
+  return acuerdos.map((acuerdo) => ({
+    ...acuerdo,
+    pagosInformadosResumen:
+      resumenPorAcuerdo.get(String(acuerdo?._id || acuerdo?.id || "")) || {
+        cantidad: 0,
+        total: 0,
+        ultimaFecha: null,
+      },
+  }));
+};
+
+const normalizarEstadoMango = (valor = "") =>
+  String(valor || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase();
+
+/**
+ * Traduce un acuerdo confirmado de Mango a los mismos estados operativos que
+ * usa la tabla de acuerdos manuales. Los pagos informados no intervienen: solo
+ * cuentan los pagos válidos conciliados con COBRINA.
+ */
+const calcularEstadoSeguimientoMango = (acuerdo = {}) => {
+  const esperado = Number(
+    acuerdo.primerPago || acuerdo.anticipoMonto || acuerdo.montoCuota || 0
+  );
+  const totalAcuerdo = Number(acuerdo.montoTotalAcuerdo || 0);
+  const objetivo = esperado > 0 ? esperado : totalAcuerdo;
+  const pagado = Number(
+    acuerdo.montoPagosValidos ?? acuerdo.montoPagosPosteriores ?? 0
+  );
+
+  if (objetivo > 0 && pagado >= objetivo) return "Pagado";
+  if (pagado > 0) return "Pagado parcial";
+
+  const vencimientoRaw = acuerdo.anticipoVto || acuerdo.primerVto || null;
+  const textoVencimiento = String(vencimientoRaw || "").trim();
+  let vencimientoISO = "";
+
+  const ymd = textoVencimiento.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  const dmy = textoVencimiento.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})/);
+  if (ymd) {
+    vencimientoISO = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+  } else if (dmy) {
+    vencimientoISO = `${dmy[3]}-${String(dmy[2]).padStart(2, "0")}-${String(dmy[1]).padStart(2, "0")}`;
+  } else if (vencimientoRaw) {
+    const fecha = new Date(vencimientoRaw);
+    if (!Number.isNaN(fecha.getTime())) vencimientoISO = fecha.toISOString().slice(0, 10);
+  }
+
+  if (vencimientoISO) {
+    const hoy = new Date();
+    const hoyISO = `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, "0")}-${String(hoy.getDate()).padStart(2, "0")}`;
+    if (vencimientoISO < hoyISO) return "Promesa caída";
+  }
+
+  return "Promesa activa";
+};
+
+const coincideEstadoMango = (acuerdo = {}, estadoSolicitado = "") => {
+  const solicitado = normalizarEstadoMango(estadoSolicitado);
+  if (!solicitado) return true;
+
+  // Compatibilidad con nombres que pudieron quedar guardados en filtros viejos.
+  const alias = {
+    vencido: "promesa caida",
+    caido: "promesa caida",
+    "promesa vencida": "promesa caida",
+    activo: "promesa activa",
+    parcial: "pagado parcial",
+  };
+  const esperado = alias[solicitado] || solicitado;
+  return normalizarEstadoMango(calcularEstadoSeguimientoMango(acuerdo)) === esperado;
+};
+
+/**
+ * Construye la misma consulta para la vista y para el Excel de acuerdos Mango.
+ * Los filtros se reciben desde el bloque general de Proyecciones; no existe un
+ * segundo formulario independiente.
+ */
+const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, paginar = false } = {}) => {
+  const condiciones = [
+    { borrado: { $ne: true } },
+    { resultadoGestion: /acuerdo/i },
+  ];
+
+  const usuarioId = String(req.query?.usuarioId || "").trim();
+
+  const desde = String(req.query?.fechaDesde || req.query?.desde || "").trim();
+  const hasta = String(req.query?.fechaHasta || req.query?.hasta || "").trim();
+  if (desde || hasta) {
+    const rango = {};
+    if (/^\d{4}-\d{2}-\d{2}$/.test(desde)) rango.$gte = crearFechaLocal(desde);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(hasta)) rango.$lte = crearFechaLocal(hasta, true);
+    if (Object.keys(rango).length) condiciones.push({ fecha: rango });
+  }
+
+  const entidadId = String(req.query?.entidadId || "").trim();
+  const entidadNumero = Number(req.query?.entidadNumero || 0);
+  if (entidadId || entidadNumero > 0) {
+    const canonica = await resolverEntidadCanonica({ entidadId, entidadNumero });
+    if (canonica) {
+      const variantes = variantesTextoEntidad(canonica.entidad).map(
+        (valor) => new RegExp(`^${escapeRegexSafe(valor)}$`, "i")
+      );
+      condiciones.push({
+        $or: [
+          { entidadNumero: canonica.entidadNumero },
+          { entidad: { $in: variantes } },
+        ],
+      });
+    }
+  }
+
+  const concepto = String(req.query?.concepto || "").trim();
+  if (concepto) {
+    const regex = new RegExp(escapeRegexSafe(concepto), "i");
+    condiciones.push({ $or: [{ resultadoGestion: regex }, { observacionGestion: regex }] });
+  }
+
+  // El estado de Mango no está guardado textualmente en ReporteGestion. Se
+  // calcula después de cruzar fecha de vencimiento y pagos válidos, igual que
+  // en acuerdos manuales. Por eso no se aplica como regex sobre MongoDB.
+  const estadoFiltro = String(req.query?.estado || "").trim();
+
+  const buscar = String(req.query?.buscar || "").trim();
+  if (buscar) {
+    const regex = new RegExp(escapeRegexSafe(buscar), "i");
+    const busqueda = [
+      { nombreDeudor: regex },
+      { entidad: regex },
+      { usuario: regex },
+      { resultadoGestion: regex },
+      { estadoCuenta: regex },
+      { observacionGestion: regex },
+    ];
+    const dniLimpio = buscar.replace(/\D/g, "");
+    if (dniLimpio) busqueda.push({ dni: dniLimpio }, { dni: Number(dniLimpio) });
+    condiciones.push({ $or: busqueda });
+  }
+
+  // Estos accesos rápidos pertenecen a los controles manuales. En Mango no hay
+  // próximo llamado ni un acuerdo "sin gestión" porque el acuerdo nace de una gestión.
+  if (req.query?.llamadoHoy === "true" || req.query?.sinGestion === "true") {
+    return {
+      acuerdos: [],
+      total: 0,
+      paginadoEnMongo: false,
+      filtrosNoCompatibles: [
+        req.query?.llamadoHoy === "true" ? "Llamados de hoy" : "",
+        req.query?.sinGestion === "true" ? "Sin gestión" : "",
+      ].filter(Boolean),
+    };
+  }
+
+  const query = condiciones.length === 1 ? condiciones[0] : { $and: condiciones };
+  const subCesionId = String(req.query?.subCesionId || "").trim();
+  const puedePaginarEnMongo = Boolean(
+    paginar &&
+      esAmbitoGlobal(req) &&
+      !usuarioId &&
+      !subCesionId &&
+      !estadoFiltro
+  );
+  const skip = Math.max(0, (Math.max(1, Number(page) || 1) - 1) * Math.max(1, Number(limit) || 20));
+
+  const consultaGestiones = ReporteGestion.find(query)
+    .sort({ fecha: -1, hora: -1, _id: -1 })
+    .select(
+      "dni entidad entidadNumero nombreDeudor usuario fecha hora tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion"
+    )
+    .lean()
+    .maxTimeMS(30000);
+
+  if (puedePaginarEnMongo) consultaGestiones.skip(skip).limit(limit);
+
+  const [mapas, gestiones, totalCrudo] = await Promise.all([
+    construirMapasEntidades(),
+    consultaGestiones,
+    puedePaginarEnMongo
+      ? ReporteGestion.countDocuments(query).maxTimeMS(30000)
+      : Promise.resolve(null),
+  ]);
+
+  let acuerdos = gestiones
+    .map((gestion) => mapearGestionAacuerdoMango(gestion, mapas.numeroPorNombre))
+    .filter(Boolean);
+
+  if (!acuerdos.length) {
+    return {
+      acuerdos: [],
+      total: puedePaginarEnMongo ? Number(totalCrudo || 0) : 0,
+      paginadoEnMongo: puedePaginarEnMongo,
+      filtrosNoCompatibles: [],
+    };
+  }
+
+  acuerdos = await vincularAcuerdosMangoConPagos(acuerdos);
+
+  const variantesObjetivo = await variantesOperadorObjetivo(req, usuarioId);
+  acuerdos = acuerdos.filter((acuerdo) => acuerdoPerteneceAOperador(acuerdo, variantesObjetivo));
+
+  if (subCesionId) {
+    acuerdos = acuerdos.filter((acuerdo) =>
+      (acuerdo.pagosValidos || []).some((pago) => String(pago.subCesionId || "") === subCesionId)
+    );
+  }
+
+  acuerdos = acuerdos
+    .map((acuerdo) => ({
+      ...acuerdo,
+      estadoSeguimiento: calcularEstadoSeguimientoMango(acuerdo),
+    }))
+    .filter((acuerdo) => coincideEstadoMango(acuerdo, estadoFiltro));
+
+  acuerdos = await enriquecerAcuerdosMangoConPagosInformados(acuerdos);
+
+  return {
+    acuerdos,
+    total: puedePaginarEnMongo ? Number(totalCrudo || 0) : acuerdos.length,
+    paginadoEnMongo: puedePaginarEnMongo,
+    filtrosNoCompatibles: [],
+  };
+};
+
+const acuerdosMangoListadoCache = new Map();
+const ACUERDOS_MANGO_LISTADO_TTL_MS = 30_000;
+const ACUERDOS_MANGO_LISTADO_CACHE_MAX = 40;
+
+const claveCacheAcuerdosMango = (req, page, limit) => {
+  const queryOrdenada = Object.keys(req.query || {})
+    .sort()
+    .reduce((acc, key) => {
+      const value = req.query[key];
+      if (value !== "" && value != null && value !== false) acc[key] = value;
+      return acc;
+    }, {});
+  return JSON.stringify({
+    user: req.user?.id || "",
+    role: req.user?.role || "",
+    page,
+    limit,
+    query: queryOrdenada,
+  });
+};
+
+const guardarCacheAcuerdosMango = (key, payload) => {
+  if (acuerdosMangoListadoCache.size >= ACUERDOS_MANGO_LISTADO_CACHE_MAX) {
+    const firstKey = acuerdosMangoListadoCache.keys().next().value;
+    if (firstKey) acuerdosMangoListadoCache.delete(firstKey);
+  }
+  acuerdosMangoListadoCache.set(key, { at: Date.now(), payload });
+};
+
+/**
+ * Listado de solo lectura de los acuerdos confirmados importados desde Mango.
+ * Se muestra dentro de Proyecciones, pero nunca crea ni modifica controles
+ * manuales. Los perfiles de alcance propio ven solamente sus acuerdos.
+ */
+export const listarAcuerdosMangoParaProyecciones = async (req, res) => {
+  try {
+    if (!tieneAccesoProyecciones(req)) {
+      return res.status(403).json({ error: "Sin acceso a Proyecciones" });
+    }
+
+    const page = Math.max(1, Number.parseInt(req.query?.page, 10) || 1);
+    const limit = Math.min(100, Math.max(5, Number.parseInt(req.query?.limit, 10) || 20));
+    const cacheKey = claveCacheAcuerdosMango(req, page, limit);
+    const cached = acuerdosMangoListadoCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < ACUERDOS_MANGO_LISTADO_TTL_MS) {
+      return res.json({ ...cached.payload, cache: "hit" });
+    }
+
+    const {
+      acuerdos,
+      filtrosNoCompatibles,
+      total: totalCalculado,
+      paginadoEnMongo,
+    } = await obtenerAcuerdosMangoFiltrados(req, { page, limit, paginar: true });
+    const total = Number(totalCalculado ?? acuerdos.length);
+    const items = paginadoEnMongo
+      ? acuerdos
+      : acuerdos.slice((page - 1) * limit, page * limit);
+
+    const payload = {
+      ok: true,
+      modo: "solo-lectura",
+      fuente: "reporte-de-gestiones",
+      separadosDeControlesManuales: true,
+      alcance: esAmbitoGlobal(req) ? "todos" : "propios",
+      filtrosGeneralesAplicados: true,
+      filtrosNoCompatibles,
+      items,
+      total,
+      page,
+      pages: Math.max(1, Math.ceil(total / limit)),
+      limit,
+      paginadoOptimizado: Boolean(paginadoEnMongo),
+    };
+    guardarCacheAcuerdosMango(cacheKey, payload);
+    return res.json(payload);
+  } catch (error) {
+    console.error("❌ Error listando acuerdos Mango en Proyecciones:", error);
+    return res.status(500).json({ error: "No se pudieron cargar los acuerdos confirmados de Mango" });
+  }
+};
+
+const obtenerAcuerdoMangoAutorizado = async (req, acuerdoId) => {
+  if (!mongoose.isValidObjectId(acuerdoId)) return { error: "Acuerdo Mango inválido", status: 400 };
+  const gestion = await ReporteGestion.findOne({
+    _id: acuerdoId,
+    borrado: { $ne: true },
+    resultadoGestion: /acuerdo/i,
+  })
+    .select(
+      "dni entidad entidadNumero nombreDeudor usuario fecha hora tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion"
+    )
+    .lean();
+  if (!gestion) return { error: "Acuerdo Mango no encontrado", status: 404 };
+
+  const { numeroPorNombre } = await construirMapasEntidades();
+  let acuerdo = mapearGestionAacuerdoMango(gestion, numeroPorNombre);
+  if (!acuerdo) return { error: "No se pudo interpretar el acuerdo Mango", status: 422 };
+  [acuerdo] = await vincularAcuerdosMangoConPagos([acuerdo]);
+
+  if (esAmbitoPropio(req)) {
+    const variantes = await variantesOperadorObjetivo(req);
+    if (!acuerdoPerteneceAOperador(acuerdo, variantes)) {
+      return { error: "No tenés permiso sobre este acuerdo Mango", status: 403 };
+    }
+  }
+
+  return { acuerdo, gestion };
+};
+
+export const informarPagoAcuerdoMango = async (req, res) => {
+  try {
+    if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso" });
+    const acceso = await obtenerAcuerdoMangoAutorizado(req, req.params.id);
+    if (acceso.error) return res.status(acceso.status).json({ error: acceso.error });
+
+    const fecha = parseExcelDate(req.body?.fecha);
+    const monto = Number(req.body?.monto);
+    if (!fecha || Number.isNaN(fecha.getTime())) return res.status(400).json({ error: "Fecha inválida" });
+    if (!Number.isFinite(monto) || monto <= 0) return res.status(400).json({ error: "Monto inválido" });
+
+    const inicio = new Date(fecha);
+    inicio.setHours(0, 0, 0, 0);
+    const fin = new Date(fecha);
+    fin.setHours(23, 59, 59, 999);
+    const duplicado = await PagoInformadoMango.exists({
+      acuerdoGestionId: req.params.id,
+      fecha: { $gte: inicio, $lte: fin },
+      monto,
+      erroneo: { $ne: true },
+    });
+    if (duplicado) {
+      return res.status(409).json({ error: "Pago duplicado (misma fecha y monto ya informados)." });
+    }
+
+    const creado = await PagoInformadoMango.create({
+      acuerdoGestionId: req.params.id,
+      fecha,
+      monto,
+      operadorId: req.user.id,
+    });
+    acuerdosMangoListadoCache.clear();
+
+    const pago = await PagoInformadoMango.findById(creado._id)
+      .populate("operadorId", "username nombre email")
+      .lean();
+    return res.status(201).json({
+      ok: true,
+      mensaje: "Pago informado como dato orientativo. No modifica el pago válido.",
+      pago,
+    });
+  } catch (error) {
+    console.error("❌ Error informando pago de acuerdo Mango:", error);
+    return res.status(500).json({ error: "No se pudo informar el pago del acuerdo Mango" });
+  }
+};
+
+export const listarPagosInformadosAcuerdoMango = async (req, res) => {
+  try {
+    if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso" });
+    const acceso = await obtenerAcuerdoMangoAutorizado(req, req.params.id);
+    if (acceso.error) return res.status(acceso.status).json({ error: acceso.error });
+
+    const pagos = await PagoInformadoMango.find({ acuerdoGestionId: req.params.id })
+      .sort({ fecha: -1, createdAt: -1 })
+      .populate("operadorId", "username nombre email")
+      .populate("marcadoPor", "username nombre")
+      .lean();
+    return res.json({ ok: true, acuerdo: acceso.acuerdo, pagos });
+  } catch (error) {
+    console.error("❌ Error listando pagos informados Mango:", error);
+    return res.status(500).json({ error: "No se pudieron cargar los pagos informados" });
+  }
+};
+
+export const marcarPagoInformadoMangoErroneo = async (req, res) => {
+  try {
+    if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso" });
+    const acceso = await obtenerAcuerdoMangoAutorizado(req, req.params.id);
+    if (acceso.error) return res.status(acceso.status).json({ error: acceso.error });
+
+    const pago = await PagoInformadoMango.findOne({
+      _id: req.params.pagoId,
+      acuerdoGestionId: req.params.id,
+    });
+    if (!pago) return res.status(404).json({ error: "Pago informado no encontrado" });
+    if (!esAmbitoGlobal(req) && String(pago.operadorId) !== String(req.user.id)) {
+      return res.status(403).json({ error: "Solo podés modificar los pagos que informaste" });
+    }
+
+    const erroneo = req.body?.erroneo !== false;
+    pago.erroneo = erroneo;
+    pago.motivoError = erroneo ? String(req.body?.motivo || "Marcado como erróneo").trim() : "";
+    pago.marcadoPor = erroneo ? req.user.id : null;
+    pago.marcadoEn = erroneo ? new Date() : null;
+    await pago.save();
+    acuerdosMangoListadoCache.clear();
+    return res.json({ ok: true, pago });
+  } catch (error) {
+    console.error("❌ Error actualizando pago informado Mango:", error);
+    return res.status(500).json({ error: "No se pudo actualizar el pago informado" });
+  }
+};
+
+export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
+  try {
+    if (!tieneAccesoProyecciones(req)) {
+      return res.status(403).json({ error: "Sin acceso a Proyecciones" });
+    }
+    const { acuerdos } = await obtenerAcuerdosMangoFiltrados(req);
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Acuerdos Mango");
+    worksheet.columns = [
+      { header: "Fecha acuerdo", key: "fecha", width: 15 },
+      { header: "Hora", key: "hora", width: 10 },
+      { header: "DNI", key: "dni", width: 15 },
+      { header: "Titular", key: "titular", width: 30 },
+      { header: "Entidad ID", key: "entidadNumero", width: 12 },
+      { header: "Entidad", key: "entidad", width: 25 },
+      { header: "Tipo de acuerdo", key: "tipo", width: 30 },
+      { header: "Anticipo", key: "anticipo", width: 14 },
+      { header: "Cuota", key: "cuota", width: 14 },
+      { header: "Total acuerdo", key: "total", width: 16 },
+      { header: "Operador", key: "operador", width: 22 },
+      { header: "Estado cuenta", key: "estadoCuenta", width: 22 },
+      { header: "Estado pago", key: "estadoPago", width: 24 },
+      { header: "Pagado válido", key: "pagadoValido", width: 16 },
+      { header: "Pago mismo día", key: "pagoMismoDia", width: 16 },
+      { header: "Pagos posteriores", key: "pagosPosteriores", width: 17 },
+      { header: "Último pago válido", key: "ultimoPago", width: 18 },
+      { header: "Coincidencia", key: "coincidencia", width: 18 },
+      { header: "Revisión", key: "revision", width: 38 },
+      { header: "Observación Mango", key: "observacion", width: 45 },
+    ];
+
+    acuerdos.forEach((item) => worksheet.addRow({
+      fecha: item.fecha ? new Date(item.fecha) : "",
+      hora: item.hora || "",
+      dni: item.dni || "",
+      titular: item.nombreDeudor || "",
+      entidadNumero: item.entidadNumero || "",
+      entidad: item.entidad || "",
+      tipo: item.tipoAcuerdo || item.resultado || "Acuerdo",
+      anticipo: Number(item.anticipoMonto || 0),
+      cuota: Number(item.montoCuota || 0),
+      total: Number(item.montoTotalAcuerdo || 0),
+      operador: item.operador || "",
+      estadoCuenta: item.estadoCuenta || "",
+      estadoPago: item.estadoPagoAcuerdo || "",
+      pagadoValido: Number(item.montoPagosValidos || item.montoPagosPosteriores || 0),
+      pagoMismoDia: Number(item.montoPagosMismoDia || 0),
+      pagosPosteriores: Number(item.montoPagosEstrictamentePosteriores || 0),
+      ultimoPago: item.ultimoPagoValido ? new Date(`${item.ultimoPagoValido}T12:00:00`) : "",
+      coincidencia: item.coincidenciaPagoPor || "",
+      revision: item.motivoRevisionPagos || "",
+      observacion: item.observacionGestion || item.observacionResumen || "",
+    }));
+
+    worksheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
+    worksheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF29154F" } };
+    worksheet.views = [{ state: "frozen", ySplit: 1 }];
+    ["anticipo", "cuota", "total", "pagadoValido", "pagoMismoDia", "pagosPosteriores"].forEach((key) => {
+      worksheet.getColumn(key).numFmt = '$ #,##0.00';
+    });
+    worksheet.getColumn("fecha").numFmt = "dd/mm/yyyy";
+    worksheet.getColumn("ultimoPago").numFmt = "dd/mm/yyyy";
+    worksheet.autoFilter = { from: "A1", to: "T1" };
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    const suffix = new Date().toISOString().slice(0, 10);
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename=acuerdos_mango_${suffix}.xlsx`);
+    return res.send(Buffer.from(buffer));
+  } catch (error) {
+    console.error("❌ Error exportando acuerdos Mango:", error);
+    return res.status(500).json({ error: "No se pudo generar el Excel de acuerdos Mango" });
   }
 };

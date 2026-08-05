@@ -1,24 +1,8 @@
-// controllers/usuarioController.js
 import Empleado from "../models/Empleado.js";
+import { buildEffectiveRoleFilter, getEffectiveRole } from "../config/roles.js";
 
-/**
- * GET /usuarios
- * Solo super-admin. Lista de usuarios con filtros y paginación.
- * Query params opcionales:
- *  - q: búsqueda (username/email)
- *  - role: operador | operador-vip | admin | super-admin
- *  - includeInactive: "true" para incluir dados de baja (si existe campo activo=false)
- *  - limit: número máx. (default 100)
- *  - page: página (default 1)
- */
 export const obtenerUsuariosActivos = async (req, res) => {
   try {
-    // ✅ Enforce super-admin (además de cualquier middleware que tengas)
-    const rol = req.user?.role || req.user?.rol;
-    if (rol !== "super-admin") {
-      return res.status(403).json({ error: "No autorizado" });
-    }
-
     const {
       q = "",
       role: roleFilter,
@@ -30,56 +14,45 @@ export const obtenerUsuariosActivos = async (req, res) => {
     const LIM = Math.max(1, Math.min(parseInt(limit, 10) || 100, 500));
     const PAGE = Math.max(1, parseInt(page, 10) || 1);
     const skip = (PAGE - 1) * LIM;
+    const condiciones = [];
 
-    const query = {};
-
-    // 🔎 Búsqueda por username o email
-    if (q && String(q).trim() !== "") {
-      const regex = new RegExp(String(q).trim(), "i");
-      query.$or = [{ username: regex }, { email: regex }];
+    if (q && String(q).trim()) {
+      const safe = String(q).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const regex = new RegExp(safe, "i");
+      condiciones.push({ $or: [{ username: regex }, { email: regex }] });
     }
 
-    // 🎚️ Filtro por rol
-    if (roleFilter) {
-      query.role = roleFilter;
+    if (roleFilter && String(roleFilter) !== "todos") {
+      const effectiveRoleFilter = buildEffectiveRoleFilter(roleFilter);
+      if (!effectiveRoleFilter) {
+        return res.status(400).json({ error: "Perfil inválido" });
+      }
+      condiciones.push(effectiveRoleFilter);
     }
 
-    // ✅ Activos por defecto (si existe el campo activo, respétalo)
-    //   - Si no existe en tu schema, esta condición no afecta.
-   
-   if (String(includeInactive).toLowerCase() !== "true") {
-   query.$or = [
-     ...(query.$or || []),
-     { isActive: { $exists: false } }, // si no existe, lo tomamos como activo
-     { isActive: true },
-   ];
- }
+    if (String(includeInactive).toLowerCase() !== "true") {
+      condiciones.push({ isActive: { $ne: false } });
+    }
 
-    // 📄 Proyección segura (solo lo necesario)
-    const projection = "username email role ultimaActividad isActive";
+    const query = condiciones.length ? { $and: condiciones } : {};
+    const projection = "username nombre email role ultimaActividad isActive";
 
-    // 🔢 Total y resultados
     const [total, usuarios] = await Promise.all([
       Empleado.countDocuments(query),
       Empleado.find(query, projection).sort({ username: 1 }).skip(skip).limit(LIM).lean(),
     ]);
 
-    // ✨ Normalizar salida
     const items = usuarios.map((u) => ({
       id: String(u._id),
       username: u.username,
+      nombre: u.nombre || "",
       email: u.email,
-      role: u.role,
-      activo: u.isActive !== false, // si no existe el campo, lo consideramos activo
+      role: getEffectiveRole(u.role, u.username),
+      activo: u.isActive !== false,
       ultimaActividad: u.ultimaActividad || null,
     }));
 
-    return res.json({
-      total,
-      page: PAGE,
-      limit: LIM,
-      resultados: items,
-    });
+    return res.json({ total, page: PAGE, limit: LIM, resultados: items });
   } catch (error) {
     console.error("❌ Error al obtener usuarios:", error);
     return res.status(500).json({ error: "Error al obtener usuarios" });

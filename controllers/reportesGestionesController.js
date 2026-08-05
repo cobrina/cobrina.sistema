@@ -5,12 +5,14 @@ import { extraerEmails } from "../utils/email.util.js";
 import { toDateOnly, normalizarHora } from "../utils/fecha.util.js";
 import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
+import Pago from "../models/Pago.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
 import { invalidateCalidadCache } from "./calidadGestionesController.js";
 import {
   transformarGestionEnAcuerdo,
   resumirAcuerdos,
   crearExcelAcuerdos,
+  vincularPagosPosteriores,
   TIPOS_ACUERDO,
 } from "../services/acuerdosGestionesService.js";
 
@@ -71,7 +73,7 @@ function ownerScope(req) {
 
   if (!usuarioId) return {};
 
-  const isAdminLike = rol === "admin" || rol === "super-admin" || rol === "superadmin";
+  const isAdminLike = ["capacitadora", "administracion", "supervisor", "super-admin"].includes(rol);
 
   if (isAdminLike && !onlyMine) {
     return {}; // ✅ ver todo
@@ -247,11 +249,18 @@ export async function cargar(req, res) {
 
     const [empleados, entidades] = await Promise.all([
       Empleado.find({ isActive: true }).select("username").lean(),
-      Entidad.find().select("nombre").lean(),
+      Entidad.find().select("numero nombre").lean(),
     ]);
 
     const setUsers = new Set(empleados.map((e) => String(e.username || "").toLowerCase()));
-    const setEnts = new Set(entidades.map((e) => String(e.nombre || "").toUpperCase()));
+    const entidadesPorNombre = new Map();
+    const entidadesPorNumero = new Map();
+    entidades.forEach((e) => {
+      const nombre = String(e.nombre || "").trim().toUpperCase();
+      const numero = Number(e.numero);
+      if (nombre) entidadesPorNombre.set(nombre, e);
+      if (Number.isFinite(numero)) entidadesPorNumero.set(numero, e);
+    });
 
     const errores = [];
     const seen = new Set();
@@ -294,7 +303,12 @@ export async function cargar(req, res) {
       const fechaKey = fDate.toISOString().slice(0, 10);
 
       const usuario = normUser(usuarioRaw);
-      let entidad = normEntidad(entidadRaw);
+      const entidadNumeroIngresado = /^\d+$/.test(entidadRaw) ? Number(entidadRaw) : null;
+      const entidadCatalogo = entidadNumeroIngresado != null
+        ? entidadesPorNumero.get(entidadNumeroIngresado)
+        : entidadesPorNombre.get(normEntidad(entidadRaw));
+      let entidad = normEntidad(entidadCatalogo?.nombre || entidadRaw);
+      const entidadNumero = Number(entidadCatalogo?.numero);
       if (entidad.length > 120) entidad = entidad.slice(0, 120);
 
       if (!setUsers.has(usuario)) {
@@ -306,10 +320,10 @@ export async function cargar(req, res) {
         return;
       }
 
-      if (!setEnts.has(entidad)) {
+      if (!entidadCatalogo || !Number.isFinite(entidadNumero)) {
         errores.push({
           fila: row,
-          motivo: `Entidad "${entidadRaw}" no existe en la tabla Entidades.`,
+          motivo: `Entidad "${entidadRaw}" no existe en la tabla Entidades por nombre ni por número.`,
           row: { ...f },
         });
         return;
@@ -374,6 +388,7 @@ export async function cargar(req, res) {
         telMailMarcado: telMail,
         observacionGestion: observacion,
         entidad,
+        entidadNumero,
         mailsDetectados: mailsSoloTel,
       });
     });
@@ -2386,10 +2401,14 @@ const ACUERDOS_SORT_KEYS = new Set([
   "montoTotalAcuerdo", "fechaAnticipo", "montoAnticipo", "cuotas", "montoCuota",
   "deudaMaxima", "dni", "telefonoGestion", "nombreDeudor", "fecha", "hora", "usuario", "entidad",
   "tipoContacto", "resultadoGestion", "estadoCuenta", "telMailMarcado", "observacionGestion",
+  "estadoPagoAcuerdo", "cantidadPagosPosteriores", "montoPagosPosteriores", "ultimoPagoPosterior",
+  "ultimaGestionMangoFecha", "ultimaGestionMangoHora", "ultimaGestionMangoUsuario",
+  "ultimaGestionMangoResultado",
 ]);
 
 const ACUERDOS_NUMERIC_SORT_KEYS = new Set([
   "dias", "primerPago", "montoTotalAcuerdo", "montoAnticipo", "cuotas", "montoCuota", "deudaMaxima",
+  "cantidadPagosPosteriores", "montoPagosPosteriores", "montoUltimoPagoAnterior", "diasPagoAnterior",
 ]);
 
 function valorOrdenAcuerdo(row, key) {
@@ -2399,6 +2418,74 @@ function valorOrdenAcuerdo(row, key) {
       : Number(row.diasParaVencer ?? 999999);
   }
   return row?.[key];
+}
+
+async function vincularPagosConAcuerdosSinRomper(acuerdos = [], { fechaHasta = "" } = {}) {
+  const fallback = (motivo = "SIN_PAGOS_CARGADOS") => ({
+    rows: vincularPagosPosteriores(acuerdos, [], [], { disponible: false, motivo }),
+    meta: {
+      disponible: false,
+      motivo,
+      pagosConsultados: 0,
+      acuerdosEvaluados: acuerdos.length,
+      periodoHasta: fechaHasta || "",
+    },
+  });
+
+  if (!acuerdos.length) return fallback("SIN_ACUERDOS");
+
+  try {
+    const moduleHasData = await Pago.exists({});
+    if (!moduleHasData) return fallback("SIN_PAGOS_CARGADOS");
+
+    const dnis = [...new Set(
+      acuerdos.map((row) => String(row?.dni || "").replace(/\D/g, "")).filter(Boolean)
+    )];
+    if (!dnis.length) return fallback("ACUERDOS_SIN_DNI");
+
+    const agreementDates = acuerdos
+      .map((row) => String(row?.fecha || "").slice(0, 10))
+      .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))
+      .sort();
+    const earliest = agreementDates[0] ? diaInicioUTC(agreementDates[0]) : null;
+    const paymentStart = earliest ? new Date(earliest.getTime() - 90 * 86400000) : null;
+    const requestedEnd = fechaHasta ? diaFinUTC(fechaHasta) : null;
+    const now = new Date();
+    const paymentEnd = requestedEnd && requestedEnd < now ? requestedEnd : now;
+    const paymentMatch = { dni: { $in: dnis } };
+    if (paymentStart) paymentMatch.fechaPago = { $gte: paymentStart, $lte: paymentEnd };
+
+    const payments = await Pago.find(paymentMatch)
+      .select("idPago dni entidadId subCesionId fechaPago monto conceptoCodigo estado")
+      .sort({ fechaPago: 1, _id: 1 })
+      .lean()
+      .maxTimeMS(15000);
+
+    const entityNumbers = [...new Set(
+      payments.map((payment) => Number(payment?.entidadId || 0)).filter(Boolean)
+    )];
+    const entities = entityNumbers.length
+      ? await Entidad.find({ numero: { $in: entityNumbers } })
+          .select("numero nombre")
+          .lean()
+          .maxTimeMS(5000)
+      : [];
+
+    return {
+      rows: vincularPagosPosteriores(acuerdos, payments, entities, { disponible: true }),
+      meta: {
+        disponible: true,
+        motivo: "",
+        pagosConsultados: payments.length,
+        acuerdosEvaluados: acuerdos.length,
+        periodoDesde: paymentStart?.toISOString().slice(0, 10) || "",
+        periodoHasta: paymentEnd.toISOString().slice(0, 10),
+      },
+    };
+  } catch (error) {
+    console.warn("Cruce opcional acuerdos/pagos no disponible:", error?.message || error);
+    return fallback("ERROR_CONSULTA_PAGOS");
+  }
 }
 
 function desplazarISOUnMesAtras(value) {
@@ -2459,6 +2546,98 @@ function ordenarAcuerdos(rows, rawKey = "fecha", rawDir = "desc") {
   });
 
   return { key, dir };
+}
+
+
+const claveEntidadGestion = (value = "") =>
+  String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toUpperCase();
+
+const clavesCasoGestion = (row = {}) => {
+  const dniNormalizado = String(row?.dni || "").replace(/\D/g, "");
+  if (!dniNormalizado) return [];
+  const numero = Number(row?.entidadNumero || 0);
+  const nombre = claveEntidadGestion(row?.entidad);
+  return [
+    numero > 0 ? `${dniNormalizado}|N:${numero}` : "",
+    nombre ? `${dniNormalizado}|T:${nombre}` : "",
+  ].filter(Boolean);
+};
+
+async function vincularUltimaGestionMango(acuerdos = [], req) {
+  if (!acuerdos.length) return acuerdos;
+
+  const dnis = [...new Set(
+    acuerdos.map((row) => String(row?.dni || "").replace(/\D/g, "")).filter(Boolean)
+  )];
+  if (!dnis.length) return acuerdos;
+
+  const dniVariants = [...new Set(
+    dnis.flatMap((dniValue) => {
+      const numeric = Number(dniValue);
+      return Number.isSafeInteger(numeric) ? [dniValue, numeric] : [dniValue];
+    })
+  )];
+
+  const gestiones = await ReporteGestion.find({
+    ...ownerScope(req),
+    borrado: { $ne: true },
+    dni: { $in: dniVariants },
+  })
+    .select(
+      "dni entidad entidadNumero fecha hora usuario resultadoGestion estadoCuenta tipoContacto observacionGestion"
+    )
+    .sort({ fecha: -1, hora: -1, _id: -1 })
+    .lean()
+    .maxTimeMS(30000);
+
+  const latestByKey = new Map();
+  for (const gestion of gestiones) {
+    const snapshot = {
+      ultimaGestionMangoFecha: gestion?.fecha
+        ? new Date(gestion.fecha).toISOString().slice(0, 10)
+        : "",
+      ultimaGestionMangoHora: String(gestion?.hora || ""),
+      ultimaGestionMangoUsuario: String(gestion?.usuario || ""),
+      ultimaGestionMangoResultado: String(gestion?.resultadoGestion || ""),
+      ultimaGestionMangoEstadoCuenta: String(gestion?.estadoCuenta || ""),
+      ultimaGestionMangoTipoContacto: String(gestion?.tipoContacto || ""),
+      ultimaGestionMangoObservacion: String(gestion?.observacionGestion || ""),
+    };
+    for (const key of clavesCasoGestion(gestion)) {
+      if (!latestByKey.has(key)) latestByKey.set(key, snapshot);
+    }
+  }
+
+  return acuerdos.map((acuerdo) => {
+    let latest = null;
+    for (const key of clavesCasoGestion(acuerdo)) {
+      latest = latestByKey.get(key);
+      if (latest) break;
+    }
+    if (!latest) {
+      return {
+        ...acuerdo,
+        ultimaGestionMangoFecha: "",
+        ultimaGestionMangoHora: "",
+        ultimaGestionMangoUsuario: "",
+        ultimaGestionMangoResultado: "",
+        ultimaGestionMangoEstadoCuenta: "",
+        ultimaGestionMangoTipoContacto: "",
+        ultimaGestionMangoObservacion: "",
+      };
+    }
+    const original = `${String(acuerdo?.fecha || "").slice(0, 10)}T${String(acuerdo?.hora || "00:00:00")}`;
+    const latestStamp = `${latest.ultimaGestionMangoFecha}T${latest.ultimaGestionMangoHora || "00:00:00"}`;
+    return {
+      ...acuerdo,
+      ...latest,
+      ultimaGestionMangoEsPosterior: Boolean(latest.ultimaGestionMangoFecha) && latestStamp > original,
+    };
+  });
 }
 
 async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false } = {}) {
@@ -2525,7 +2704,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
       .collation({ locale: "es", strength: 1 }),
     ReporteGestion.find(agreementMatch)
       .select(
-        "dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad"
+        "dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero"
       )
       .sort({ fecha: -1, hora: -1, _id: -1 })
       .lean()
@@ -2553,8 +2732,13 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     acuerdos = acuerdos.filter((row) => row.estadoVencimiento === "VENCIDO");
   }
 
+  acuerdos = await vincularUltimaGestionMango(acuerdos, req);
+
+  const paymentLink = await vincularPagosConAcuerdosSinRomper(acuerdos, { fechaHasta: hasta });
+  acuerdos = paymentLink.rows;
+
   const appliedSort = ordenarAcuerdos(acuerdos, sortKey, sortDir);
-  const summary = resumirAcuerdos(acuerdos, totalGestiones, gestionesPorOperador);
+  const summary = resumirAcuerdos(acuerdos, totalGestiones, gestionesPorOperador, paymentLink.meta);
 
   if (paginate && desde && hasta) {
     const anteriorDesde = desplazarISOUnMesAtras(desde);
@@ -2584,7 +2768,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
           .collation({ locale: "es", strength: 1 }),
         ReporteGestion.find(previousAgreementMatch)
           .select(
-            "dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad"
+            "dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero"
           )
           .sort({ fecha: -1, hora: -1, _id: -1 })
           .lean()
@@ -2650,7 +2834,9 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     catalogos: {
       tiposAcuerdo: TIPOS_ACUERDO,
       estadosVencimiento: ["VENCIDO", "VENCE HOY", "PRÓXIMO 3 DÍAS", "PENDIENTE"],
+      estadosPagoAcuerdo: ["CON PAGO POSTERIOR", "PAGO MISMO DÍA", "SIN PAGO POSTERIOR"],
     },
+    integracionPagos: paymentLink.meta,
     params: {
       desde: desde || null,
       hasta: hasta || null,
@@ -2685,6 +2871,7 @@ export async function analyticsAcuerdos(req, res) {
       pages: data.pages,
       limit: data.limit,
       catalogos: data.catalogos,
+      integracionPagos: data.integracionPagos,
       params: data.params,
     });
   } catch (error) {

@@ -1,7 +1,7 @@
 // BACKEND/routes/auditorias.js
 import { Router } from "express";
 import verifyToken from "../middleware/verifyToken.js";
-import permitirRoles from "../middleware/permitirRoles.js";
+import permitirModulos from "../middleware/permitirModulos.js";
 
 import {
   ping,
@@ -18,7 +18,7 @@ import {
 const router = Router();
 
 // ✅ Protegido: solo admin/super-admin
-const guard = [verifyToken, permitirRoles("admin", "super-admin")];
+const guard = [verifyToken, permitirModulos("reportes")];
 
 /* =========================
    Básicos

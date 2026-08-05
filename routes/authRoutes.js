@@ -2,12 +2,13 @@
 import express from "express";
 import { heartbeat } from "../controllers/authController.js";
 import bcrypt from "bcrypt";
-import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
 import { check, validationResult } from "express-validator";
 import rateLimit from "express-rate-limit";
 import Empleado from "../models/Empleado.js";
 import verifyToken from "../middleware/verifyToken.js";
+import { getEffectiveRole } from "../config/roles.js";
+import { firmarTokenSesion, obtenerConfiguracionVencimiento } from "../utils/jwtSesion.js";
 
 dotenv.config();
 
@@ -72,14 +73,18 @@ router.post(
         return res.status(401).json({ error: "Usuario o contraseña inválidos" });
       }
 
+      const effectiveRole = getEffectiveRole(empleado.role, empleado.username);
+
       const payload = {
         id: empleado._id,
         username: empleado.username,
-        role: empleado.role,
+        role: effectiveRole,
       };
 
-      const expiresIn = "1d";
-      const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn });
+      // Por defecto la sesión no vence por una fecha fija. Si alguna instalación
+      // necesita caducidad, puede configurarla explícitamente con JWT_EXPIRES_IN.
+      const token = firmarTokenSesion(payload);
+      const { sinVencimiento, expiresIn } = obtenerConfiguracionVencimiento();
 
       // Actualizar última actividad (sin romper si falla)
       empleado.ultimaActividad = new Date();
@@ -89,11 +94,11 @@ router.post(
         message: "Login exitoso",
         token,
         token_type: "Bearer",
-        expires_in: expiresIn,
+        expires_in: sinVencimiento ? undefined : expiresIn,
         user: {
           id: empleado._id,
           username: empleado.username,
-          role: empleado.role,
+          role: effectiveRole,
         },
       });
     } catch (error) {

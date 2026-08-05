@@ -1,5 +1,6 @@
 import jwt from "jsonwebtoken";
 import Empleado from "../models/Empleado.js";
+import { getEffectiveRole } from "../config/roles.js";
 
 const verifyToken = async (req, res, next) => {
   try {
@@ -16,6 +17,7 @@ const verifyToken = async (req, res, next) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET, {
       algorithms: ["HS256"],
+      clockTolerance: 30,
     });
 
     const id = decoded?.id;
@@ -38,9 +40,14 @@ const verifyToken = async (req, res, next) => {
     req.user = {
       id: String(empleado._id),
       username: empleado.username || usernameToken,
-      role: String(empleado.role || decoded.role).trim().toLowerCase(),
+      role: getEffectiveRole(empleado.role || decoded.role, empleado.username || usernameToken),
     };
     req.userId = req.user.id;
+    req.auth = {
+      token,
+      issuedAt: decoded?.iat || null,
+      expiresAt: decoded?.exp || null,
+    };
 
     return next();
   } catch (error) {

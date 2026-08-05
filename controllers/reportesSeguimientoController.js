@@ -2,6 +2,8 @@ import mongoose from "mongoose";
 import ReporteGestion from "../models/ReporteGestion.js";
 import AuditoriaContactoDirecto from "../models/AuditoriaContactoDirecto.js";
 import Empleado from "../models/Empleado.js";
+import NovedadRRHH from "../models/NovedadRRHH.js";
+import { horarioEfectivoParaFecha, minutosEsperadosEnRango } from "../utils/calculoAsistencia.js";
 import { toDateOnly } from "../utils/fecha.util.js";
 
 const CACHE_TTL_MS = 120_000;
@@ -55,7 +57,7 @@ function ownerScope(req) {
   const userId = getUserId(req);
   const onlyMine = String(req?.query?.onlyMine || "").toLowerCase() === "true";
   if (!userId) return {};
-  if (["admin", "super-admin", "superadmin"].includes(role) && !onlyMine) return {};
+  if (["capacitadora", "administracion", "supervisor", "super-admin"].includes(role) && !onlyMine) return {};
   return { propietario: new mongoose.Types.ObjectId(userId) };
 }
 
@@ -136,7 +138,7 @@ function isSingleDayRange(desde, hasta) {
   return Boolean(desde && hasta && desde.toISOString().slice(0, 10) === hasta.toISOString().slice(0, 10));
 }
 
-function groupActivity(rows, employeeByUsername) {
+function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()) {
   const grouped = new Map();
   for (const row of rows) {
     const username = String(row.usuario || "").trim().toLowerCase();
@@ -183,17 +185,14 @@ function groupActivity(rows, employeeByUsername) {
     const workedMin = blocks.reduce((sum, block) => sum + block.durationMin, 0);
     const longTotal = long.reduce((sum, gap) => sum + gap, 0);
     const employee = employeeByUsername.get(item.username);
-    const schedule = employee?.horarioLaboral || {};
-    const weekday = dayOfWeek(item.day);
-    const scheduled = Array.isArray(schedule.dias) ? schedule.dias.includes(weekday) : weekday >= 1 && weekday <= 5;
-    const scheduledStart = minutesOfDay(schedule.entrada);
-    const scheduledEnd = minutesOfDay(schedule.salida);
-    const expectedMin = scheduled && scheduledStart != null && scheduledEnd != null && scheduledEnd > scheduledStart
-      ? scheduledEnd - scheduledStart
-      : 0;
-    const tolerance = Number(schedule.toleranciaMinutos || 10);
-    const lateMin = scheduledStart == null ? 0 : Math.max(0, first - scheduledStart - tolerance);
-    const earlyMin = scheduledEnd == null ? 0 : Math.max(0, scheduledEnd - last - TOLERANCIA_FIN_MIN);
+    const novedadesEmpleado = novedadesByEmployee.get(String(employee?._id || "")) || [];
+    const horarioEfectivo = horarioEfectivoParaFecha(employee, item.day, novedadesEmpleado);
+    const scheduledStart = minutesOfDay(horarioEfectivo.entrada);
+    const scheduledEnd = minutesOfDay(horarioEfectivo.salida);
+    const expectedMin = horarioEfectivo.minutosEsperados;
+    const tolerance = Number(horarioEfectivo.toleranciaMinutos || 10);
+    const lateMin = !horarioEfectivo.programado || scheduledStart == null ? 0 : Math.max(0, first - scheduledStart - tolerance);
+    const earlyMin = !horarioEfectivo.programado || scheduledEnd == null ? 0 : Math.max(0, scheduledEnd - last - TOLERANCIA_FIN_MIN);
     const sortedHours = [...hourly.values()].sort((a, b) => b - a);
     const topTwo = (sortedHours[0] || 0) + (sortedHours[1] || 0);
     const concentrationPct = item.events.length ? (topTwo * 100) / item.events.length : 0;
@@ -202,7 +201,9 @@ function groupActivity(rows, employeeByUsername) {
     daily.push({
       username: item.username,
       fecha: item.day,
-      horarioAsignado: scheduledStart != null && scheduledEnd != null ? `${hhmm(scheduledStart)}–${hhmm(scheduledEnd)}` : "Sin horario",
+      horarioAsignado: horarioEfectivo.etiqueta,
+      horarioModificado: horarioEfectivo.cambioHorario,
+      licenciaMedica: horarioEfectivo.licenciaMedica,
       primeraGestion: hhmm(first),
       ultimaGestion: hhmm(last),
       franjaTotalMin: Math.max(0, last - first),
@@ -231,17 +232,18 @@ function groupActivity(rows, employeeByUsername) {
   return daily;
 }
 
-function summarizeDaily(rows, employee, desde, hasta) {
+function summarizeDaily(rows, employee, desde, hasta, novedades = []) {
   const sum = (key) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
   const max = (key) => rows.reduce((value, row) => Math.max(value, Number(row[key] || 0)), 0);
   const longCount = sum("pausasLargas");
-  const scheduleDays = Array.isArray(employee?.horarioLaboral?.dias) && employee.horarioLaboral.dias.length
-    ? employee.horarioLaboral.dias
-    : [1, 2, 3, 4, 5];
-  const start = minutesOfDay(employee?.horarioLaboral?.entrada);
-  const end = minutesOfDay(employee?.horarioLaboral?.salida);
-  const expectedDaily = start != null && end != null && end > start ? end - start : 0;
-  const expectedDays = rangeDays(desde, hasta).filter((day) => scheduleDays.includes(dayOfWeek(day))).length;
+  const clavesRango = rangeDays(desde, hasta);
+  const expectedDays = clavesRango.filter((day) => horarioEfectivoParaFecha(employee, day, novedades).minutosEsperados > 0).length;
+  const expectedTotal = minutosEsperadosEnRango(
+    employee,
+    desde.toISOString().slice(0, 10),
+    hasta.toISOString().slice(0, 10),
+    novedades
+  );
   const worked = sum("horasTrabajadasMin");
   const gestiones = sum("gestiones");
   const cases = sum("casos");
@@ -249,10 +251,10 @@ function summarizeDaily(rows, employee, desde, hasta) {
   return {
     diasConActividad: rows.length,
     diasLaboralesEsperados: expectedDays,
-    horasPrevistasMin: expectedDays * expectedDaily,
+    horasPrevistasMin: expectedTotal,
     franjaRegistradaMin: sum("franjaTotalMin"),
     horasTrabajadasMin: worked,
-    diferenciaPrevistaMin: expectedDaily ? worked - expectedDays * expectedDaily : null,
+    diferenciaPrevistaMin: expectedTotal ? worked - expectedTotal : null,
     gestiones,
     casos: cases,
     gestionesPorHora: worked ? gestiones / (worked / 60) : 0,
@@ -451,7 +453,7 @@ async function resolveEmployees(req) {
 
   const employeeQuery = requested.length
     ? { isActive: { $ne: false }, username: { $in: requested } }
-    : { isActive: { $ne: false }, role: { $in: ["operador", "operador-vip"] } };
+    : { isActive: { $ne: false }, role: { $in: ["operador", "operador-vip", "capacitadora", "administracion", "admin"] } };
   const employees = await Empleado.find(employeeQuery)
     .select("username nombre role horarioLaboral")
     .maxTimeMS(5_000)
@@ -497,17 +499,36 @@ export async function seguimientoOperadores(req, res) {
     // Esta consulta contiene solamente los cuatro campos necesarios. El orden se
     // realiza en memoria después de filtrar al operador/rango, evitando un sort
     // costoso sobre toda la colección cuando la consulta administrativa no usa propietario.
-    const rows = await ReporteGestion.find(match)
-      .select("usuario fecha hora dni")
-      .maxTimeMS(15_000)
-      .lean();
+    const employeeIds = [...employeeByUsername.values()].map((employee) => employee._id).filter(Boolean);
+    const [rows, novedadesHorario] = await Promise.all([
+      ReporteGestion.find(match)
+        .select("usuario fecha hora dni")
+        .maxTimeMS(15_000)
+        .lean(),
+      employeeIds.length
+        ? NovedadRRHH.find({
+            empleadoId: { $in: employeeIds },
+            tipo: { $in: ["cambio-horario", "licencia-medica"] },
+            estado: { $ne: "anulado" },
+            fechaDesde: { $lte: hasta },
+            $or: [{ fechaHasta: null }, { fechaHasta: { $gte: desde } }],
+          }).lean()
+        : Promise.resolve([]),
+    ]);
+    const novedadesByEmployee = new Map();
+    for (const novedad of novedadesHorario) {
+      const key = String(novedad.empleadoId);
+      if (!novedadesByEmployee.has(key)) novedadesByEmployee.set(key, []);
+      novedadesByEmployee.get(key).push(novedad);
+    }
 
-    const daily = groupActivity(rows, employeeByUsername);
+    const daily = groupActivity(rows, employeeByUsername, novedadesByEmployee);
     const includeDailyRows = usernames.length === 1 || isSingleDayRange(desde, hasta);
     const operadores = usernames.map((username) => {
       const employee = employeeByUsername.get(username) || { username };
       const days = daily.filter((row) => row.username === username);
-      const summary = summarizeDaily(days, employee, desde, hasta);
+      const novedadesEmpleado = novedadesByEmployee.get(String(employee?._id || "")) || [];
+      const summary = summarizeDaily(days, employee, desde, hasta, novedadesEmpleado);
       const alerts = buildActivityRecommendations(summary);
       if (!days.length && includeDailyRows) {
         alerts.unshift('Sin actividad registrada en el rango seleccionado.');
@@ -517,6 +538,15 @@ export async function seguimientoOperadores(req, res) {
         nombre: employee.nombre || "",
         role: employee.role || "",
         horarioLaboral: employee.horarioLaboral || {},
+        novedadesHorario: novedadesEmpleado.map((novedad) => ({
+          id: String(novedad._id),
+          tipo: novedad.tipo,
+          fechaDesde: novedad.fechaDesde,
+          fechaHasta: novedad.fechaHasta,
+          horaEntradaNueva: novedad.horaEntradaNueva || "",
+          horaSalidaNueva: novedad.horaSalidaNueva || "",
+          descripcion: novedad.descripcion || "",
+        })),
         resumen: summary,
         dias: includeDailyRows ? days : [],
         alertas: alerts,

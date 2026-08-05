@@ -57,6 +57,28 @@ const AgendaItemSchema = new mongoose.Schema(
       default: false,
       index: true,
     },
+    serieId: {
+      type: String,
+      trim: true,
+      default: "",
+      index: true,
+    },
+    recurrencia: {
+      type: String,
+      enum: ["", "semanal", "mensual"],
+      default: "",
+      index: true,
+    },
+    recurrenciaHasta: {
+      type: String,
+      default: "",
+      match: /^$|^\d{4}-\d{2}-\d{2}$/,
+    },
+    indiceRecurrencia: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
   },
   {
     timestamps: true,
@@ -66,5 +88,6 @@ const AgendaItemSchema = new mongoose.Schema(
 
 AgendaItemSchema.index({ propietario: 1, fechaClave: 1, hora: 1 });
 AgendaItemSchema.index({ creadoPor: 1, fechaClave: 1, hora: 1 });
+AgendaItemSchema.index({ serieId: 1, fechaClave: 1 });
 
 export default mongoose.model("AgendaItem", AgendaItemSchema);

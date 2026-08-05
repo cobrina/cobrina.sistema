@@ -7,7 +7,8 @@ export async function list(req, res) {
     const filter = {};
     if (onlyActive !== "false") filter.isActive = true;
 
-    if (!["super-admin", "admin"].includes(req.usuario?.rol)) {
+    const role = req.user?.role || req.user?.rol || req.usuario?.role || req.usuario?.rol;
+    if (!["administracion", "supervisor", "super-admin"].includes(role)) {
       filter.visibility = "all";
     }
 
@@ -34,8 +35,8 @@ export async function list(req, res) {
 export async function create(req, res) {
   try {
     const data = req.body;
-    data.createdBy = req.usuario?._id;
-    data.updatedBy = req.usuario?._id;
+    data.createdBy = req.user?.id || req.usuario?._id;
+    data.updatedBy = req.user?.id || req.usuario?._id;
     const tip = await Tip.create(data);
     res.status(201).json(tip);
   } catch (e) {
@@ -46,7 +47,7 @@ export async function create(req, res) {
 export async function update(req, res) {
   try {
     const { id } = req.params;
-    const data = { ...req.body, updatedBy: req.usuario?._id };
+    const data = { ...req.body, updatedBy: req.user?.id || req.usuario?._id };
     const tip = await Tip.findByIdAndUpdate(id, data, { new: true });
     if (!tip) return res.status(404).json({ error: "Tip no encontrado" });
     res.json(tip);
@@ -61,7 +62,7 @@ export async function toggleActive(req, res) {
     const tip = await Tip.findById(id);
     if (!tip) return res.status(404).json({ error: "Tip no encontrado" });
     tip.isActive = !tip.isActive;
-    tip.updatedBy = req.usuario?._id;
+    tip.updatedBy = req.user?.id || req.usuario?._id;
     await tip.save();
     res.json(tip);
   } catch (e) {

@@ -60,7 +60,7 @@ function ownerScope(req) {
 
   if (!usuarioId) return {};
   const isAdminLike =
-    rol === "admin" || rol === "super-admin" || rol === "superadmin";
+    ["capacitadora", "administracion", "supervisor", "super-admin"].includes(rol);
 
   if (isAdminLike && !onlyMine) return {}; // ver todo
   return { propietario: new mongoose.Types.ObjectId(usuarioId) };
@@ -378,7 +378,7 @@ export async function catalogos(req, res) {
     const operadores = (
       await Empleado.find({
         isActive: true,
-        role: { $in: ["operador", "operador-vip"] },
+        role: { $in: ["operador", "operador-vip", "capacitadora", "administracion", "admin"] },
       })
         .select("username")
         .sort({ username: 1 })

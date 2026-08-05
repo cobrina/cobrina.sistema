@@ -8,8 +8,8 @@ import SubCesion from "../models/SubCesion.js";
 const router = express.Router();
 
 // Roles permitidos
-const soloAdmin = [verifyToken, permitirRoles("super-admin")];
-const lecturaTodos = [verifyToken, permitirRoles("super-admin", "admin", "operador", "operador-vip")];
+const soloAdmin = [verifyToken, permitirRoles("administracion", "supervisor", "super-admin")];
+const lecturaTodos = [verifyToken, permitirRoles("operador", "operador-vip", "cuotero", "capacitadora", "administracion", "supervisor", "super-admin")];
 
 /* ===========================
    🔹 SubCesiones
