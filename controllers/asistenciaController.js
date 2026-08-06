@@ -324,7 +324,15 @@ export async function marcarSalida(req, res) {
     const asistencia = await Asistencia.findOne({ empleado: req.user.id, fechaClave });
 
     if (!asistencia || asistencia.estado !== "presente") {
-      return res.status(400).json({ error: "No hay una jornada abierta para finalizar" });
+      return res.json({
+        ok: true,
+        yaEstabaFinalizada: Boolean(asistencia),
+        estado: asistencia?.estado || "sin-fichar",
+        marcas: asistencia?.marcas || [],
+        mensaje: asistencia
+          ? "La jornada ya estaba finalizada"
+          : "No había una jornada abierta",
+      });
     }
 
     await finalizarAsistencia(asistencia, ahora, "manual");

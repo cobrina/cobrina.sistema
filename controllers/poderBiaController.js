@@ -124,9 +124,7 @@ export async function generarPoderGreenLight(req, res) {
   try {
     const dni = normalizarDni(req.body.dni);
     const nombreTitular = String(req.body.nombreTitular || "").trim().toUpperCase();
-    const tratamientoRaw = String(req.body.tratamiento || "").trim().toLowerCase();
-    const tratamiento = ["sr", "sra"].includes(tratamientoRaw) ? tratamientoRaw : "";
-    const cartera = String(req.body.cartera || "").trim();
+    const cartera = String(req.body.cartera || "").trim().toUpperCase();
     const tipoProducto = String(req.body.tipoProducto || "").trim();
     const numeroProducto = String(req.body.numeroProducto || "").trim().toUpperCase();
     const fechaDocumento = req.body.fechaDocumento ? new Date(req.body.fechaDocumento) : new Date();
@@ -141,7 +139,7 @@ export async function generarPoderGreenLight(req, res) {
       tipoPoder: "green-light",
       dni,
       nombreTitular,
-      tratamiento,
+      tratamiento: "",
       cartera,
       tipoProducto,
       numeroProducto,
@@ -160,11 +158,14 @@ export async function generarPoderGreenLight(req, res) {
     const bodyWidth = pageWidth - 124;
 
     doc.image(logoGreenLightPath, pageWidth / 2 - 58, 38, { fit: [116, 92], align: "center", valign: "center" });
-    doc.font("Helvetica-Bold").fontSize(12).text(
-      "Fideicomiso Financiero Privado Green Light (Brubank S.A.U)",
-      left,
+    const tituloGreenLight = `Fideicomiso Financiero Privado Green Light (${cartera})`;
+    const tituloLeft = 38;
+    const tituloWidth = pageWidth - 76;
+    doc.font("Helvetica-Bold").fontSize(tituloGreenLight.length > 92 ? 10.2 : 11.3).text(
+      tituloGreenLight,
+      tituloLeft,
       152,
-      { width: bodyWidth, align: "center" }
+      { width: tituloWidth, align: "center", lineGap: 2 }
     );
 
     doc.font("Helvetica").fontSize(10.5).text(
@@ -175,12 +176,7 @@ export async function generarPoderGreenLight(req, res) {
     );
     doc.font("Helvetica").fontSize(11).text("Presente", left, 258, { underline: true });
 
-    const tratamientoTitular = tratamiento === "sra"
-      ? "de la Sra. "
-      : tratamiento === "sr"
-        ? "del Sr. "
-        : "de ";
-    const p1 = `Por medio del presente en nuestro carácter de acreedores, hacemos constar que el estudio de cobranza RDC Collections y asociados, actualmente se encuentra autorizado como Agente de Recaudación del Fideicomiso Financiero Privado Green Light (Brubank S.A.U), para el cobro de la deuda ${tratamientoTitular}`;
+    const p1 = `Por medio del presente en nuestro carácter de acreedores, hacemos constar que el estudio de cobranza RDC Collections y asociados, actualmente se encuentra autorizado como Agente de Recaudación del Fideicomiso Financiero Privado Green Light (${cartera}), para el cobro de la deuda del Sr./Sra. `;
     doc.font("Helvetica").fontSize(10.5).text(p1, left, 310, { width: bodyWidth, align: "justify", indent: 44, continued: true, lineGap: 5 });
     doc.font("Helvetica-Bold").text(nombreTitular, { continued: true });
     doc.font("Helvetica").text(" titular del DNI ", { continued: true });

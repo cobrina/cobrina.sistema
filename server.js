@@ -39,7 +39,7 @@ if (missingEnv.length) {
 }
 
 const app = express();
-const BUILD_ID = "rdc-green-light-ui-2026-08-06.5";
+const BUILD_ID = "rdc-green-light-ui-2026-08-06.10";
 const PORT = Number(process.env.PORT) || 5000;
 let httpServer = null;
 let shuttingDown = false;
