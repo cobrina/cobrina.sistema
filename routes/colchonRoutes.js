@@ -37,19 +37,22 @@ import { ROLES } from "../config/roles.js";
 
 const router = express.Router();
 const accesoColchon = [verifyToken, permitirModulos("colchon")];
-const soloSuper = [verifyToken, permitirRoles(ROLES.SUPER_ADMIN)];
+const administracionColchon = [
+  verifyToken,
+  permitirRoles(ROLES.CUOTERO, ROLES.SUPERVISOR, ROLES.SUPER_ADMIN),
+];
 const confirmaPagos = [
   verifyToken,
   permitirRoles(ROLES.CUOTERO, ROLES.SUPERVISOR, ROLES.SUPER_ADMIN),
 ];
 
-// Modelos, importaciones y vaciado masivo: únicamente super-admin.
-router.get("/modelo", ...soloSuper, descargarModeloColchon);
-router.get("/modelo-pagos", ...soloSuper, descargarModeloPagos);
-router.post("/importar", ...soloSuper, upload.single("archivo"), importarExcel);
-router.post("/importar-pagos", ...soloSuper, rechazarImportacionPagosColchon);
-router.delete("/vaciar", ...soloSuper, eliminarTodasLasCuotas);
-router.post("/eliminar-seleccion", ...soloSuper, eliminarCuotasSeleccionadas);
+// Modelos, importaciones y mantenimiento: cuotero/a, supervisor/a y super-admin.
+router.get("/modelo", ...administracionColchon, descargarModeloColchon);
+router.get("/modelo-pagos", ...administracionColchon, descargarModeloPagos);
+router.post("/importar", ...administracionColchon, upload.single("archivo"), importarExcel);
+router.post("/importar-pagos", ...administracionColchon, rechazarImportacionPagosColchon);
+router.delete("/vaciar", ...administracionColchon, eliminarTodasLasCuotas);
+router.post("/eliminar-seleccion", ...administracionColchon, eliminarCuotasSeleccionadas);
 
 // Consultas y exportaciones respetan alcance propio/global en el controller.
 router.get("/exportar", ...accesoColchon, exportarExcel);

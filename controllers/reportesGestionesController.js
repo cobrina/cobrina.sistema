@@ -763,9 +763,21 @@ export async function catalogos(req, res) {
 
     throwIfAborted(req);
 
-    const operadores = (
-      await Empleado.find({ isActive: true }).select("username").sort({ username: 1 }).lean()
-    ).map((e) => String(e.username || ""));
+    const empleadosActivos = await Empleado.find({ isActive: true })
+      .select("username nombre role horarioLaboral.modalidad horarioLaboral.entrada horarioLaboral.salida")
+      .sort({ username: 1 })
+      .lean();
+    const operadores = empleadosActivos.map((e) => String(e.username || ""));
+    const operadoresDetalle = empleadosActivos
+      .map((empleado) => ({
+        username: String(empleado.username || "").trim(),
+        nombre: String(empleado.nombre || "").trim(),
+        role: String(empleado.role || "").trim(),
+        modalidadHorario: empleado?.horarioLaboral?.modalidad === "libre" ? "libre" : "fijo",
+        entrada: String(empleado?.horarioLaboral?.entrada || "").trim(),
+        salida: String(empleado?.horarioLaboral?.salida || "").trim(),
+      }))
+      .filter((empleado) => empleado.username);
 
     const entidades = (await Entidad.find().select("nombre").sort({ numero: 1 }).lean()).map((x) =>
       String(x.nombre || "")
@@ -786,6 +798,7 @@ export async function catalogos(req, res) {
     return res.json({
       ok: true,
       operadores: ordenar(operadores),
+      operadoresDetalle,
       entidades: ordenar(entidades),
       tiposContacto: ordenar(tiposRaw),
       estadosCuenta: ordenar(estadosRaw),

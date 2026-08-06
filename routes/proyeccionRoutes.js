@@ -124,24 +124,24 @@ router.patch(
 router.put("/:id", ...accesoProyecciones, permitirDuenoOAmbitoGlobal, actualizarProyeccion);
 router.delete("/:id", ...accesoProyecciones, permitirDuenoOAmbitoGlobal, eliminarProyeccion);
 
-// Operaciones destructivas o cargas masivas: únicamente super-admin.
+// Operaciones destructivas o cargas masivas: supervisor/a y super-admin.
 router.delete(
   "/admin/eliminar-masivo",
   verifyToken,
-  permitirRoles(ROLES.SUPER_ADMIN),
+  permitirRoles(ROLES.SUPERVISOR, ROLES.SUPER_ADMIN),
   eliminarProyeccionesMasivo
 );
 router.post(
   "/pagos/importar",
   verifyToken,
-  permitirRoles(ROLES.SUPER_ADMIN),
+  permitirRoles(ROLES.SUPERVISOR, ROLES.SUPER_ADMIN),
   upload.single("file"),
   importarPagosMasivo
 );
 router.post(
   "/importar",
   verifyToken,
-  permitirRoles(ROLES.SUPER_ADMIN),
+  permitirRoles(ROLES.SUPERVISOR, ROLES.SUPER_ADMIN),
   upload.single("file"),
   importarProyeccionesMasivo
 );

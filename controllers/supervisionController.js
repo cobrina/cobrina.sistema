@@ -6,10 +6,11 @@ import ObjetivoMensual from "../models/ObjetivoMensual.js";
 import Asistencia from "../models/Asistencia.js";
 import Proyeccion from "../models/Proyeccion.js";
 import Colchon from "../models/Colchon.js";
-import AcuerdoPago from "../models/AcuerdoPago.js";
 import ReporteGestion from "../models/ReporteGestion.js";
 import NovedadRRHH from "../models/NovedadRRHH.js";
+import AcuerdoPago from "../models/AcuerdoPago.js";
 import { horarioEfectivoParaFecha, minutosTrabajadosDesdeMarcas, minutosEsperadosHastaHoy, rangoMesLocal } from "../utils/calculoAsistencia.js";
+import { transformarGestionEnAcuerdo } from "../services/acuerdosGestionesService.js";
 
 function mesValido(valor) {
   const match = String(valor || "").match(/^(\d{4})-(\d{2})$/);
@@ -18,6 +19,28 @@ function mesValido(valor) {
   const mes = Number(match[2]);
   if (anio < 2000 || anio > 2100 || mes < 1 || mes > 12) return null;
   return `${anio}-${String(mes).padStart(2, "0")}`;
+}
+
+function fechaHoraGestionLocal(fecha, hora = "") {
+  const fechaMatch = String(fecha || "").trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!fechaMatch) return null;
+
+  const horaMatch = String(hora || "").trim().match(/^(\d{1,2})(?::(\d{1,2}))?(?::(\d{1,2}))?/);
+  const horas = horaMatch ? Number(horaMatch[1]) : 0;
+  const minutos = horaMatch ? Number(horaMatch[2] || 0) : 0;
+  const segundos = horaMatch ? Number(horaMatch[3] || 0) : 0;
+  if (horas > 23 || minutos > 59 || segundos > 59) return null;
+
+  // Las horas de Mango se guardan en horario argentino (UTC-03:00).
+  const fechaUTC = new Date(Date.UTC(
+    Number(fechaMatch[1]),
+    Number(fechaMatch[2]) - 1,
+    Number(fechaMatch[3]),
+    horas + 3,
+    minutos,
+    segundos
+  ));
+  return Number.isNaN(fechaUTC.getTime()) ? null : fechaUTC;
 }
 
 function fechaBaseMes(mes) {
@@ -87,8 +110,9 @@ export async function resumenSupervision(req, res) {
       .lean();
 
     const [pagosTres, objetivos, asistencias, novedadesHorario, proyeccionesCaidas, colchonSinGestion,
-      pendientesColchon, pendientesProyecciones, ultimaPago, ultimoAcuerdo, ultimaGestion,
-      pagosHoyAgg, presentesAhora, jornadasSinSalida] = await Promise.all([
+      pendientesColchon, pendientesProyecciones, ultimaPago, ultimaGestionAcuerdo, ultimaGestion,
+      gestionesAcuerdoPeriodo, pagosHoyAgg, presentesAhora, jornadasSinSalida,
+      ultimaAcuerdoManual, acuerdosManualesCantidad] = await Promise.all([
       Pago.find({ fechaPago: { $gte: desdeTres, $lte: hasta } })
         .select("monto fechaPago operadorId operadorUsername entidadId subCesionId")
         .lean(),
@@ -121,14 +145,30 @@ export async function resumenSupervision(req, res) {
         pagosInformados: { $elemMatch: { erroneo: { $ne: true }, estadoAplicacion: { $in: [null, "pendiente"] } } },
       }),
       Pago.findOne().sort({ createdAt: -1 }).select("createdAt fechaPago").lean(),
-      AcuerdoPago.findOne().sort({ createdAt: -1 }).select("createdAt fechaHora fuenteArchivo").lean(),
-      ReporteGestion.findOne().sort({ createdAt: -1 }).select("createdAt fecha fuenteArchivo").lean(),
+      ReporteGestion.findOne({ borrado: { $ne: true }, resultadoGestion: /acuerdo/i })
+        .sort({ createdAt: -1 })
+        .select("createdAt fecha hora usuario resultadoGestion fuenteArchivo")
+        .lean(),
+      ReporteGestion.findOne({ borrado: { $ne: true } }).sort({ createdAt: -1 }).select("createdAt fecha fuenteArchivo").lean(),
+      ReporteGestion.find({
+        fecha: { $gte: selectedDesdeUTC, $lte: selectedHastaUTC },
+        borrado: { $ne: true },
+        resultadoGestion: /acuerdo/i,
+      })
+        .select("dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero")
+        .sort({ fecha: -1, hora: -1, _id: -1 })
+        .lean(),
       Pago.aggregate([
         { $match: { fechaPago: { $gte: hoyDesde, $lte: hoyHasta } } },
         { $group: { _id: null, total: { $sum: "$monto" }, cantidad: { $sum: 1 } } },
       ]),
       Asistencia.countDocuments({ fechaClave: hoyClave, estado: "presente" }),
       Asistencia.countDocuments({ fechaClave: { $lt: hoyClave }, estado: "presente" }),
+      AcuerdoPago.findOne({ mes: mesSeleccionado })
+        .sort({ fechaHora: -1, createdAt: -1 })
+        .select("fechaHora createdAt fuenteArchivo operador")
+        .lean(),
+      AcuerdoPago.countDocuments({ mes: mesSeleccionado }),
     ]);
 
     const recaudacionTresMeses = meses.map((m) => {
@@ -178,6 +218,8 @@ export async function resumenSupervision(req, res) {
         horarioHoy: horarioHoy.etiqueta,
         horarioModificadoHoy: horarioHoy.cambioHorario,
         licenciaMedicaHoy: horarioHoy.licenciaMedica,
+        horarioLibre: horarioHoy.horarioLibre,
+        deficitMinutos: Math.max(0, esperados - minutos),
       };
     });
 
@@ -235,10 +277,76 @@ export async function resumenSupervision(req, res) {
       })
       .sort((a, b) => b.total - a.total);
 
+    // La fuente de acuerdos es exactamente la misma que Reportes > Acuerdos:
+    // gestiones con resultado "acuerdo" que además superan la validación del parser.
+    // El total de acuerdos no depende de que existan pagos importados.
+    const usuariosActivos = new Set(
+      empleados
+        .map((empleado) => String(empleado.username || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+    const acuerdosValidos = gestionesAcuerdoPeriodo
+      .map((gestion) => transformarGestionEnAcuerdo(gestion))
+      .filter(Boolean)
+      // El filtro se hace en JS para que nombres con mayúsculas/minúsculas distintas
+      // no oculten acuerdos que sí aparecen en Reporte de gestiones.
+      .filter((acuerdo) => usuariosActivos.has(String(acuerdo.usuario || "").trim().toLowerCase()));
+    const ultimoAcuerdoMango = acuerdosValidos[0] || null;
+    const ultimaFechaAcuerdoMango = ultimoAcuerdoMango?.fecha
+      ? fechaHoraGestionLocal(ultimoAcuerdoMango.fecha, ultimoAcuerdoMango.hora)
+      : null;
+    const acuerdosPorOperadorMap = new Map();
+    const acuerdosPorTipoMap = new Map();
+    let montoTotalAcuerdos = 0;
+    let primerPagoTotal = 0;
+    let acuerdosVencidos = 0;
+    let acuerdosVenceHoy = 0;
+    let acuerdosProximos = 0;
+
+    for (const acuerdo of acuerdosValidos) {
+      const usuario = String(acuerdo.usuario || "Sin operador").trim() || "Sin operador";
+      const actual = acuerdosPorOperadorMap.get(usuario) || {
+        usuario,
+        total: 0,
+        montoTotal: 0,
+        primerPagoTotal: 0,
+        vencidos: 0,
+        venceHoy: 0,
+        proximos: 0,
+      };
+      actual.total += 1;
+      actual.montoTotal += Number(acuerdo.montoTotalAcuerdo || 0);
+      actual.primerPagoTotal += Number(acuerdo.primerPago || 0);
+      if (acuerdo.estadoVencimiento === "VENCIDO") actual.vencidos += 1;
+      if (acuerdo.estadoVencimiento === "VENCE HOY") actual.venceHoy += 1;
+      if (acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") actual.proximos += 1;
+      acuerdosPorOperadorMap.set(usuario, actual);
+
+      const tipo = acuerdo.tipoAcuerdo || "Sin clasificar";
+      acuerdosPorTipoMap.set(tipo, (acuerdosPorTipoMap.get(tipo) || 0) + 1);
+      montoTotalAcuerdos += Number(acuerdo.montoTotalAcuerdo || 0);
+      primerPagoTotal += Number(acuerdo.primerPago || 0);
+      if (acuerdo.estadoVencimiento === "VENCIDO") acuerdosVencidos += 1;
+      if (acuerdo.estadoVencimiento === "VENCE HOY") acuerdosVenceHoy += 1;
+      if (acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") acuerdosProximos += 1;
+    }
+
+    const acuerdosPorOperador = [...acuerdosPorOperadorMap.values()]
+      .sort((a, b) => b.total - a.total || b.montoTotal - a.montoTotal);
+    const acuerdosPorTipo = [...acuerdosPorTipoMap.entries()]
+      .map(([tipo, total]) => ({ tipo, total }))
+      .sort((a, b) => b.total - a.total);
+
     const horasParaRevisar = operadores
-      .filter((o) => o.minutosEsperados > 0 && o.porcentajeHoras < 75)
-      .sort((a, b) => a.porcentajeHoras - b.porcentajeHoras)
-      .slice(0, 12);
+      .filter((o) => !o.horarioLibre && o.minutosEsperados > 0 && o.deficitMinutos >= 60 && o.porcentajeHoras < 90)
+      .sort((a, b) => b.deficitMinutos - a.deficitMinutos || a.porcentajeHoras - b.porcentajeHoras)
+      .slice(0, 12)
+      .map((o) => ({
+        ...o,
+        motivoRevision: o.minutosTrabajados <= 0
+          ? "Sin horas fichadas en el período"
+          : `Faltan ${Math.floor(o.deficitMinutos / 60)}h ${Math.round(o.deficitMinutos % 60)}m frente al horario base`,
+      }));
 
     const objetivosParaRevisar = operadores
       .filter((o) => o.objetivo > 0)
@@ -294,9 +402,32 @@ export async function resumenSupervision(req, res) {
         cambiosHorarioHoy,
         licenciasMedicasHoy,
       },
+      acuerdos: {
+        total: acuerdosValidos.length,
+        montoTotal: montoTotalAcuerdos,
+        primerPagoTotal,
+        vencidos: acuerdosVencidos,
+        venceHoy: acuerdosVenceHoy,
+        proximos: acuerdosProximos,
+        porOperador: acuerdosPorOperador,
+        porTipo: acuerdosPorTipo,
+        fuente: "reporte-gestiones",
+      },
       actualizaciones: {
         pagos: ultimaPago,
-        acuerdos: ultimoAcuerdo,
+        acuerdos: ultimaGestionAcuerdo,
+        acuerdosManuales: {
+          cantidad: Number(acuerdosManualesCantidad || 0),
+          fecha: ultimaAcuerdoManual?.fechaHora || ultimaAcuerdoManual?.createdAt || null,
+          fuenteArchivo: ultimaAcuerdoManual?.fuenteArchivo || "",
+        },
+        acuerdosMango: {
+          cantidad: acuerdosValidos.length,
+          fecha: ultimaFechaAcuerdoMango && !Number.isNaN(ultimaFechaAcuerdoMango.getTime())
+            ? ultimaFechaAcuerdoMango
+            : null,
+          fuente: "Reporte de gestiones",
+        },
         gestiones: ultimaGestion,
       },
       objetivos,

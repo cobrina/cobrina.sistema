@@ -19,7 +19,7 @@ import PagoInformadoMango from "../models/PagoInformadoMango.js";
 import { transformarGestionEnAcuerdo, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
 
 const rolDe = (req) => req.user.role || req.user.rol;
-const esSuperAdmin = (req) => rolDe(req) === ROLES.SUPER_ADMIN;
+const esGestorGlobal = (req) => [ROLES.SUPERVISOR, ROLES.SUPER_ADMIN].includes(rolDe(req));
 const esAmbitoGlobal = (req) => getProyeccionesScope(rolDe(req)) === "all";
 const esAmbitoPropio = (req) => getProyeccionesScope(rolDe(req)) === "own";
 const tieneAccesoProyecciones = (req) => getProyeccionesScope(rolDe(req)) !== "none";
@@ -2289,7 +2289,7 @@ export const limpiarObservacionesProyeccion = async (req, res) => {
 export const importarPagosMasivo = async (req, res) => {
   try {
     // 1) Seguridad por rol (la ruta igual debería tener el middleware)
-    if (!esSuperAdmin(req)) {
+    if (!esGestorGlobal(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -2699,7 +2699,7 @@ export const importarPagosMasivo = async (req, res) => {
 
 export const eliminarProyeccionesMasivo = async (req, res) => {
   try {
-    if (!esSuperAdmin(req)) return res.status(403).json({ error: "Solo super-admin puede eliminar proyecciones masivamente" });
+    if (!esGestorGlobal(req)) return res.status(403).json({ error: "Solo Supervisión o super-admin pueden eliminar proyecciones masivamente" });
     const confirmacion = String(req.body?.confirmacion || "").trim();
     if (confirmacion !== "ELIMINAR PROYECCIONES") {
       return res.status(400).json({ error: "Confirmación inválida" });
@@ -3107,7 +3107,7 @@ export const exportarPagosExcel = async (req, res) => {
 
 export const importarProyeccionesMasivo = async (req, res) => {
   try {
-    if (!esSuperAdmin(req)) {
+    if (!esGestorGlobal(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 

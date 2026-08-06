@@ -204,6 +204,7 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
       horarioAsignado: horarioEfectivo.etiqueta,
       horarioModificado: horarioEfectivo.cambioHorario,
       licenciaMedica: horarioEfectivo.licenciaMedica,
+      horarioLibre: horarioEfectivo.horarioLibre,
       primeraGestion: hhmm(first),
       ultimaGestion: hhmm(last),
       franjaTotalMin: Math.max(0, last - first),
@@ -236,19 +237,25 @@ function summarizeDaily(rows, employee, desde, hasta, novedades = []) {
   const sum = (key) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
   const max = (key) => rows.reduce((value, row) => Math.max(value, Number(row[key] || 0)), 0);
   const longCount = sum("pausasLargas");
+  const horarioLibre = employee?.horarioLaboral?.modalidad === "libre";
   const clavesRango = rangeDays(desde, hasta);
-  const expectedDays = clavesRango.filter((day) => horarioEfectivoParaFecha(employee, day, novedades).minutosEsperados > 0).length;
-  const expectedTotal = minutosEsperadosEnRango(
-    employee,
-    desde.toISOString().slice(0, 10),
-    hasta.toISOString().slice(0, 10),
-    novedades
-  );
+  const expectedDays = horarioLibre
+    ? 0
+    : clavesRango.filter((day) => horarioEfectivoParaFecha(employee, day, novedades).minutosEsperados > 0).length;
+  const expectedTotal = horarioLibre
+    ? 0
+    : minutosEsperadosEnRango(
+        employee,
+        desde.toISOString().slice(0, 10),
+        hasta.toISOString().slice(0, 10),
+        novedades
+      );
   const worked = sum("horasTrabajadasMin");
   const gestiones = sum("gestiones");
   const cases = sum("casos");
   const longTotal = sum("pausaLargaTotalMin");
   return {
+    horarioLibre,
     diasConActividad: rows.length,
     diasLaboralesEsperados: expectedDays,
     horasPrevistasMin: expectedTotal,
@@ -266,7 +273,7 @@ function summarizeDaily(rows, employee, desde, hasta, novedades = []) {
     pausaMaximaMin: max("pausaMaximaMin"),
     diasInicioTardio: rows.filter((row) => row.inicioTardioMin > 0).length,
     diasFinAnticipado: rows.filter((row) => row.finAnticipadoMin > 0).length,
-    diasMenosCuatroHoras: rows.filter((row) => row.horasTrabajadasMin < 240).length,
+    diasMenosCuatroHoras: horarioLibre ? 0 : rows.filter((row) => row.horasTrabajadasMin < 240).length,
     diasActividadConcentrada: rows.filter((row) => row.concentracionDosHorasPct >= 50).length,
   };
 }
@@ -403,11 +410,13 @@ function aggregateAudit(audits) {
 
 function buildActivityRecommendations(summary) {
   const alerts = [];
-  if (summary.diasMenosCuatroHoras) alerts.push(`${summary.diasMenosCuatroHoras} día(s) con menos de 4 horas trabajadas según Mango.`);
+  if (!summary.horarioLibre && summary.diasMenosCuatroHoras) alerts.push(`${summary.diasMenosCuatroHoras} día(s) con menos de 4 horas trabajadas según Mango.`);
   if (summary.pausasCriticas) alerts.push(`${summary.pausasCriticas} pausa(s) crítica(s) superiores a 60 minutos.`);
   if (summary.diasInicioTardio) alerts.push(`${summary.diasInicioTardio} día(s) con inicio posterior al horario y tolerancia configurados.`);
   if (summary.diasActividadConcentrada) alerts.push(`${summary.diasActividadConcentrada} día(s) con más del 50 % de las gestiones concentradas en solo dos horas.`);
-  if (!alerts.length) alerts.push("No se detectaron alertas principales de actividad con los criterios actuales.");
+  if (!alerts.length) alerts.push(summary.horarioLibre
+    ? "Horario libre: se informa actividad real sin calcular tardanzas, faltas horarias ni cumplimiento de una franja fija."
+    : "No se detectaron alertas principales de actividad con los criterios actuales.");
   return alerts;
 }
 

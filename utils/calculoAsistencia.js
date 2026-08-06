@@ -78,6 +78,7 @@ function ultimaNovedad(novedades, tipo, fechaClave) {
 /**
  * Devuelve el horario que debe usarse para una fecha concreta.
  * - Una licencia médica vigente deja el esperado del día en 0.
+ * - La modalidad libre informa actividad real sin exigir una franja ni horas esperadas.
  * - Un cambio de horario reemplaza entrada/salida únicamente en las fechas cargadas.
  * - Sin novedades se conserva el horario base del empleado.
  */
@@ -86,18 +87,35 @@ export function horarioEfectivoParaFecha(empleado, fechaClave, novedades = []) {
   const diasBase = Array.isArray(base.dias) && base.dias.length ? base.dias : [1, 2, 3, 4, 5];
   const date = fechaClaveADateUTC(fechaClave);
   const weekday = date?.getUTCDay();
+  const modalidad = String(base.modalidad || "fijo").trim().toLowerCase() === "libre" ? "libre" : "fijo";
   const licencia = ultimaNovedad(novedades, "licencia-medica", fechaClave);
   if (licencia) {
     return {
       programado: false,
       licenciaMedica: true,
       cambioHorario: false,
+      horarioLibre: modalidad === "libre",
       entrada: "",
       salida: "",
       toleranciaMinutos: 0,
       minutosEsperados: 0,
       novedad: licencia,
       etiqueta: "Licencia médica",
+    };
+  }
+
+  if (modalidad === "libre") {
+    return {
+      programado: false,
+      licenciaMedica: false,
+      cambioHorario: false,
+      horarioLibre: true,
+      entrada: "",
+      salida: "",
+      toleranciaMinutos: 0,
+      minutosEsperados: 0,
+      novedad: null,
+      etiqueta: "Horario libre",
     };
   }
 
@@ -117,6 +135,7 @@ export function horarioEfectivoParaFecha(empleado, fechaClave, novedades = []) {
     programado: Boolean(programado && minutosEsperados > 0),
     licenciaMedica: false,
     cambioHorario: tieneCambioValido,
+    horarioLibre: false,
     entrada,
     salida,
     toleranciaMinutos: Number.isFinite(toleranciaMinutos) ? toleranciaMinutos : 10,

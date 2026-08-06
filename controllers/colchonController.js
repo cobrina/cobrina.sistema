@@ -23,13 +23,13 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const rolDe = (req) => req.user.role || req.user.rol;
-const esSuperAdmin = (req) => rolDe(req) === ROLES.SUPER_ADMIN;
 const ambitoColchon = (req) => getColchonScope(rolDe(req));
 const nivelEscrituraColchon = (req) => getColchonWriteLevel(rolDe(req));
 const tieneAccesoColchon = (req) => ambitoColchon(req) !== "none";
 const esAmbitoGlobal = (req) => ambitoColchon(req) === "all";
 const esAmbitoPropio = (req) => ambitoColchon(req) === "own";
 const puedeEditarTodo = (req) => nivelEscrituraColchon(req) === "full";
+const esGestorGlobal = (req) => puedeEditarTodo(req);
 const puedeEditarPropio = (req) => ["full", "own-full"].includes(nivelEscrituraColchon(req));
 const esSoloInformador = (req) => nivelEscrituraColchon(req) === "inform-only";
 const puedeConfirmarPagos = (req) => canConfirmColchonPayments(rolDe(req));
@@ -490,7 +490,7 @@ export const eliminarCuota = async (req, res) => {
 
 export const eliminarCuotasSeleccionadas = async (req, res) => {
   try {
-    if (!esSuperAdmin(req)) {
+    if (!esGestorGlobal(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -844,7 +844,7 @@ export const filtrarCuotas = async (req, res) => {
 
 // Importar desde Excel
 export const importarExcel = async (req, res) => {
-  if (!esSuperAdmin(req)) return res.status(403).json({ error: "No autorizado" });
+  if (!esGestorGlobal(req)) return res.status(403).json({ error: "No autorizado" });
   try {
     if (!req.file)
       return res.status(400).json({ error: "No se recibió archivo" });
@@ -1889,7 +1889,7 @@ export const limpiarCuota = async (req, res) => {
 
 export const importarPagosDesdeExcel = async (req, res) => {
   try {
-    if (!esSuperAdmin(req)) {
+    if (!esGestorGlobal(req)) {
       return res.status(403).json({ error: "No autorizado" });
     }
 
@@ -2260,7 +2260,7 @@ export const exportarPagos = async (req, res) => {
 // Eliminar todas las cuotas del colchón
 export const eliminarTodasLasCuotas = async (req, res) => {
   try {
-    if (!esSuperAdmin(req)) return res.status(403).json({ error: "No autorizado" });
+    if (!esGestorGlobal(req)) return res.status(403).json({ error: "No autorizado" });
     await Colchon.deleteMany({});
     res.json({ mensaje: "Todas las cuotas fueron eliminadas correctamente" });
   } catch (error) {

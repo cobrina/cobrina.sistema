@@ -6,6 +6,7 @@ import Empleado from "../models/Empleado.js";
 import NovedadRRHH from "../models/NovedadRRHH.js";
 import verifyToken from "../middleware/verifyToken.js";
 import permitirModulos from "../middleware/permitirModulos.js";
+import permitirRoles from "../middleware/permitirRoles.js";
 import {
   ROLES,
   ASSIGNABLE_ROLES,
@@ -19,6 +20,16 @@ import {
 
 const router = express.Router();
 const gestoresUsuarios = [verifyToken, permitirModulos("usuarios")];
+const gestoresContrasenas = [
+  verifyToken,
+  permitirRoles(
+    ROLES.CUOTERO,
+    ROLES.CAPACITADORA,
+    ROLES.ADMINISTRACION,
+    ROLES.SUPERVISOR,
+    ROLES.SUPER_ADMIN
+  ),
+];
 
 const validar = (req, res) => {
   const errores = validationResult(req);
@@ -43,7 +54,7 @@ function rolSolicitadoParaActor(req, rawRole) {
   if (!role) throw new Error("Rol inválido");
 
   if (!canAssignElevatedRoles(req.user.role, req.user.username) && role !== ROLES.OPERADOR) {
-    throw new Error("Solo los super-admin autorizados pueden asignar perfiles especiales");
+    throw new Error("No tenés permiso para asignar ese perfil");
   }
   return role;
 }
@@ -67,7 +78,7 @@ router.post(
 
       if (
         isDesignatedSuperAdmin(username) &&
-        !canAssignElevatedRoles(req.user.role, req.user.username)
+        getEffectiveRole(req.user.role, req.user.username) !== ROLES.SUPER_ADMIN
       ) {
         return res.status(403).json({
           error: "Ese nombre de usuario está reservado para un super-admin autorizado",
@@ -102,6 +113,67 @@ router.post(
         return res.status(409).json({ error: `Duplicado: ${campo} ya está en uso` });
       }
       return res.status(500).json({ error: "Error interno del servidor al crear empleado" });
+    }
+  }
+);
+
+
+router.get("/password-reset/users", ...gestoresContrasenas, async (req, res) => {
+  try {
+    const actorRole = getEffectiveRole(req.user.role, req.user.username);
+    const empleados = await Empleado.find({ isActive: { $ne: false } })
+      .select("username nombre email role")
+      .sort({ username: 1 })
+      .lean();
+
+    const visibles = empleados
+      .map(empleadoSeguro)
+      .filter((empleado) => {
+        if (empleado.role === ROLES.SUPER_ADMIN) return false;
+        if (actorRole === ROLES.SUPERVISOR) return true;
+        return [ROLES.OPERADOR, ROLES.OPERADOR_VIP].includes(empleado.role);
+      });
+
+    return res.json(visibles);
+  } catch (error) {
+    if (process.env.NODE_ENV === "development") console.error("Listar usuarios para contraseña:", error);
+    return res.status(500).json({ error: "No se pudieron obtener los usuarios" });
+  }
+});
+
+router.patch(
+  "/password-reset/:id",
+  ...gestoresContrasenas,
+  [
+    check("id").custom(isObjectId).withMessage("ID inválido"),
+    check("password")
+      .isString()
+      .isLength({ min: 6, max: 100 })
+      .withMessage("La contraseña debe tener entre 6 y 100 caracteres"),
+  ],
+  async (req, res) => {
+    if (!validar(req, res)) return;
+    try {
+      const target = await Empleado.findById(req.params.id).select("+password");
+      if (!target) return res.status(404).json({ error: "Operador no encontrado" });
+      const actorRole = getEffectiveRole(req.user.role, req.user.username);
+      const targetRole = getEffectiveRole(target.role, target.username);
+      const permitido = actorRole === ROLES.SUPERVISOR
+        ? targetRole !== ROLES.SUPER_ADMIN
+        : [ROLES.OPERADOR, ROLES.OPERADOR_VIP].includes(targetRole);
+      if (!permitido) {
+        return res.status(403).json({
+          error: actorRole === ROLES.SUPERVISOR
+            ? "No se puede restablecer la contraseña de un super-admin"
+            : "Solo se pueden restablecer contraseñas de operadores y operadores VIP",
+        });
+      }
+      target.password = await bcrypt.hash(String(req.body.password), 10);
+      await target.save();
+      return res.json({ ok: true, message: `Contraseña actualizada para ${target.username}` });
+    } catch (error) {
+      if (process.env.NODE_ENV === "development") console.error("Cambiar contraseña:", error);
+      return res.status(500).json({ error: "No se pudo actualizar la contraseña" });
     }
   }
 );

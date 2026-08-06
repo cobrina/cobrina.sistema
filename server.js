@@ -26,6 +26,7 @@ import tipsRoutes from "./routes/tipsRoutes.js";
 import rrhhRoutes from "./routes/rrhhRoutes.js";
 import poderBiaRoutes from "./routes/poderBiaRoutes.js";
 import supervisionRoutes from "./routes/supervisionRoutes.js";
+import dashboardRoutes from "./routes/dashboardRoutes.js";
 import { procesarCierresAutomaticos } from "./controllers/asistenciaController.js";
 
 dotenv.config();
@@ -38,7 +39,7 @@ if (missingEnv.length) {
 }
 
 const app = express();
-const BUILD_ID = "rdc-pagos-rrhh-supervision-2026-08-05.4";
+const BUILD_ID = "rdc-green-light-ui-2026-08-06.5";
 const PORT = Number(process.env.PORT) || 5000;
 let httpServer = null;
 let shuttingDown = false;
@@ -135,6 +136,9 @@ app.get("/api/version", (_req, res) => {
       supervision: true,
       pagosInternos: true,
       poderesBia: true,
+      poderGreenLight: true,
+      dashboardPorPerfil: true,
+      cambioContrasenas: true,
       acuerdosMango: true,
       misTareas: true,
     },
@@ -143,6 +147,9 @@ app.get("/api/version", (_req, res) => {
       "/api/rrhh/resumen-empleados",
       "/api/supervision/resumen",
       "/api/poderes-bia/generar",
+      "/api/poderes-bia/generar/green-light",
+      "/api/dashboard/resumen",
+      "/api/empleados/password-reset/users",
       "/proyecciones/acuerdos-mango",
       "/api/stickies",
     ],
@@ -172,6 +179,7 @@ app.use("/rrhh", rrhhRoutes); // alias de compatibilidad
 app.use("/api/poderes-bia", poderBiaRoutes);
 app.use("/poderes-bia", poderBiaRoutes); // alias de compatibilidad
 app.use("/api/supervision", supervisionRoutes);
+app.use("/api/dashboard", dashboardRoutes);
 app.use("/supervision", supervisionRoutes); // alias de compatibilidad
 
 // Pagos internos habilitados en RDC, con la misma lógica operativa de Procob.

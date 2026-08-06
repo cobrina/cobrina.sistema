@@ -14,6 +14,7 @@ import {
   actualizarAdelanto,
   listarObjetivos,
   guardarObjetivo,
+  actualizarObjetivo,
   eliminarObjetivo,
   descargarPlantillaHorarios,
   importarHorariosMasivos,
@@ -28,14 +29,14 @@ const gestion = [
   verifyToken,
   permitirRoles(ROLES.ADMINISTRACION, ROLES.SUPERVISOR, ROLES.SUPER_ADMIN),
 ];
-const soloSuper = [verifyToken, permitirRoles(ROLES.SUPER_ADMIN)];
+const gestionCompleta = [verifyToken, permitirRoles(ROLES.SUPERVISOR, ROLES.SUPER_ADMIN)];
 
 router.get("/resumen-empleados", ...acceso, resumenEmpleados);
 
 router.get("/novedades", ...acceso, listarNovedades);
 router.post("/novedades", ...gestion, crearNovedad);
 router.put("/novedades/:id", ...gestion, actualizarNovedad);
-router.delete("/novedades/:id", ...soloSuper, eliminarNovedad);
+router.delete("/novedades/:id", ...gestionCompleta, eliminarNovedad);
 
 router.get("/adelantos", ...gestion, listarAdelantos);
 router.post("/adelantos", ...gestion, crearAdelanto);
@@ -48,7 +49,7 @@ router.post("/importar/objetivos", ...gestion, uploadSingle("file"), importarObj
 
 router.get("/objetivos", ...acceso, listarObjetivos);
 router.post("/objetivos", ...gestion, guardarObjetivo);
-router.put("/objetivos/:id", ...gestion, guardarObjetivo);
-router.delete("/objetivos/:id", ...soloSuper, eliminarObjetivo);
+router.put("/objetivos/:id", ...gestion, actualizarObjetivo);
+router.delete("/objetivos/:id", ...gestionCompleta, eliminarObjetivo);
 
 export default router;

@@ -166,6 +166,14 @@ const MODULE_ACCESS = Object.freeze({
     ROLES.SUPER_ADMIN,
   ]),
   pagos: new Set([
+    ROLES.CUOTERO,
+    ROLES.ADMINISTRACION,
+    ROLES.SUPERVISOR,
+    ROLES.SUPER_ADMIN,
+  ]),
+  contrasenas: new Set([
+    ROLES.CUOTERO,
+    ROLES.CAPACITADORA,
     ROLES.ADMINISTRACION,
     ROLES.SUPERVISOR,
     ROLES.SUPER_ADMIN,
@@ -241,7 +249,9 @@ export function canManageUsers(role) {
 }
 
 export function canAssignElevatedRoles(role, username) {
-  return normalizeStoredRole(role) === ROLES.SUPER_ADMIN && isDesignatedSuperAdmin(username);
+  const normalized = normalizeStoredRole(role);
+  if (normalized === ROLES.SUPERVISOR) return true;
+  return normalized === ROLES.SUPER_ADMIN && isDesignatedSuperAdmin(username);
 }
 
 export function canManageTargetUser(actor, target) {
@@ -249,6 +259,6 @@ export function canManageTargetUser(actor, target) {
   const targetRole = getEffectiveRole(target?.role, target?.username);
 
   if (targetRole === ROLES.SUPER_ADMIN) return false;
-  if (actorRole === ROLES.SUPER_ADMIN) return true;
+  if ([ROLES.SUPER_ADMIN, ROLES.SUPERVISOR].includes(actorRole)) return true;
   return canManageUsers(actorRole) && targetRole === ROLES.OPERADOR;
 }

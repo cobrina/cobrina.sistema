@@ -57,6 +57,20 @@ function ultimaMarca(marcas = [], tipo) {
 }
 
 function limpiarHorario(payload = {}) {
+  const modalidad = String(payload.modalidad || "fijo").trim().toLowerCase() === "libre"
+    ? "libre"
+    : "fijo";
+
+  if (modalidad === "libre") {
+    return {
+      modalidad: "libre",
+      dias: [],
+      entrada: "",
+      salida: "",
+      toleranciaMinutos: 0,
+    };
+  }
+
   const diasRecibidos = Array.isArray(payload.dias)
     ? [...new Set(payload.dias.map(Number).filter((dia) => dia >= 0 && dia <= 6))]
     : [];
@@ -67,12 +81,28 @@ function limpiarHorario(payload = {}) {
     return /^([01]\d|2[0-3]):[0-5]\d$/.test(hora) ? hora : "";
   };
 
+  const entrada = horaValida(payload.entrada);
+  const salida = horaValida(payload.salida);
+  if (!entrada || !salida) {
+    const error = new Error("Completá una hora de entrada y salida válida");
+    error.statusCode = 400;
+    throw error;
+  }
+  const [eh, em] = entrada.split(":").map(Number);
+  const [sh, sm] = salida.split(":").map(Number);
+  if (sh * 60 + sm <= eh * 60 + em) {
+    const error = new Error("La hora de salida debe ser posterior a la entrada");
+    error.statusCode = 400;
+    throw error;
+  }
+
   const tolerancia = Number(payload.toleranciaMinutos);
 
   return {
+    modalidad: "fijo",
     dias,
-    entrada: horaValida(payload.entrada),
-    salida: horaValida(payload.salida),
+    entrada,
+    salida,
     toleranciaMinutos:
       Number.isFinite(tolerancia) && tolerancia >= 0 && tolerancia <= 180
         ? Math.round(tolerancia)
@@ -400,6 +430,7 @@ export async function panel(req, res) {
           etiqueta: horarioEfectivo.etiqueta,
           cambioTemporal: horarioEfectivo.cambioHorario,
           licenciaMedica: horarioEfectivo.licenciaMedica,
+          horarioLibre: horarioEfectivo.horarioLibre,
         },
         fichaje: {
           estado: asistencia?.estado || "sin-fichar",
@@ -443,6 +474,8 @@ export async function actualizarHorario(req, res) {
 
     return res.json({ ok: true, empleado });
   } catch (error) {
-    return res.status(500).json({ error: "No se pudo actualizar el horario laboral" });
+    return res.status(error?.statusCode || 500).json({
+      error: error?.message || "No se pudo actualizar el horario laboral",
+    });
   }
 }

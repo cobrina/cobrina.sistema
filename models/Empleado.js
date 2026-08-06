@@ -67,6 +67,12 @@ const EmpleadoSchema = new mongoose.Schema(
       index: true,
     },
     horarioLaboral: {
+      modalidad: {
+        type: String,
+        enum: ["fijo", "libre"],
+        default: "fijo",
+        index: true,
+      },
       dias: {
         type: [Number],
         default: [1, 2, 3, 4, 5],

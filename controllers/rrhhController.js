@@ -21,9 +21,21 @@ const objectId = (value) =>
 
 const actorId = (req) => new mongoose.Types.ObjectId(req.user.id);
 
+function rangoMesUTC(mes) {
+  const match = String(mes || "").match(/^(\d{4})-(\d{2})$/);
+  if (!match) return null;
+  const anio = Number(match[1]);
+  const numeroMes = Number(match[2]);
+  if (numeroMes < 1 || numeroMes > 12) return null;
+  return {
+    desde: new Date(Date.UTC(anio, numeroMes - 1, 1, 0, 0, 0, 0)),
+    hasta: new Date(Date.UTC(anio, numeroMes, 0, 23, 59, 59, 999)),
+  };
+}
+
 function filtroFechaMes(campo, mes) {
-  const { desde, hasta } = rangoMesLocal(mes);
-  return { [campo]: { $gte: desde, $lte: hasta } };
+  const rango = rangoMesUTC(mes) || rangoMesLocal(mes);
+  return { [campo]: { $gte: rango.desde, $lte: rango.hasta } };
 }
 
 function parseDate(value, fallback = null) {
@@ -123,7 +135,15 @@ export async function listarNovedades(req, res) {
     }
     if (req.query.tipo) query.tipo = req.query.tipo;
     if (req.query.estado) query.estado = req.query.estado;
-    if (req.query.mes) Object.assign(query, filtroFechaMes("fechaDesde", req.query.mes));
+    if (req.query.mes) {
+      const rango = rangoMesUTC(req.query.mes);
+      if (!rango) return res.status(400).json({ error: "Mes inválido" });
+      query.fechaDesde = { $lte: rango.hasta };
+      query.$or = [
+        { fechaHasta: null },
+        { fechaHasta: { $gte: rango.desde } },
+      ];
+    }
 
     const items = await NovedadRRHH.find(query)
       .populate("empleadoId", "username nombre role")
@@ -205,8 +225,14 @@ export async function actualizarNovedad(req, res) {
     if (!actual) return res.status(404).json({ error: "Novedad no encontrada" });
 
     const update = { ...req.body, modificadoPor: actorId(req) };
-    delete update.empleadoId;
     delete update.creadoPor;
+    if (update.empleadoId !== undefined) {
+      const empleadoId = objectId(update.empleadoId);
+      if (!empleadoId) return res.status(400).json({ error: "Empleado inválido" });
+      const existeEmpleado = await Empleado.exists({ _id: empleadoId });
+      if (!existeEmpleado) return res.status(404).json({ error: "Empleado no encontrado" });
+      update.empleadoId = empleadoId;
+    }
     if (update.fechaDesde) {
       update.fechaDesde = parseDate(update.fechaDesde);
       if (!update.fechaDesde) return res.status(400).json({ error: "Fecha inválida" });
@@ -223,6 +249,9 @@ export async function actualizarNovedad(req, res) {
     if (errorDatos) return res.status(400).json({ error: errorDatos });
 
     if (tipo === "licencia-medica") update.justificado = true;
+    update.motivoApercibimiento = tipo === "apercibimiento"
+      ? String(datosCombinados.motivoApercibimiento || "otro")
+      : "";
     if (tipo === "cambio-horario") {
       update.horarioNuevo = `${datosCombinados.horaEntradaNueva}-${datosCombinados.horaSalidaNueva}`;
       update.toleranciaMinutosNueva = Math.max(0, Math.min(180, Number(datosCombinados.toleranciaMinutosNueva ?? 10)));
@@ -302,8 +331,24 @@ export async function crearAdelanto(req, res) {
 export async function actualizarAdelanto(req, res) {
   try {
     const update = { ...req.body, modificadoPor: actorId(req) };
-    delete update.empleadoId;
     delete update.creadoPor;
+    if (update.empleadoId !== undefined) {
+      const empleadoId = objectId(update.empleadoId);
+      if (!empleadoId) return res.status(400).json({ error: "Empleado inválido" });
+      const existeEmpleado = await Empleado.exists({ _id: empleadoId });
+      if (!existeEmpleado) return res.status(404).json({ error: "Empleado no encontrado" });
+      update.empleadoId = empleadoId;
+    }
+    if (update.fechaSolicitud) {
+      update.fechaSolicitud = parseDate(update.fechaSolicitud);
+      if (!update.fechaSolicitud) return res.status(400).json({ error: "Fecha inválida" });
+    }
+    if (update.monto !== undefined) {
+      update.monto = Number(update.monto);
+      if (!Number.isFinite(update.monto) || update.monto <= 0) {
+        return res.status(400).json({ error: "Monto inválido" });
+      }
+    }
     if (["aprobado", "rechazado", "cancelado", "descontado"].includes(update.estado) && !update.fechaResolucion) {
       update.fechaResolucion = new Date();
     }
@@ -396,6 +441,85 @@ export async function guardarObjetivo(req, res) {
   }
 }
 
+
+export async function actualizarObjetivo(req, res) {
+  try {
+    const actual = await ObjetivoMensual.findById(req.params.id);
+    if (!actual) return res.status(404).json({ error: "Objetivo no encontrado" });
+
+    const alcance = String(req.body.alcance || actual.alcance || "");
+    const mes = String(req.body.mes || actual.mes || "");
+    const montoObjetivo = Number(
+      req.body.montoObjetivo !== undefined ? req.body.montoObjetivo : actual.montoObjetivo
+    );
+    if (!/^\d{4}-\d{2}$/.test(mes) || !["equipo", "operador", "entidad", "entidad-subcesion"].includes(alcance)) {
+      return res.status(400).json({ error: "Mes o alcance inválido" });
+    }
+    if (!Number.isFinite(montoObjetivo) || montoObjetivo < 0) {
+      return res.status(400).json({ error: "Objetivo inválido" });
+    }
+
+    const empleadoId = alcance === "operador"
+      ? objectId(req.body.empleadoId ?? actual.empleadoId)
+      : null;
+    const entidadNumero = ["entidad", "entidad-subcesion"].includes(alcance)
+      ? normalizarEntidadNumero(req.body.entidadNumero ?? actual.entidadNumero)
+      : null;
+    const subCesionId = alcance === "entidad-subcesion"
+      ? objectId(req.body.subCesionId ?? actual.subCesionId)
+      : null;
+
+    if (alcance === "operador" && !empleadoId) return res.status(400).json({ error: "Elegí un operador" });
+    if (["entidad", "entidad-subcesion"].includes(alcance) && !entidadNumero) {
+      return res.status(400).json({ error: "Elegí una entidad" });
+    }
+    if (alcance === "entidad-subcesion" && !subCesionId) {
+      return res.status(400).json({ error: "Elegí una subcesión" });
+    }
+
+    if (empleadoId && !(await Empleado.exists({ _id: empleadoId }))) {
+      return res.status(400).json({ error: "El operador no existe" });
+    }
+    if (entidadNumero && !(await Entidad.exists({ numero: entidadNumero }))) {
+      return res.status(400).json({ error: "La entidad no existe" });
+    }
+    if (subCesionId && !(await SubCesion.exists({ _id: subCesionId }))) {
+      return res.status(400).json({ error: "La subcesión no existe" });
+    }
+
+    const duplicado = await ObjetivoMensual.exists({
+      _id: { $ne: actual._id },
+      mes,
+      alcance,
+      empleadoId,
+      entidadNumero,
+      subCesionId,
+    });
+    if (duplicado) {
+      return res.status(409).json({ error: "Ya existe un objetivo con ese mes y alcance" });
+    }
+
+    actual.mes = mes;
+    actual.alcance = alcance;
+    actual.empleadoId = empleadoId;
+    actual.entidadNumero = entidadNumero;
+    actual.subCesionId = subCesionId;
+    actual.montoObjetivo = montoObjetivo;
+    actual.observaciones = String(req.body.observaciones ?? actual.observaciones ?? "").trim();
+    actual.activo = req.body.activo !== undefined ? Boolean(req.body.activo) : actual.activo;
+    actual.modificadoPor = actorId(req);
+    await actual.save();
+    await actual.populate("empleadoId", "username nombre role");
+    await actual.populate("subCesionId", "nombre");
+    return res.json(actual);
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({ error: "Ya existe un objetivo con ese mes y alcance" });
+    }
+    return res.status(400).json({ error: error.message || "No se pudo actualizar el objetivo" });
+  }
+}
+
 export async function eliminarObjetivo(req, res) {
   try {
     const item = await ObjetivoMensual.findByIdAndDelete(req.params.id);
@@ -417,21 +541,25 @@ export async function descargarPlantillaHorarios(req, res) {
       usuario: empleado.username,
       email: empleado.email,
       nombre: empleado.nombre,
-      dias: (empleado.horarioLaboral?.dias || [1, 2, 3, 4, 5]).join(","),
-      entrada: empleado.horarioLaboral?.entrada || "09:00",
-      salida: empleado.horarioLaboral?.salida || "18:00",
-      tolerancia: empleado.horarioLaboral?.toleranciaMinutos ?? 10,
+      modalidad: empleado.horarioLaboral?.modalidad === "libre" ? "LIBRE" : "FIJO",
+      dias: empleado.horarioLaboral?.modalidad === "libre"
+        ? ""
+        : (empleado.horarioLaboral?.dias || [1, 2, 3, 4, 5]).join(","),
+      entrada: empleado.horarioLaboral?.modalidad === "libre" ? "" : (empleado.horarioLaboral?.entrada || "09:00"),
+      salida: empleado.horarioLaboral?.modalidad === "libre" ? "" : (empleado.horarioLaboral?.salida || "18:00"),
+      tolerancia: empleado.horarioLaboral?.modalidad === "libre" ? 0 : (empleado.horarioLaboral?.toleranciaMinutos ?? 10),
     }));
 
     if (quiereCsv(req)) {
       return enviarCsv(
         res,
         [
-          ["USUARIO", "EMAIL", "NOMBRE", "DIAS_SEMANA", "ENTRADA", "SALIDA", "TOLERANCIA_MINUTOS"],
+          ["USUARIO", "EMAIL", "NOMBRE", "MODALIDAD", "DIAS_SEMANA", "ENTRADA", "SALIDA", "TOLERANCIA_MINUTOS"],
           ...filasHorarios.map((fila) => [
             fila.usuario,
             fila.email,
             fila.nombre,
+            fila.modalidad,
             fila.dias,
             fila.entrada,
             fila.salida,
@@ -448,6 +576,7 @@ export async function descargarPlantillaHorarios(req, res) {
       { header: "USUARIO", key: "usuario", width: 22 },
       { header: "EMAIL", key: "email", width: 30 },
       { header: "NOMBRE", key: "nombre", width: 30 },
+      { header: "MODALIDAD", key: "modalidad", width: 16 },
       { header: "DIAS_SEMANA", key: "dias", width: 20 },
       { header: "ENTRADA", key: "entrada", width: 12 },
       { header: "SALIDA", key: "salida", width: 12 },
@@ -458,7 +587,7 @@ export async function descargarPlantillaHorarios(req, res) {
     sheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF29104F" } };
     sheet.views = [{ state: "frozen", ySplit: 1 }];
     sheet.addRow({});
-    sheet.addRow({ usuario: "AYUDA", email: "Usá 0=domingo, 1=lunes ... 6=sábado. Ejemplo: 1,2,3,4,5" });
+    sheet.addRow({ usuario: "AYUDA", email: "MODALIDAD: FIJO o LIBRE. En LIBRE dejá días, entrada y salida vacíos. En FIJO usá 0=domingo ... 6=sábado." });
     return enviarWorkbook(res, workbook, "modelo-horarios-rrhh.xlsx");
   } catch (error) {
     console.error("RRHH plantilla horarios:", error);
@@ -481,22 +610,29 @@ export async function importarHorariosMasivos(req, res) {
       const email = String(datos.EMAIL || "").trim().toLowerCase();
       if (usuario === "ayuda") continue;
       const empleado = porUsuario.get(usuario) || porEmail.get(email);
-      const dias = parseDiasLaborales(datos.DIAS_SEMANA);
-      const entrada = String(datos.ENTRADA || "").trim();
-      const salida = String(datos.SALIDA || "").trim();
-      const tolerancia = Number(datos.TOLERANCIA_MINUTOS ?? 10);
+      const modalidadRaw = String(datos.MODALIDAD || "FIJO").trim().toUpperCase();
+      const modalidad = ["LIBRE", "FLEXIBLE", "SIN HORARIO"].includes(modalidadRaw) ? "libre" : "fijo";
+      const dias = modalidad === "libre" ? [] : parseDiasLaborales(datos.DIAS_SEMANA);
+      const entrada = modalidad === "libre" ? "" : String(datos.ENTRADA || "").trim();
+      const salida = modalidad === "libre" ? "" : String(datos.SALIDA || "").trim();
+      const tolerancia = modalidad === "libre" ? 0 : Number(datos.TOLERANCIA_MINUTOS ?? 10);
       const problemas = [];
       if (!empleado) problemas.push("usuario o email no encontrado");
-      if (!dias) problemas.push("días inválidos");
-      if (!horaValida(entrada)) problemas.push("hora de entrada inválida");
-      if (!horaValida(salida)) problemas.push("hora de salida inválida");
+      if (modalidad === "fijo" && !dias) problemas.push("días inválidos");
+      if (modalidad === "fijo" && !horaValida(entrada)) problemas.push("hora de entrada inválida");
+      if (modalidad === "fijo" && !horaValida(salida)) problemas.push("hora de salida inválida");
+      if (modalidad === "fijo" && horaValida(entrada) && horaValida(salida)) {
+        const [eh, em] = entrada.split(":").map(Number);
+        const [sh, sm] = salida.split(":").map(Number);
+        if (sh * 60 + sm <= eh * 60 + em) problemas.push("la salida debe ser posterior a la entrada");
+      }
       if (!Number.isFinite(tolerancia) || tolerancia < 0 || tolerancia > 180) problemas.push("tolerancia inválida");
       if (problemas.length) {
         errores.push({ fila: filaExcel, usuario: usuario || email || "-", error: problemas.join(", ") });
         continue;
       }
       await Empleado.updateOne({ _id: empleado._id }, {
-        $set: { horarioLaboral: { dias, entrada, salida, toleranciaMinutos: tolerancia } },
+        $set: { horarioLaboral: { modalidad, dias, entrada, salida, toleranciaMinutos: tolerancia } },
       }, { runValidators: true });
       actualizados += 1;
     }
@@ -708,6 +844,13 @@ export async function resumenEmpleados(req, res) {
         minutosTrabajados: horasMinutos,
         minutosEsperados: esperados,
         porcentajeHoras: esperados > 0 ? Math.round((horasMinutos / esperados) * 1000) / 10 : null,
+        horarioLibre: empleado.horarioLaboral?.modalidad === "libre",
+        horarioBase: {
+          modalidad: empleado.horarioLaboral?.modalidad === "libre" ? "libre" : "fijo",
+          entrada: empleado.horarioLaboral?.entrada || "",
+          salida: empleado.horarioLaboral?.salida || "",
+          dias: Array.isArray(empleado.horarioLaboral?.dias) ? empleado.horarioLaboral.dias : [],
+        },
         faltas: novedadesEmp.filter((n) => n.tipo === "falta").length,
         faltasJustificadas: novedadesEmp.filter((n) => n.tipo === "falta-justificada").length,
         llegadasTarde: novedadesEmp.filter((n) => n.tipo === "llegada-tarde").length,

@@ -11,6 +11,7 @@ import {
   canAssignAgenda,
   canManageUsers,
   canAssignElevatedRoles,
+  canManageTargetUser,
   buildEffectiveRoleFilter,
 } from "../config/roles.js";
 
@@ -24,6 +25,8 @@ const M = {
   presentismo: "presentismo",
   reportes: "reportes",
   admin: "administracion",
+  pagos: "pagos",
+  contrasenas: "contrasenas",
   usuarios: "usuarios",
   rrhh: "rrhh",
   supervision: "supervision",
@@ -33,10 +36,10 @@ const M = {
 const expectedModules = {
   [ROLES.OPERADOR]: [M.proy, M.colchon, M.notas, M.agenda],
   [ROLES.OPERADOR_VIP]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.poderesBia],
-  [ROLES.CUOTERO]: [M.cert, M.recibos, M.colchon, M.notas, M.agenda, M.poderesBia],
-  [ROLES.CAPACITADORA]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.presentismo, M.reportes, M.rrhh, M.poderesBia],
-  [ROLES.ADMINISTRACION]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.presentismo, M.reportes, M.admin, M.usuarios, M.rrhh, M.poderesBia],
-  [ROLES.SUPERVISOR]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.presentismo, M.reportes, M.admin, M.usuarios, M.rrhh, M.supervision, M.poderesBia],
+  [ROLES.CUOTERO]: [M.cert, M.recibos, M.colchon, M.notas, M.agenda, M.pagos, M.contrasenas, M.poderesBia],
+  [ROLES.CAPACITADORA]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.presentismo, M.reportes, M.contrasenas, M.rrhh, M.poderesBia],
+  [ROLES.ADMINISTRACION]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.presentismo, M.reportes, M.admin, M.pagos, M.contrasenas, M.usuarios, M.rrhh, M.poderesBia],
+  [ROLES.SUPERVISOR]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.presentismo, M.reportes, M.admin, M.pagos, M.contrasenas, M.usuarios, M.rrhh, M.supervision, M.poderesBia],
   [ROLES.SUPER_ADMIN]: Object.values(M),
 };
 
@@ -57,6 +60,21 @@ for (const username of SUPER_ADMIN_USERNAMES) {
   assert.equal(canAssignElevatedRoles(ROLES.SUPER_ADMIN, username), true);
 }
 assert.equal(canAssignElevatedRoles(ROLES.SUPER_ADMIN, "otra-persona"), false);
+assert.equal(canAssignElevatedRoles(ROLES.SUPERVISOR, "supervisora"), true);
+assert.equal(
+  canManageTargetUser(
+    { role: ROLES.SUPERVISOR, username: "supervisora" },
+    { role: ROLES.ADMINISTRACION, username: "admin-1" }
+  ),
+  true
+);
+assert.equal(
+  canManageTargetUser(
+    { role: ROLES.SUPERVISOR, username: "supervisora" },
+    { role: ROLES.SUPER_ADMIN, username: SUPER_ADMIN_USERNAMES[0] }
+  ),
+  false
+);
 
 assert.equal(getProyeccionesScope(ROLES.OPERADOR), "own");
 assert.equal(getProyeccionesScope(ROLES.CAPACITADORA), "own");
@@ -73,6 +91,7 @@ assert.equal(getColchonWriteLevel(ROLES.OPERADOR_VIP), "inform-only");
 assert.equal(getColchonWriteLevel(ROLES.CAPACITADORA), "own-full");
 assert.equal(getColchonWriteLevel(ROLES.ADMINISTRACION), "own-full");
 assert.equal(getColchonWriteLevel(ROLES.CUOTERO), "full");
+assert.equal(getColchonWriteLevel(ROLES.SUPERVISOR), "full");
 assert.equal(canConfirmColchonPayments(ROLES.CUOTERO), true);
 assert.equal(canConfirmColchonPayments(ROLES.ADMINISTRACION), false);
 
