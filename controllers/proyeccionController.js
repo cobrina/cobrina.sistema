@@ -25,6 +25,18 @@ const esAmbitoPropio = (req) => getProyeccionesScope(rolDe(req)) === "own";
 const tieneAccesoProyecciones = (req) => getProyeccionesScope(rolDe(req)) !== "none";
 const esDueno = (req, proyeccion) => String(proyeccion?.empleadoId?._id || proyeccion?.empleadoId) === String(req.user.id);
 
+const validarIdentidadProyeccion = ({ dni, nombreTitular }) => {
+  const dniNormalizado = normalizarDni(dni);
+  const nombre = String(nombreTitular || "").trim();
+  if (!/^\d{6,9}$/.test(dniNormalizado)) {
+    return "El DNI debe contener entre 6 y 9 números. Verificá que no hayas ingresado el nombre en el campo DNI.";
+  }
+  if (!/[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]/.test(nombre) || /^\s*[\d.\-]+\s*$/.test(nombre)) {
+    return "El nombre del titular debe contener letras. Verificá que el DNI no esté cargado en el campo de nombre.";
+  }
+  return "";
+};
+
 const calcularTotalInformado = (proy) =>
   (proy.pagosInformados || [])
     .filter((p) => !p.erroneo)
@@ -641,6 +653,9 @@ export const crearProyeccion = async (req, res) => {
         .json({ error: `Faltan completar: ${faltan.join(", ")}` });
     }
 
+    const errorIdentidad = validarIdentidadProyeccion({ dni, nombreTitular });
+    if (errorIdentidad) return res.status(400).json({ error: errorIdentidad });
+
     // ✅ Fechas
     if (isNaN(Date.parse(fechaPromesa))) {
       return res.status(400).json({ error: "Fecha de promesa inválida" });
@@ -863,6 +878,9 @@ export const actualizarProyeccion = async (req, res) => {
         .status(400)
         .json({ error: `Faltan completar: ${faltan.join(", ")}` });
     }
+
+    const errorIdentidadEdicion = validarIdentidadProyeccion({ dni, nombreTitular });
+    if (errorIdentidadEdicion) return res.status(400).json({ error: errorIdentidadEdicion });
 
     // ✅ fechas (si vienen)
     if (fechaPromesa && isNaN(Date.parse(fechaPromesa))) {

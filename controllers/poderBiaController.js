@@ -126,13 +126,14 @@ export async function generarPoderGreenLight(req, res) {
     const nombreTitular = String(req.body.nombreTitular || "").trim().toUpperCase();
     const tratamientoRaw = String(req.body.tratamiento || "").trim().toLowerCase();
     const tratamiento = ["sr", "sra"].includes(tratamientoRaw) ? tratamientoRaw : "";
+    const cartera = String(req.body.cartera || "").trim();
     const tipoProducto = String(req.body.tipoProducto || "").trim();
     const numeroProducto = String(req.body.numeroProducto || "").trim().toUpperCase();
     const fechaDocumento = req.body.fechaDocumento ? new Date(req.body.fechaDocumento) : new Date();
 
-    if (!dni || !nombreTitular || !tipoProducto || !numeroProducto || Number.isNaN(fechaDocumento.getTime())) {
+    if (!dni || !nombreTitular || !cartera || !tipoProducto || !numeroProducto || Number.isNaN(fechaDocumento.getTime())) {
       return res.status(400).json({
-        error: "Completá nombre, DNI, tipo de producto, número de producto y una fecha válida",
+        error: "Completá nombre, DNI, cartera, tipo de producto, número de producto y una fecha válida",
       });
     }
 
@@ -141,6 +142,7 @@ export async function generarPoderGreenLight(req, res) {
       dni,
       nombreTitular,
       tratamiento,
+      cartera,
       tipoProducto,
       numeroProducto,
       fechaDocumento,
@@ -189,7 +191,9 @@ export async function generarPoderGreenLight(req, res) {
     doc.font("Helvetica-Bold").text(tipoProducto.toUpperCase(), { continued: true });
     doc.font("Helvetica").text(", número de producto N° ", { continued: true });
     doc.font("Helvetica-Bold").text(numeroProducto, { continued: true });
-    doc.font("Helvetica").text(" originado en Brubank S.A.U; siendo SW Invest (SWI) administrador y tenedor.");
+    doc.font("Helvetica").text(" originado en ", { continued: true });
+    doc.font("Helvetica-Bold").text(cartera, { continued: true });
+    doc.font("Helvetica").text("; siendo SW Invest (SWI) administrador y tenedor.");
 
     doc.image(firmaBravoPath, pageWidth - 250, 610, { fit: [170, 105], align: "center", valign: "center" });
     doc.font("Helvetica").fontSize(10.5).text("Saluda atentamente", pageWidth - 258, 720, { width: 180, align: "center" });
