@@ -3,6 +3,19 @@ import mongoose from "mongoose";
 import AuditoriaContactoDirecto from "../models/AuditoriaContactoDirecto.js";
 import Empleado from "../models/Empleado.js";
 import { toDateOnly, normalizarHora } from "../utils/fecha.util.js";
+import {
+  CRITERIOS_TITULAR,
+  FORMULARIOS_AUDITORIA,
+  MOTIVOS_NO_AUDITABLE,
+  PESOS_AUDITORIA,
+  UMBRALES_AUDITORIA,
+  calcularScoresAuditoriaItem,
+  criterioPorId,
+  formularioAplicadoParaTipo,
+  normalizarResultadosItem,
+  normalizarTipoInterlocutor,
+  semaforoAuditoria,
+} from "../config/auditorias.js";
 
 /* ============================================================
    Helpers (mismo estilo que Reportes)
@@ -132,141 +145,15 @@ function isLlamada(tipoInteraccion = "") {
 }
 
 /* ============================================================
-   Planilla: criterios y pesos (idéntico al Excel)
+   Formularios, resultados y score
+   - TITULAR conserva exactamente los 24 criterios históricos.
+   - TERCERO y TERCERO_PAGADOR usan formularios separados.
+   - NO_APLICA se excluye del denominador ponderado.
    ============================================================ */
-const CRITERIOS = [
-  // Presentación (3)
-  {
-    id: 1,
-    grupo: "presentacion",
-    label: "Se presenta cordial y correctamente",
-  },
-  {
-    id: 2,
-    grupo: "presentacion",
-    label: "Solicita por titular o encargado de pago",
-  },
-  { id: 3, grupo: "presentacion", label: "Expone motivo del llamado" },
+const PESOS = PESOS_AUDITORIA;
+const UMBRAL_BAJO = UMBRALES_AUDITORIA.bajo;
+const UMBRAL_ALTO = UMBRALES_AUDITORIA.alto;
 
-  // Negociación (7)
-  { id: 4, grupo: "negociacion", label: "Solicita saldo actualizado" },
-  { id: 5, grupo: "negociacion", label: "Consulta motivos de atraso" },
-  { id: 6, grupo: "negociacion", label: "Negocia el saldo a abonar" },
-  { id: 7, grupo: "negociacion", label: "Argumenta ante historial de gestion" },
-  {
-    id: 8,
-    grupo: "negociacion",
-    label: "Refuta argumentos frente a negativa de pago",
-  },
-  { id: 9, grupo: "negociacion", label: "Informa consecuencias de atraso" },
-  { id: 10, grupo: "negociacion", label: "Brinda información relevante" },
-
-  // Cierre (6)
-  {
-    id: 11,
-    grupo: "cierre",
-    label: "Comprometió al titular o encargado de pago",
-  },
-  {
-    id: 12,
-    grupo: "cierre",
-    label: "Solicita teléfonos alternativos / implementa otro medio",
-  },
-  { id: 13, grupo: "cierre", label: "Informa saldo deudor negociado" },
-  {
-    id: 14,
-    grupo: "cierre",
-    label: "Fecha de pago o de nueva comunicación (Acuerdo/Contacto)",
-  },
-  {
-    id: 15,
-    grupo: "cierre",
-    label: "Holdeo correcto (Promesa o fecha de nueva comunicación)",
-  },
-  { id: 16, grupo: "cierre", label: "Informa y/o confirma medios de pago" },
-
-  // Calidad de Gestión (8)
-  { id: 17, grupo: "calidad", label: "Formalidad" },
-  {
-    id: 18,
-    grupo: "calidad",
-    label: "Transmite urgencia con seguridad y firmeza",
-  },
-  { id: 19, grupo: "calidad", label: "Aplica gestion MORA TARDIA" },
-  { id: 20, grupo: "calidad", label: "Manejo de conflicto" },
-  { id: 21, grupo: "calidad", label: "Analiza el comportamiento del titular" },
-  { id: 22, grupo: "calidad", label: "Resolución de conflicto" },
-  {
-    id: 23,
-    grupo: "calidad",
-    label: "Observaciones correctas y completas (Mango)",
-  },
-  { id: 24, grupo: "calidad", label: "Cierre de gestión (Mango)" },
-];
-
-const ALL_IDS = CRITERIOS.map((c) => c.id);
-const CRITERIOS_BY_ID = new Map(CRITERIOS.map((c) => [c.id, c]));
-
-const PESOS = {
-  presentacion: 0.1,
-  negociacion: 0.4,
-  cierre: 0.3,
-  calidad: 0.2,
-};
-
-const UMBRAL_BAJO = 6.5;
-const UMBRAL_ALTO = 7.5;
-
-function uniqNums(arr = []) {
-  return [
-    ...new Set(
-      (arr || []).map((n) => Number(n)).filter((n) => Number.isFinite(n))
-    ),
-  ];
-}
-
-function valorResultadoCriterio(value) {
-  if (value === true || value === 1) return 1;
-  if (value === 0.5) return 0.5;
-
-  const v = String(value ?? "").trim().toLowerCase();
-  if (["si", "sí", "ok", "cumple", "completo", "true", "1"].includes(v)) return 1;
-  if (["parcial", "medio", "mitad", "0.5", "0,5"].includes(v)) return 0.5;
-  return 0;
-}
-
-function normalizarResultados(item = {}) {
-  let fallosIds = [];
-  let parcialesIds = [];
-
-  if (item.checks && typeof item.checks === "object" && !Array.isArray(item.checks)) {
-    for (const id of ALL_IDS) {
-      const raw = item.checks[String(id)] ?? item.checks[id];
-      const valor = valorResultadoCriterio(raw);
-      if (valor === 0.5) parcialesIds.push(id);
-      else if (valor !== 1) fallosIds.push(id);
-    }
-  } else if (Array.isArray(item.fallosIds) || Array.isArray(item.parcialesIds)) {
-    fallosIds = uniqNums(item.fallosIds || []);
-    parcialesIds = uniqNums(item.parcialesIds || []);
-  } else if (Array.isArray(item.okIds)) {
-    const ok = new Set(uniqNums(item.okIds));
-    fallosIds = ALL_IDS.filter((id) => !ok.has(id));
-  } else {
-    fallosIds = [...ALL_IDS];
-  }
-
-  const validos = new Set(ALL_IDS);
-  fallosIds = [...new Set(fallosIds)]
-    .filter((id) => validos.has(id))
-    .sort((a, b) => a - b);
-  const fallosSet = new Set(fallosIds);
-  parcialesIds = [...new Set(parcialesIds)]
-    .filter((id) => validos.has(id) && !fallosSet.has(id))
-    .sort((a, b) => a - b);
-
-  return { fallosIds, parcialesIds };
-}
 
 function parseComentariosCriterio(it = {}) {
   const raw =
@@ -281,7 +168,7 @@ function parseComentariosCriterio(it = {}) {
 
   for (const [key, value] of Object.entries(raw)) {
     const criterioId = Number(key);
-    if (!CRITERIOS_BY_ID.has(criterioId)) continue;
+    if (!Number.isInteger(criterioId) || criterioId < 1 || criterioId > 24) continue;
 
     const txt = String(value ?? "").trim();
     if (!txt) continue;
@@ -292,43 +179,91 @@ function parseComentariosCriterio(it = {}) {
   return out;
 }
 
-function calcScoresFromResultados(fallosIds = [], parcialesIds = []) {
-  const fallos = new Set(fallosIds);
-  const parciales = new Set(parcialesIds);
-
-  const totales = { presentacion: 3, negociacion: 7, cierre: 6, calidad: 8 };
-  const puntos = { presentacion: 0, negociacion: 0, cierre: 0, calidad: 0 };
-
-  for (const id of ALL_IDS) {
-    const c = CRITERIOS_BY_ID.get(id);
-    if (!c) continue;
-    if (fallos.has(id)) continue;
-    puntos[c.grupo] += parciales.has(id) ? 0.5 : 1;
-  }
-
-  const scoreBloques = {
-    presentacion: totales.presentacion ? (puntos.presentacion / totales.presentacion) * 10 : 0,
-    negociacion: totales.negociacion ? (puntos.negociacion / totales.negociacion) * 10 : 0,
-    cierre: totales.cierre ? (puntos.cierre / totales.cierre) * 10 : 0,
-    calidad: totales.calidad ? (puntos.calidad / totales.calidad) * 10 : 0,
-  };
-
-  const scoreAudio =
-    (scoreBloques.presentacion / 10) * PESOS.presentacion +
-    (scoreBloques.negociacion / 10) * PESOS.negociacion +
-    (scoreBloques.cierre / 10) * PESOS.cierre +
-    (scoreBloques.calidad / 10) * PESOS.calidad;
-
-  return {
-    scoreBloques,
-    scoreAudio: Number((scoreAudio * 10).toFixed(6)),
-  };
+function calcScoresFromResultados(resultadosCriterios = {}, formulario = "TITULAR") {
+  return calcularScoresAuditoriaItem(resultadosCriterios, formulario);
 }
 
 function semaforo(scoreFinal) {
-  if (scoreFinal < UMBRAL_BAJO) return "bajo";
-  if (scoreFinal >= UMBRAL_ALTO) return "alto";
-  return "medio";
+  return semaforoAuditoria(scoreFinal);
+}
+
+function construirItemsAuditoria(itemsIn = [], { tipoInterlocutor, formularioAplicado }) {
+  const noAuditable = tipoInterlocutor === "NO_AUDITABLE";
+
+  return itemsIn.map((it, idx) => {
+    const telefono = String(it.telefono || "").trim();
+    if (!telefono) throw new Error(`Cada item debe incluir telefono. (item #${idx + 1})`);
+
+    const dni = String(it.dni || "").trim();
+    const cartera = String(it.cartera || "").trim().toUpperCase();
+    const fechaAudio = it.fechaAudio ? toDateOnly(it.fechaAudio) : null;
+    const horaAprox = it.horaAprox ? normalizarHora(it.horaAprox) : "";
+    const tipoInteraccion = String(it.tipoInteraccion || "LLAMADA_SALIENTE").trim().toUpperCase();
+    const referencia = String(it.referencia || "").trim();
+    const duracionMinutos = parseDuracionMinutos(it);
+    const duracionSegundos = parseDuracionSegundosCompat(it);
+
+    if (!noAuditable && isLlamada(tipoInteraccion) && duracionMinutos <= 0) {
+      throw new Error(`Falta duración (minutos) para llamada en item #${idx + 1}.`);
+    }
+
+    const comentariosCriterio = noAuditable ? {} : parseComentariosCriterio(it);
+
+    if (noAuditable) {
+      return {
+        telefono, dni, cartera, fechaAudio, horaAprox, tipoInteraccion, referencia,
+        duracionMinutos, duracionSegundos, comentariosCriterio,
+        resultadosCriterios: {}, fallosIds: [], parcialesIds: [], criteriosNoAplica: [],
+        scoreAudio: null,
+        scoreBloques: { presentacion: null, negociacion: null, cierre: null, calidad: null },
+      };
+    }
+
+    const resultados = normalizarResultadosItem(it, formularioAplicado);
+    const { scoreBloques, scoreAudio } = calcScoresFromResultados(
+      resultados.resultadosCriterios,
+      formularioAplicado
+    );
+
+    return {
+      telefono, dni, cartera, fechaAudio, horaAprox, tipoInteraccion, referencia,
+      duracionMinutos, duracionSegundos, comentariosCriterio,
+      ...resultados,
+      scoreAudio,
+      scoreBloques,
+    };
+  });
+}
+
+function calcularResumenItems(items = [], tipoInterlocutor = "TITULAR") {
+  if (tipoInterlocutor === "NO_AUDITABLE") {
+    return {
+      scoreFinal: null,
+      scoreBloques: { presentacion: null, negociacion: null, cierre: null, calidad: null },
+      semaforo: null,
+    };
+  }
+
+  const scoresValidos = items
+    .map((x) => x?.scoreAudio)
+    .filter((v) => v != null && Number.isFinite(Number(v)))
+    .map(Number);
+  const scoreFinal = scoresValidos.length
+    ? Number((scoresValidos.reduce((a, b) => a + b, 0) / scoresValidos.length).toFixed(6))
+    : null;
+
+  const scoreBloques = {};
+  for (const k of ["presentacion", "negociacion", "cierre", "calidad"]) {
+    const vals = items
+      .map((x) => x?.scoreBloques?.[k])
+      .filter((v) => v != null && Number.isFinite(Number(v)))
+      .map(Number);
+    scoreBloques[k] = vals.length
+      ? Number((vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(6))
+      : null;
+  }
+
+  return { scoreFinal, scoreBloques, semaforo: semaforo(scoreFinal) };
 }
 
 function normalizarItemSalida(it = {}) {
@@ -336,11 +271,17 @@ function normalizarItemSalida(it = {}) {
     it?.comentariosCriterio instanceof Map
       ? Object.fromEntries(it.comentariosCriterio)
       : it?.comentariosCriterio || {};
+  const resultados =
+    it?.resultadosCriterios instanceof Map
+      ? Object.fromEntries(it.resultadosCriterios)
+      : it?.resultadosCriterios || {};
 
   return {
     ...it,
     duracionMinutos: getDuracionMinutosSalida(it),
     comentariosCriterio: comentarios,
+    resultadosCriterios: resultados,
+    criteriosNoAplica: Array.isArray(it?.criteriosNoAplica) ? it.criteriosNoAplica : [],
   };
 }
 
@@ -350,8 +291,16 @@ function normalizarAuditoriaSalida(doc) {
   const base =
     typeof doc?.toObject === "function" ? doc.toObject() : { ...doc };
 
+  const tipoInterlocutor = normalizarTipoInterlocutor(base.tipoInterlocutor || "TITULAR");
+  const formularioAplicado =
+    base.formularioAplicado || formularioAplicadoParaTipo(tipoInterlocutor);
+
   return {
     ...base,
+    tipoInterlocutor,
+    formularioAplicado,
+    motivoNoAuditable: base.motivoNoAuditable || "",
+    detalleMotivoNoAuditable: base.detalleMotivoNoAuditable || "",
     items: Array.isArray(base.items)
       ? base.items.map(normalizarItemSalida)
       : [],
@@ -407,10 +356,24 @@ export async function catalogos(req, res) {
       operadores,
       motivos,
       tiposInteraccion,
+      tiposInterlocutor: [
+        { value: "TITULAR", label: "Titular" },
+        { value: "TERCERO", label: "Tercero / Familiar / Referencia" },
+        { value: "TERCERO_PAGADOR", label: "Tercero pagador" },
+        { value: "NO_AUDITABLE", label: "No auditable" },
+      ],
+      motivosNoAuditable: MOTIVOS_NO_AUDITABLE,
+      formularios: Object.fromEntries(
+        Object.entries(FORMULARIOS_AUDITORIA).map(([key, value]) => [
+          key,
+          { key, label: value.label, lista: value.criterios },
+        ])
+      ),
+      // Compatibilidad con el frontend/reportes históricos: criterios = TITULAR.
       criterios: {
         pesos: PESOS,
         umbrales: { bajo: UMBRAL_BAJO, alto: UMBRAL_ALTO },
-        lista: CRITERIOS,
+        lista: CRITERIOS_TITULAR,
       },
     });
   } catch (e) {
@@ -463,75 +426,17 @@ export async function crear(req, res) {
         .status(400)
         .json({ error: "Máximo 5 audios/items por auditoría." });
 
-    const items = itemsIn.map((it, idx) => {
-      const telefono = String(it.telefono || "").trim();
-      if (!telefono)
-        throw new Error(`Cada item debe incluir telefono. (item #${idx + 1})`);
+    const tipoInterlocutor = normalizarTipoInterlocutor(body.tipoInterlocutor || "TITULAR");
+    const formularioAplicado = formularioAplicadoParaTipo(tipoInterlocutor);
+    const motivoNoAuditable = String(body.motivoNoAuditable || "").trim();
+    const detalleMotivoNoAuditable = String(body.detalleMotivoNoAuditable || "").trim();
 
-      const dni = String(it.dni || "").trim();
-      const cartera = String(it.cartera || "")
-        .trim()
-        .toUpperCase();
+    if (tipoInterlocutor === "NO_AUDITABLE" && !motivoNoAuditable) {
+      return res.status(400).json({ error: "Seleccioná un motivo para marcar la auditoría como No auditable." });
+    }
 
-      const fechaAudio = it.fechaAudio ? toDateOnly(it.fechaAudio) : null;
-      const horaAprox = it.horaAprox ? normalizarHora(it.horaAprox) : "";
-
-      const tipoInteraccion = String(it.tipoInteraccion || "LLAMADA_SALIENTE")
-        .trim()
-        .toUpperCase();
-      const referencia = String(it.referencia || "").trim();
-
-      const duracionMinutos = parseDuracionMinutos(it);
-      const duracionSegundos = parseDuracionSegundosCompat(it);
-
-      if (isLlamada(tipoInteraccion) && duracionMinutos <= 0) {
-        throw new Error(
-          `Falta duración (minutos) para llamada en item #${idx + 1}.`
-        );
-      }
-
-      const comentariosCriterio = parseComentariosCriterio(it);
-      const { fallosIds, parcialesIds } = normalizarResultados(it);
-      const { scoreBloques, scoreAudio } = calcScoresFromResultados(
-        fallosIds,
-        parcialesIds
-      );
-
-      return {
-        telefono,
-        dni,
-        cartera,
-        fechaAudio,
-        horaAprox,
-        tipoInteraccion,
-        referencia,
-        duracionMinutos,
-        duracionSegundos,
-        comentariosCriterio,
-        fallosIds,
-        parcialesIds,
-        scoreAudio,
-        scoreBloques,
-      };
-    });
-
-    const scoreFinal = Number(
-      (
-        items.reduce((acc, x) => acc + (Number(x.scoreAudio) || 0), 0) /
-        items.length
-      ).toFixed(6)
-    );
-
-    const avg = (k) =>
-      items.reduce((acc, x) => acc + (Number(x.scoreBloques?.[k]) || 0), 0) /
-      items.length;
-
-    const scoreBloques = {
-      presentacion: Number(avg("presentacion").toFixed(6)),
-      negociacion: Number(avg("negociacion").toFixed(6)),
-      cierre: Number(avg("cierre").toFixed(6)),
-      calidad: Number(avg("calidad").toFixed(6)),
-    };
+    const items = construirItemsAuditoria(itemsIn, { tipoInterlocutor, formularioAplicado });
+    const resumenScores = calcularResumenItems(items, tipoInterlocutor);
 
     const doc = await AuditoriaContactoDirecto.create({
       propietario: new mongoose.Types.ObjectId(usuarioId),
@@ -540,17 +445,24 @@ export async function crear(req, res) {
       fechaAuditoria: body.fechaAuditoria
         ? toDateOnly(body.fechaAuditoria)
         : new Date(),
+      tipoInterlocutor,
+      formularioAplicado,
+      motivoNoAuditable: tipoInterlocutor === "NO_AUDITABLE" ? motivoNoAuditable : "",
+      detalleMotivoNoAuditable:
+        tipoInterlocutor === "NO_AUDITABLE" ? detalleMotivoNoAuditable : "",
       motivosSeleccion: Array.isArray(body.motivosSeleccion)
         ? body.motivosSeleccion
         : [],
       // ❌ feedbackInformado / requiereCoaching removidos
       observacionesGenerales: String(body.observacionesGenerales || "").trim(),
-      puntosPositivos: String(body.puntosPositivos || "").trim(),
-      puntosAMejorar: String(body.puntosAMejorar || "").trim(),
+      puntosPositivos:
+        tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosPositivos || "").trim(),
+      puntosAMejorar:
+        tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosAMejorar || "").trim(),
       items,
-      scoreFinal,
-      scoreBloques,
-      semaforo: semaforo(scoreFinal),
+      scoreFinal: resumenScores.scoreFinal,
+      scoreBloques: resumenScores.scoreBloques,
+      semaforo: resumenScores.semaforo,
       borrado: false,
     });
 
@@ -578,6 +490,7 @@ export async function listar(req, res) {
       operador,
       auditor,
       semaforo: sem,
+      tipoInterlocutor,
       page = 1,
       limit = 50,
     } = req.query || {};
@@ -597,6 +510,18 @@ export async function listar(req, res) {
     if (operador) base.operadorUsername = String(operador).toLowerCase().trim();
     if (auditor) base.auditorUsername = String(auditor).toLowerCase().trim();
     if (sem) base.semaforo = String(sem).toLowerCase().trim();
+    if (tipoInterlocutor) {
+      const tipo = normalizarTipoInterlocutor(tipoInterlocutor);
+      if (tipo === "TITULAR") {
+        base.$or = [
+          { tipoInterlocutor: "TITULAR" },
+          { tipoInterlocutor: { $exists: false } },
+          { tipoInterlocutor: null },
+        ];
+      } else {
+        base.tipoInterlocutor = tipo;
+      }
+    }
 
     // ❌ filtros feedback/coaching removidos
 
@@ -697,6 +622,23 @@ export async function editar(req, res) {
         toDateOnly(body.fechaAuditoria) || existing.fechaAuditoria;
     }
 
+    const tipoInterlocutor = normalizarTipoInterlocutor(
+      body.tipoInterlocutor || existing.tipoInterlocutor || "TITULAR"
+    );
+    const formularioAplicado = formularioAplicadoParaTipo(tipoInterlocutor);
+    const motivoNoAuditable = String(body.motivoNoAuditable || "").trim();
+    const detalleMotivoNoAuditable = String(body.detalleMotivoNoAuditable || "").trim();
+
+    if (tipoInterlocutor === "NO_AUDITABLE" && !motivoNoAuditable) {
+      return res.status(400).json({ error: "Seleccioná un motivo para marcar la auditoría como No auditable." });
+    }
+
+    existing.tipoInterlocutor = tipoInterlocutor;
+    existing.formularioAplicado = formularioAplicado;
+    existing.motivoNoAuditable = tipoInterlocutor === "NO_AUDITABLE" ? motivoNoAuditable : "";
+    existing.detalleMotivoNoAuditable =
+      tipoInterlocutor === "NO_AUDITABLE" ? detalleMotivoNoAuditable : "";
+
     existing.motivosSeleccion = Array.isArray(body.motivosSeleccion)
       ? body.motivosSeleccion
       : existing.motivosSeleccion;
@@ -706,8 +648,10 @@ export async function editar(req, res) {
     existing.observacionesGenerales = String(
       body.observacionesGenerales || ""
     ).trim();
-    existing.puntosPositivos = String(body.puntosPositivos || "").trim();
-    existing.puntosAMejorar = String(body.puntosAMejorar || "").trim();
+    existing.puntosPositivos =
+      tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosPositivos || "").trim();
+    existing.puntosAMejorar =
+      tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosAMejorar || "").trim();
 
     const itemsIn = Array.isArray(body.items) ? body.items : [];
     if (itemsIn.length < 1)
@@ -719,80 +663,13 @@ export async function editar(req, res) {
         .status(400)
         .json({ error: "Máximo 5 audios/items por auditoría." });
 
-    const items = itemsIn.map((it, idx) => {
-      const telefono = String(it.telefono || "").trim();
-      if (!telefono)
-        throw new Error(`Cada item debe incluir telefono. (item #${idx + 1})`);
-
-      const dni = String(it.dni || "").trim();
-      const cartera = String(it.cartera || "")
-        .trim()
-        .toUpperCase();
-
-      const fechaAudio = it.fechaAudio ? toDateOnly(it.fechaAudio) : null;
-      const horaAprox = it.horaAprox ? normalizarHora(it.horaAprox) : "";
-
-      const tipoInteraccion = String(it.tipoInteraccion || "LLAMADA_SALIENTE")
-        .trim()
-        .toUpperCase();
-      const referencia = String(it.referencia || "").trim();
-
-      const duracionMinutos = parseDuracionMinutos(it);
-      const duracionSegundos = parseDuracionSegundosCompat(it);
-
-      if (isLlamada(tipoInteraccion) && duracionMinutos <= 0) {
-        throw new Error(
-          `Falta duración (minutos) para llamada en item #${idx + 1}.`
-        );
-      }
-
-      const comentariosCriterio = parseComentariosCriterio(it);
-      const { fallosIds, parcialesIds } = normalizarResultados(it);
-      const { scoreBloques, scoreAudio } = calcScoresFromResultados(
-        fallosIds,
-        parcialesIds
-      );
-
-      return {
-        telefono,
-        dni,
-        cartera,
-        fechaAudio,
-        horaAprox,
-        tipoInteraccion,
-        referencia,
-        duracionMinutos,
-        duracionSegundos,
-        comentariosCriterio,
-        fallosIds,
-        parcialesIds,
-        scoreAudio,
-        scoreBloques,
-      };
-    });
-
-    const scoreFinal = Number(
-      (
-        items.reduce((acc, x) => acc + (Number(x.scoreAudio) || 0), 0) /
-        items.length
-      ).toFixed(6)
-    );
-
-    const avg = (k) =>
-      items.reduce((acc, x) => acc + (Number(x.scoreBloques?.[k]) || 0), 0) /
-      items.length;
-
-    const scoreBloques = {
-      presentacion: Number(avg("presentacion").toFixed(6)),
-      negociacion: Number(avg("negociacion").toFixed(6)),
-      cierre: Number(avg("cierre").toFixed(6)),
-      calidad: Number(avg("calidad").toFixed(6)),
-    };
+    const items = construirItemsAuditoria(itemsIn, { tipoInterlocutor, formularioAplicado });
+    const resumenScores = calcularResumenItems(items, tipoInterlocutor);
 
     existing.items = items;
-    existing.scoreFinal = scoreFinal;
-    existing.scoreBloques = scoreBloques;
-    existing.semaforo = semaforo(scoreFinal);
+    existing.scoreFinal = resumenScores.scoreFinal;
+    existing.scoreBloques = resumenScores.scoreBloques;
+    existing.semaforo = resumenScores.semaforo;
 
     await existing.save();
 
@@ -843,7 +720,7 @@ export async function analyticsResumen(req, res) {
       return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
-    const { desde, hasta, operador } = req.query || {};
+    const { desde, hasta, operador, tipoInterlocutor } = req.query || {};
 
     const match = { ...ownerScope(req), borrado: { $ne: true } };
 
@@ -860,6 +737,18 @@ export async function analyticsResumen(req, res) {
     if (operador) {
       match.operadorUsername = String(operador).toLowerCase().trim();
     }
+    if (tipoInterlocutor) {
+      const tipo = normalizarTipoInterlocutor(tipoInterlocutor);
+      if (tipo === "TITULAR") {
+        match.$or = [
+          { tipoInterlocutor: "TITULAR" },
+          { tipoInterlocutor: { $exists: false } },
+          { tipoInterlocutor: null },
+        ];
+      } else {
+        match.tipoInterlocutor = tipo;
+      }
+    }
 
     throwIfAborted(req);
 
@@ -869,6 +758,8 @@ export async function analyticsResumen(req, res) {
         $group: {
           _id: null,
           auditorias: { $sum: 1 },
+          auditables: { $sum: { $cond: [{ $ne: ["$scoreFinal", null] }, 1, 0] } },
+          noAuditables: { $sum: { $cond: [{ $eq: ["$tipoInterlocutor", "NO_AUDITABLE"] }, 1, 0] } },
           audios: { $sum: { $size: { $ifNull: ["$items", []] } } },
           avgFinal: { $avg: "$scoreFinal" },
           avgPres: { $avg: "$scoreBloques.presentacion" },
@@ -881,6 +772,7 @@ export async function analyticsResumen(req, res) {
 
     const semaforos = await AuditoriaContactoDirecto.aggregate([
       { $match: match },
+      { $match: { semaforo: { $in: ["bajo", "medio", "alto"] } } },
       { $group: { _id: "$semaforo", count: { $sum: 1 } } },
       { $project: { _id: 0, semaforo: "$_id", count: 1 } },
     ]);
@@ -909,33 +801,74 @@ export async function analyticsResumen(req, res) {
       { $match: match },
       { $unwind: "$items" },
       { $unwind: "$items.fallosIds" },
-      { $group: { _id: "$items.fallosIds", count: { $sum: 1 } } },
+      {
+        $group: {
+          _id: {
+            formulario: {
+              $ifNull: [
+                "$formularioAplicado",
+                { $ifNull: ["$tipoInterlocutor", "TITULAR"] },
+              ],
+            },
+            criterio: "$items.fallosIds",
+          },
+          count: { $sum: 1 },
+        },
+      },
       { $sort: { count: -1 } },
       { $limit: 10 },
     ]);
 
-    const topFallos = topFallosRaw.map((x) => ({
-      id: x._id,
-      label: CRITERIOS_BY_ID.get(x._id)?.label || `Criterio ${x._id}`,
-      grupo: CRITERIOS_BY_ID.get(x._id)?.grupo || "",
-      count: x.count,
-    }));
+    const topFallos = topFallosRaw.map((x) => {
+      const formulario = ["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(x?._id?.formulario)
+        ? x._id.formulario
+        : "TITULAR";
+      const criterio = criterioPorId(formulario, x?._id?.criterio);
+      return {
+        id: x?._id?.criterio,
+        formulario,
+        label: criterio?.label || `Criterio ${x?._id?.criterio}`,
+        grupo: criterio?.grupo || "",
+        count: x.count,
+      };
+    });
+
+    const porTipoInterlocutor = await AuditoriaContactoDirecto.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: { $ifNull: ["$tipoInterlocutor", "TITULAR"] },
+          auditorias: { $sum: 1 },
+          avgFinal: { $avg: "$scoreFinal" },
+        },
+      },
+      { $project: { _id: 0, tipoInterlocutor: "$_id", auditorias: 1, avgFinal: 1 } },
+      { $sort: { auditorias: -1, tipoInterlocutor: 1 } },
+    ]);
 
     return res.json({
       ok: true,
       resumen: {
         auditorias: resumen?.auditorias || 0,
+        auditables: resumen?.auditables || 0,
+        noAuditables: resumen?.noAuditables || 0,
         audios: resumen?.audios || 0,
-        scorePromedio: Number((resumen?.avgFinal || 0).toFixed(4)),
+        scorePromedio:
+          resumen?.avgFinal == null ? null : Number(Number(resumen.avgFinal).toFixed(4)),
         bloquesPromedio: {
-          presentacion: Number((resumen?.avgPres || 0).toFixed(4)),
-          negociacion: Number((resumen?.avgNeg || 0).toFixed(4)),
-          cierre: Number((resumen?.avgCie || 0).toFixed(4)),
-          calidad: Number((resumen?.avgCal || 0).toFixed(4)),
+          presentacion:
+            resumen?.avgPres == null ? null : Number(Number(resumen.avgPres).toFixed(4)),
+          negociacion:
+            resumen?.avgNeg == null ? null : Number(Number(resumen.avgNeg).toFixed(4)),
+          cierre:
+            resumen?.avgCie == null ? null : Number(Number(resumen.avgCie).toFixed(4)),
+          calidad:
+            resumen?.avgCal == null ? null : Number(Number(resumen.avgCal).toFixed(4)),
         },
       },
       semaforos,
       porOperador,
+      porTipoInterlocutor,
       topFallos,
     });
   } catch (e) {

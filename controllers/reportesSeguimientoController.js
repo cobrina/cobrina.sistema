@@ -5,6 +5,7 @@ import Empleado from "../models/Empleado.js";
 import NovedadRRHH from "../models/NovedadRRHH.js";
 import { horarioEfectivoParaFecha, minutosEsperadosEnRango } from "../utils/calculoAsistencia.js";
 import { toDateOnly } from "../utils/fecha.util.js";
+import { criterioPorId } from "../config/auditorias.js";
 
 const CACHE_TTL_MS = 120_000;
 const cache = new Map();
@@ -15,62 +16,6 @@ const PAUSA_BREVE_MAX = 30;
 const PAUSA_CRITICA_MIN = 60;
 const MIN_BLOQUE_MIN = 5;
 const TOLERANCIA_FIN_MIN = 30;
-
-const CRITERIOS = [
-  [1, "Se presenta cordial y correctamente", "presentacion"],
-  [2, "Solicita por titular o encargado de pago", "presentacion"],
-  [3, "Expone motivo del llamado", "presentacion"],
-  [4, "Solicita saldo actualizado", "negociacion"],
-  [5, "Consulta motivos de atraso", "negociacion"],
-  [6, "Negocia el saldo a abonar", "negociacion"],
-  [7, "Argumenta ante historial de gestión", "negociacion"],
-  [8, "Refuta argumentos frente a negativa de pago", "negociacion"],
-  [9, "Informa consecuencias de atraso", "negociacion"],
-  [10, "Brinda información relevante", "negociacion"],
-  [11, "Compromete al titular o encargado de pago", "cierre"],
-  [12, "Solicita teléfonos alternativos o implementa otro medio", "cierre"],
-  [13, "Informa saldo deudor negociado", "cierre"],
-  [14, "Confirma fecha de pago o nueva comunicación", "cierre"],
-  [15, "Realiza holdeo correcto", "cierre"],
-  [16, "Informa y confirma medios de pago", "cierre"],
-  [17, "Formalidad", "calidad"],
-  [18, "Transmite urgencia con seguridad y firmeza", "calidad"],
-  [19, "Aplica gestión de mora tardía", "calidad"],
-  [20, "Manejo de conflicto", "calidad"],
-  [21, "Analiza el comportamiento del titular", "calidad"],
-  [22, "Resolución de conflicto", "calidad"],
-  [23, "Observaciones correctas y completas en Mango", "calidad"],
-  [24, "Cierre de gestión en Mango", "calidad"],
-].map(([id, label, grupo]) => ({ id, label, grupo }));
-const CRITERIO_BY_ID = new Map(CRITERIOS.map((item) => [item.id, item]));
-
-function getUserId(req) {
-  return req?.user?.id || req?.usuario?._id || req?.userId || null;
-}
-
-function getRole(req) {
-  return String(req?.user?.role || req?.user?.rol || req?.usuario?.role || "").toLowerCase();
-}
-
-function ownerScope(req) {
-  const role = getRole(req);
-  const userId = getUserId(req);
-  const onlyMine = String(req?.query?.onlyMine || "").toLowerCase() === "true";
-  if (!userId) return {};
-  if (["capacitadora", "administracion", "supervisor", "super-admin"].includes(role) && !onlyMine) return {};
-  return { propietario: new mongoose.Types.ObjectId(userId) };
-}
-
-function startDay(raw) {
-  const date = toDateOnly(raw);
-  if (!date) return null;
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
-}
-
-function endDay(raw) {
-  const date = startDay(raw);
-  return date ? new Date(date.getTime() + 86_399_999) : null;
-}
 
 function splitCSV(raw) {
   return String(raw || "")
@@ -308,32 +253,63 @@ function recurringTexts(audits, field, limit = 8) {
 }
 
 function aggregateAudit(audits) {
-  const orderedAsc = [...audits].sort((a, b) => new Date(a.fechaAuditoria) - new Date(b.fechaAuditoria));
+  const allOrderedAsc = [...audits].sort((a, b) => new Date(a.fechaAuditoria) - new Date(b.fechaAuditoria));
+  const noAuditables = allOrderedAsc.filter((audit) => audit?.tipoInterlocutor === "NO_AUDITABLE");
+  const orderedAsc = allOrderedAsc.filter((audit) =>
+    audit?.tipoInterlocutor !== "NO_AUDITABLE" &&
+    audit?.scoreFinal != null &&
+    Number.isFinite(Number(audit.scoreFinal))
+  );
   const orderedDesc = [...orderedAsc].reverse();
   const count = orderedAsc.length;
-  const average = (path) => count
-    ? orderedAsc.reduce((sum, audit) => sum + Number(path(audit) || 0), 0) / count
-    : 0;
+  const average = (path) => {
+    const values = orderedAsc
+      .map((audit) => path(audit))
+      .filter((value) => value != null && Number.isFinite(Number(value)))
+      .map(Number);
+    return values.length
+      ? values.reduce((sum, value) => sum + value, 0) / values.length
+      : null;
+  };
   const failures = new Map();
   const partials = new Map();
   const semaforos = { bajo: 0, medio: 0, alto: 0 };
 
   for (const audit of orderedAsc) {
     semaforos[audit.semaforo] = (semaforos[audit.semaforo] || 0) + 1;
+    const formulario = ["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(audit?.formularioAplicado)
+      ? audit.formularioAplicado
+      : ["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(audit?.tipoInterlocutor)
+        ? audit.tipoInterlocutor
+        : "TITULAR";
     for (const item of audit.items || []) {
-      for (const id of item.fallosIds || []) failures.set(Number(id), (failures.get(Number(id)) || 0) + 1);
-      for (const id of item.parcialesIds || []) partials.set(Number(id), (partials.get(Number(id)) || 0) + 1);
+      for (const rawId of item.fallosIds || []) {
+        const id = Number(rawId);
+        const key = `${formulario}:${id}`;
+        failures.set(key, (failures.get(key) || 0) + 1);
+      }
+      for (const rawId of item.parcialesIds || []) {
+        const id = Number(rawId);
+        const key = `${formulario}:${id}`;
+        partials.set(key, (partials.get(key) || 0) + 1);
+      }
     }
   }
 
   const ids = new Set([...failures.keys(), ...partials.keys()]);
   const criteriosSeguimiento = [...ids]
-    .map((id) => ({
-      ...(CRITERIO_BY_ID.get(id) || { id, label: `Criterio ${id}`, grupo: "" }),
-      fallos: failures.get(id) || 0,
-      parciales: partials.get(id) || 0,
-      pesoSeguimiento: (failures.get(id) || 0) + (partials.get(id) || 0) * 0.5,
-    }))
+    .map((key) => {
+      const [formulario, rawId] = String(key).split(":");
+      const id = Number(rawId);
+      const criterio = criterioPorId(formulario, id) || { id, label: `Criterio ${id}`, grupo: "" };
+      return {
+        ...criterio,
+        formulario,
+        fallos: failures.get(key) || 0,
+        parciales: partials.get(key) || 0,
+        pesoSeguimiento: (failures.get(key) || 0) + (partials.get(key) || 0) * 0.5,
+      };
+    })
     .sort((a, b) => b.pesoSeguimiento - a.pesoSeguimiento || b.fallos - a.fallos)
     .slice(0, 10);
 
@@ -378,6 +354,8 @@ function aggregateAudit(audits) {
 
   return {
     realizadas: count,
+    realizadasTotales: allOrderedAsc.length,
+    noAuditables: noAuditables.length,
     scorePromedio: average((audit) => audit.scoreFinal),
     bloques: {
       presentacion: average((audit) => audit.scoreBloques?.presentacion),
@@ -633,7 +611,7 @@ export async function seguimientoAuditorias(req, res) {
       borrado: { $ne: true },
       operadorUsername: username,
     })
-      .select("auditorUsername operadorUsername fechaAuditoria scoreFinal scoreBloques semaforo items.fallosIds items.parcialesIds observacionesGenerales puntosPositivos puntosAMejorar")
+      .select("auditorUsername operadorUsername fechaAuditoria tipoInterlocutor formularioAplicado scoreFinal scoreBloques semaforo items.fallosIds items.parcialesIds observacionesGenerales puntosPositivos puntosAMejorar")
       .sort({ fechaAuditoria: -1 })
       .maxTimeMS(6_000)
       .lean();

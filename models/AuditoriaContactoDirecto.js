@@ -53,16 +53,25 @@ const ItemAudioSchema = new Schema(
       default: {},
     },
 
+    // Resultado explícito por criterio. Mantiene compatibilidad con fallos/parciales históricos.
+    resultadosCriterios: {
+      type: Map,
+      of: {
+        type: String,
+        enum: ["SI", "PARCIAL", "NO", "NO_APLICA"],
+      },
+      default: {},
+    },
     fallosIds: { type: [Number], default: [] },
-    // Criterios cumplidos de forma parcial: valen 0,5 en el cálculo.
     parcialesIds: { type: [Number], default: [] },
+    criteriosNoAplica: { type: [Number], default: [] },
 
-    scoreAudio: { type: Number, default: 0, min: 0, max: 10 },
+    scoreAudio: { type: Number, default: null, min: 0, max: 10 },
     scoreBloques: {
-      presentacion: { type: Number, default: 0, min: 0, max: 10 },
-      negociacion: { type: Number, default: 0, min: 0, max: 10 },
-      cierre: { type: Number, default: 0, min: 0, max: 10 },
-      calidad: { type: Number, default: 0, min: 0, max: 10 },
+      presentacion: { type: Number, default: null, min: 0, max: 10 },
+      negociacion: { type: Number, default: null, min: 0, max: 10 },
+      cierre: { type: Number, default: null, min: 0, max: 10 },
+      calidad: { type: Number, default: null, min: 0, max: 10 },
     },
   },
   { _id: false }
@@ -92,6 +101,23 @@ const AuditoriaContactoDirectoSchema = new Schema(
 
     fechaAuditoria: { type: Date, default: Date.now, index: true },
 
+    // Tipo de interlocutor de la auditoría. Auditorías históricas sin este campo
+    // se interpretan como TITULAR desde el controlador, sin recalcular su score.
+    tipoInterlocutor: {
+      type: String,
+      enum: ["TITULAR", "TERCERO", "TERCERO_PAGADOR", "NO_AUDITABLE"],
+      default: "TITULAR",
+      index: true,
+    },
+    formularioAplicado: {
+      type: String,
+      enum: ["TITULAR", "TERCERO", "TERCERO_PAGADOR", "NINGUNO"],
+      default: "TITULAR",
+      index: true,
+    },
+    motivoNoAuditable: { type: String, default: "", trim: true, maxlength: 200 },
+    detalleMotivoNoAuditable: { type: String, default: "", trim: true, maxlength: 1000 },
+
     motivosSeleccion: {
       type: [String],
       default: [],
@@ -114,18 +140,18 @@ const AuditoriaContactoDirectoSchema = new Schema(
     },
 
     // Scores calculados
-    scoreFinal: { type: Number, default: 0, min: 0, max: 10, index: true },
+    scoreFinal: { type: Number, default: null, min: 0, max: 10, index: true },
     scoreBloques: {
-      presentacion: { type: Number, default: 0, min: 0, max: 10 },
-      negociacion: { type: Number, default: 0, min: 0, max: 10 },
-      cierre: { type: Number, default: 0, min: 0, max: 10 },
-      calidad: { type: Number, default: 0, min: 0, max: 10 },
+      presentacion: { type: Number, default: null, min: 0, max: 10 },
+      negociacion: { type: Number, default: null, min: 0, max: 10 },
+      cierre: { type: Number, default: null, min: 0, max: 10 },
+      calidad: { type: Number, default: null, min: 0, max: 10 },
     },
 
     semaforo: {
       type: String,
-      default: "medio",
-      enum: ["bajo", "medio", "alto"],
+      default: null,
+      enum: ["bajo", "medio", "alto", null],
       index: true,
     },
 
