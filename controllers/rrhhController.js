@@ -5,13 +5,15 @@ import NovedadRRHH from "../models/NovedadRRHH.js";
 import AdelantoRRHH from "../models/AdelantoRRHH.js";
 import ObjetivoMensual from "../models/ObjetivoMensual.js";
 import Empleado from "../models/Empleado.js";
-import Asistencia from "../models/Asistencia.js";
 import Pago from "../models/Pago.js";
+import ReporteGestion from "../models/ReporteGestion.js";
 import Entidad from "../models/Entidad.js";
 import SubCesion from "../models/SubCesion.js";
-import { minutosTrabajadosDesdeMarcas, minutosEsperadosHastaHoy, rangoMesLocal } from "../utils/calculoAsistencia.js";
+import { minutosEsperadosHastaHoy, novedadSolapaRango, rangoMesLocal } from "../utils/calculoAsistencia.js";
+import { resumirActividadMensual } from "../utils/actividadGestiones.js";
+import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
 import { normalizarEntidadNumero } from "../utils/normalizacionNegocio.js";
-import { ROLES, normalizeStoredRole } from "../config/roles.js";
+import { ROLES, normalizeStoredRole, normalizeUsername } from "../config/roles.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
 
 const objectId = (value) =>
@@ -773,14 +775,15 @@ export async function resumenEmpleados(req, res) {
     const { mes, desde, hasta, desdeClave, hastaClave } = rangoMesLocal(req.query.mes);
     const desdeNovedades = new Date(`${desdeClave}T00:00:00.000Z`);
     const hastaNovedades = new Date(`${hastaClave}T23:59:59.999Z`);
-    const empleados = await Empleado.find({ isActive: { $ne: false } })
+    const empleadosTodos = await Empleado.find({ isActive: { $ne: false } })
       .select("username nombre role horarioLaboral")
       .sort({ username: 1 })
       .lean();
+    const empleados = filtrarEmpleadosControlados(empleadosTodos);
     const ids = empleados.map((e) => e._id);
-    const usernames = empleados.map((e) => e.username);
+    const usernames = empleados.map((e) => normalizeUsername(e.username)).filter(Boolean);
 
-    const [pagosPorId, pagosPorUsername, asistencias, objetivos, novedades, adelantos] = await Promise.all([
+    const [pagosPorId, pagosPorUsername, gestionesActividad, objetivos, novedades, adelantos] = await Promise.all([
       Pago.aggregate([
         { $match: { fechaPago: { $gte: desde, $lte: hasta }, operadorId: { $in: ids } } },
         { $group: { _id: "$operadorId", total: { $sum: "$monto" }, cantidad: { $sum: 1 } } },
@@ -799,7 +802,11 @@ export async function resumenEmpleados(req, res) {
         },
         { $group: { _id: "$operadorUsername", total: { $sum: "$monto" }, cantidad: { $sum: 1 } } },
       ]),
-      Asistencia.find({ empleado: { $in: ids }, fechaClave: { $gte: desdeClave, $lte: hastaClave } }).lean(),
+      ReporteGestion.find({
+        fecha: { $gte: desdeNovedades, $lte: hastaNovedades },
+        borrado: { $ne: true },
+        usuario: { $in: usernames },
+      }).select("fecha hora usuario").lean(),
       ObjetivoMensual.find({ mes, alcance: "operador", activo: true }).lean(),
       NovedadRRHH.find({
         empleadoId: { $in: ids },
@@ -813,23 +820,21 @@ export async function resumenEmpleados(req, res) {
     ]);
 
     const pagoIdMap = new Map(pagosPorId.map((p) => [String(p._id), p]));
-    const pagoUserMap = new Map(pagosPorUsername.map((p) => [String(p._id), p]));
-    const asistenciaMap = new Map();
-    for (const a of asistencias) {
-      const key = String(a.empleado);
-      asistenciaMap.set(key, (asistenciaMap.get(key) || 0) + minutosTrabajadosDesdeMarcas(a.marcas));
-    }
+    const pagoUserMap = new Map(pagosPorUsername.map((p) => [normalizeUsername(p._id), p]));
+    const actividadMap = resumirActividadMensual(gestionesActividad);
+    const novedadesPeriodo = novedades.filter((novedad) => novedadSolapaRango(novedad, desdeClave, hastaClave));
     const objetivoMap = new Map(objetivos.map((o) => [String(o.empleadoId), o]));
 
     const resultado = empleados.map((empleado) => {
       const id = String(empleado._id);
       const porId = pagoIdMap.get(id);
-      const porUser = pagoUserMap.get(empleado.username);
+      const porUser = pagoUserMap.get(normalizeUsername(empleado.username));
       const recaudacion = Number(porId?.total || 0) + Number(porUser?.total || 0);
       const cantidadPagos = Number(porId?.cantidad || 0) + Number(porUser?.cantidad || 0);
       const objetivo = objetivoMap.get(id);
-      const horasMinutos = asistenciaMap.get(id) || 0;
-      const novedadesEmp = novedades.filter((n) => String(n.empleadoId) === id);
+      const actividad = actividadMap.get(normalizeUsername(empleado.username)) || {};
+      const horasMinutos = Number(actividad.minutosFranja || 0);
+      const novedadesEmp = novedadesPeriodo.filter((n) => String(n.empleadoId) === id);
       const esperados = minutosEsperadosHastaHoy(empleado, mes, novedadesEmp);
       const adelantosEmp = adelantos.filter((a) => String(a.empleadoId) === id);
       const montoAdelantos = adelantosEmp.reduce((sum, a) => sum + Number(a.monto || 0), 0);
@@ -843,6 +848,11 @@ export async function resumenEmpleados(req, res) {
         llegoObjetivo: montoObjetivo > 0 ? recaudacion >= montoObjetivo : null,
         minutosTrabajados: horasMinutos,
         minutosEsperados: esperados,
+        diasConActividad: Number(actividad.diasConActividad || 0),
+        gestionesPeriodo: Number(actividad.gestiones || 0),
+        baches30: Number(actividad.baches30 || 0),
+        baches60: Number(actividad.baches60 || 0),
+        bacheMaximoMin: Number(actividad.bacheMaximoMin || 0),
         porcentajeHoras: esperados > 0 ? Math.round((horasMinutos / esperados) * 1000) / 10 : null,
         horarioLibre: empleado.horarioLaboral?.modalidad === "libre",
         horarioBase: {

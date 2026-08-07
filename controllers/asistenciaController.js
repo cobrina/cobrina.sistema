@@ -2,7 +2,11 @@ import mongoose from "mongoose";
 import Asistencia from "../models/Asistencia.js";
 import Empleado from "../models/Empleado.js";
 import NovedadRRHH from "../models/NovedadRRHH.js";
-import { horarioEfectivoParaFecha } from "../utils/calculoAsistencia.js";
+import ReporteGestion from "../models/ReporteGestion.js";
+import { horarioEfectivoParaFecha, novedadCubreFecha } from "../utils/calculoAsistencia.js";
+import { actividadDeUsuarioEnFecha } from "../utils/actividadGestiones.js";
+import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
+import { normalizeUsername } from "../config/roles.js";
 
 const TIME_ZONE = "America/Argentina/Buenos_Aires";
 const HORA_CIERRE_AUTOMATICO = "21:00";
@@ -386,24 +390,35 @@ export async function panel(req, res) {
   try {
     await procesarCierresAutomaticos();
     const fechaClave = normalizarFechaClave(req.query.fecha);
-
-    const [empleados, asistencias] = await Promise.all([
-      Empleado.find({ isActive: { $ne: false } })
-        .select("username nombre role ultimaActividad horarioLaboral isActive")
-        .sort({ username: 1 })
-        .lean(),
-      Asistencia.find({ fechaClave }).lean(),
-    ]);
     const fechaConsulta = new Date(`${fechaClave}T00:00:00.000Z`);
-    const novedades = empleados.length
-      ? await NovedadRRHH.find({
-          empleadoId: { $in: empleados.map((empleado) => empleado._id) },
-          tipo: { $in: ["cambio-horario", "licencia-medica"] },
-          estado: { $ne: "anulado" },
-          fechaDesde: { $lte: fechaConsulta },
-          $or: [{ fechaHasta: null }, { fechaHasta: { $gte: fechaConsulta } }],
-        }).lean()
-      : [];
+    const fechaConsultaHasta = new Date(`${fechaClave}T23:59:59.999Z`);
+
+    const empleadosTodos = await Empleado.find({ isActive: { $ne: false } })
+      .select("username nombre role ultimaActividad horarioLaboral isActive")
+      .sort({ username: 1 })
+      .lean();
+    const empleados = filtrarEmpleadosControlados(empleadosTodos);
+    const ids = empleados.map((empleado) => empleado._id);
+    const usernames = empleados.map((empleado) => normalizeUsername(empleado.username)).filter(Boolean);
+
+    const [asistencias, gestiones, novedades] = await Promise.all([
+      Asistencia.find({ fechaClave, empleado: { $in: ids } }).lean(),
+      ReporteGestion.find({
+        fecha: { $gte: fechaConsulta, $lte: fechaConsultaHasta },
+        borrado: { $ne: true },
+        usuario: { $in: usernames },
+      }).select("fecha hora usuario").lean(),
+      ids.length
+        ? NovedadRRHH.find({
+            empleadoId: { $in: ids },
+            tipo: { $in: ["cambio-horario", "licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"] },
+            estado: { $ne: "anulado" },
+            fechaDesde: { $lte: fechaConsultaHasta },
+            $or: [{ fechaHasta: null }, { fechaHasta: { $gte: fechaConsulta } }],
+          }).lean()
+        : Promise.resolve([]),
+    ]);
+
     const novedadesPorEmpleado = new Map();
     for (const novedad of novedades) {
       const key = String(novedad.empleadoId);
@@ -411,19 +426,22 @@ export async function panel(req, res) {
       novedadesPorEmpleado.get(key).push(novedad);
     }
 
-    const porEmpleado = new Map(
-      asistencias.map((item) => [String(item.empleado), item])
-    );
+    const porEmpleado = new Map(asistencias.map((item) => [String(item.empleado), item]));
+    const actividadPorUsuario = actividadDeUsuarioEnFecha(gestiones, fechaClave);
+    const prioridadNovedad = ["licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"];
 
     const items = empleados.map((empleado) => {
       const asistencia = porEmpleado.get(String(empleado._id));
       const marcas = asistencia?.marcas || [];
       const ultimaSalida = [...marcas].reverse().find((marca) => marca.tipo === "salida");
-      const horarioEfectivo = horarioEfectivoParaFecha(
-        empleado,
-        fechaClave,
-        novedadesPorEmpleado.get(String(empleado._id)) || []
-      );
+      const novedadesEmpleado = novedadesPorEmpleado.get(String(empleado._id)) || [];
+      const horarioEfectivo = horarioEfectivoParaFecha(empleado, fechaClave, novedadesEmpleado);
+      const actividad = actividadPorUsuario.get(normalizeUsername(empleado.username)) || null;
+      const novedadesDelDia = novedadesEmpleado.filter((novedad) => novedadCubreFecha(novedad, fechaClave));
+      const novedadDia = prioridadNovedad
+        .map((tipo) => novedadesDelDia.find((novedad) => novedad.tipo === tipo))
+        .find(Boolean) || null;
+
       return {
         _id: empleado._id,
         username: empleado.username,
@@ -440,6 +458,22 @@ export async function panel(req, res) {
           licenciaMedica: horarioEfectivo.licenciaMedica,
           horarioLibre: horarioEfectivo.horarioLibre,
         },
+        actividadGestiones: {
+          primeraGestion: actividad?.primeraGestion || "",
+          ultimaGestion: actividad?.ultimaGestion || "",
+          minutosFranja: Number(actividad?.minutosFranja || 0),
+          gestiones: Number(actividad?.gestiones || 0),
+          baches30: Number(actividad?.baches30 || 0),
+          baches60: Number(actividad?.baches60 || 0),
+          bacheMaximoMin: Number(actividad?.bacheMaximoMin || 0),
+        },
+        novedadDia: novedadDia
+          ? {
+              tipo: novedadDia.tipo,
+              descripcion: novedadDia.descripcion || "",
+              justificado: Boolean(novedadDia.justificado || novedadDia.tipo === "falta-justificada" || novedadDia.tipo === "licencia-medica"),
+            }
+          : null,
         fichaje: {
           estado: asistencia?.estado || "sin-fichar",
           entrada: primeraMarca(marcas, "entrada"),
@@ -455,9 +489,11 @@ export async function panel(req, res) {
       ok: true,
       fechaClave,
       cierreAutomatico: HORA_CIERRE_AUTOMATICO,
+      fuenteActividad: "reporte-gestiones",
       items,
     });
   } catch (error) {
+    console.error("Panel presentismo:", error);
     return res.status(500).json({ error: "No se pudo cargar el panel de presentismo" });
   }
 }

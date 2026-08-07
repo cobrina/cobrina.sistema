@@ -9,7 +9,10 @@ import Colchon from "../models/Colchon.js";
 import ReporteGestion from "../models/ReporteGestion.js";
 import NovedadRRHH from "../models/NovedadRRHH.js";
 import AcuerdoPago from "../models/AcuerdoPago.js";
-import { horarioEfectivoParaFecha, minutosTrabajadosDesdeMarcas, minutosEsperadosHastaHoy, rangoMesLocal } from "../utils/calculoAsistencia.js";
+import { horarioEfectivoParaFecha, minutosEsperadosHastaHoy, novedadCubreFecha, rangoMesLocal } from "../utils/calculoAsistencia.js";
+import { actividadDeUsuarioEnFecha, resumirActividadMensual } from "../utils/actividadGestiones.js";
+import { filtrarEmpleadosControlados, usernamesControlados } from "../utils/controlEquipo.js";
+import { normalizeUsername } from "../config/roles.js";
 import { transformarGestionEnAcuerdo } from "../services/acuerdosGestionesService.js";
 
 function mesValido(valor) {
@@ -108,11 +111,15 @@ export async function resumenSupervision(req, res) {
       .select("username nombre role horarioLaboral")
       .sort({ username: 1 })
       .lean();
+    const empleadosControlados = filtrarEmpleadosControlados(empleados);
+    const idsControlados = empleadosControlados.map((empleado) => empleado._id);
+    const usuariosControlados = usernamesControlados(empleados);
+    const listaUsuariosControlados = [...usuariosControlados];
 
-    const [pagosTres, objetivos, asistencias, novedadesHorario, proyeccionesCaidas, colchonSinGestion,
-      pendientesColchon, pendientesProyecciones, ultimaPago, ultimaGestionAcuerdo, ultimaGestion,
-      gestionesAcuerdoPeriodo, pagosHoyAgg, presentesAhora, jornadasSinSalida,
-      ultimaAcuerdoManual, acuerdosManualesCantidad] = await Promise.all([
+    const [pagosTres, objetivos, novedadesRRHH, gestionesActividadPeriodo, gestionesActividadHoy,
+      proyeccionesCaidas, colchonSinGestion, pendientesColchon, pendientesProyecciones, ultimaPago,
+      ultimaGestionAcuerdo, ultimaGestion, gestionesAcuerdoPeriodo, pagosHoyAgg, fichadosAhora,
+      jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad] = await Promise.all([
       Pago.find({ fechaPago: { $gte: desdeTres, $lte: hasta } })
         .select("monto fechaPago operadorId operadorUsername entidadId subCesionId")
         .lean(),
@@ -120,14 +127,23 @@ export async function resumenSupervision(req, res) {
         .populate("empleadoId", "username nombre")
         .populate("subCesionId", "nombre")
         .lean(),
-      Asistencia.find({ fechaClave: { $gte: desdeClave, $lte: hastaClave } }).lean(),
       NovedadRRHH.find({
-        empleadoId: { $in: empleados.map((empleado) => empleado._id) },
-        tipo: { $in: ["cambio-horario", "licencia-medica"] },
+        empleadoId: { $in: idsControlados },
+        tipo: { $in: ["cambio-horario", "licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"] },
         estado: { $ne: "anulado" },
         fechaDesde: { $lte: hastaNovedades },
         $or: [{ fechaHasta: null }, { fechaHasta: { $gte: desdeNovedades } }],
       }).lean(),
+      ReporteGestion.find({
+        fecha: { $gte: selectedDesdeUTC, $lte: selectedHastaUTC },
+        borrado: { $ne: true },
+        usuario: { $in: listaUsuariosControlados },
+      }).select("fecha hora usuario").lean(),
+      ReporteGestion.find({
+        fecha: { $gte: hoyDesdeUTC, $lte: hoyHastaUTC },
+        borrado: { $ne: true },
+        usuario: { $in: listaUsuariosControlados },
+      }).select("fecha hora usuario").lean(),
       Proyeccion.countDocuments({
         fechaPromesa: { $gte: desde, $lte: hasta },
         $or: [
@@ -162,8 +178,8 @@ export async function resumenSupervision(req, res) {
         { $match: { fechaPago: { $gte: hoyDesde, $lte: hoyHasta } } },
         { $group: { _id: null, total: { $sum: "$monto" }, cantidad: { $sum: 1 } } },
       ]),
-      Asistencia.countDocuments({ fechaClave: hoyClave, estado: "presente" }),
-      Asistencia.countDocuments({ fechaClave: { $lt: hoyClave }, estado: "presente" }),
+      Asistencia.countDocuments({ empleado: { $in: idsControlados }, fechaClave: hoyClave, estado: "presente" }),
+      Asistencia.countDocuments({ empleado: { $in: idsControlados }, fechaClave: { $lt: hoyClave }, estado: "presente" }),
       AcuerdoPago.findOne({ mes: mesSeleccionado })
         .sort({ fechaHora: -1, createdAt: -1 })
         .select("fechaHora createdAt fuenteArchivo operador")
@@ -183,28 +199,26 @@ export async function resumenSupervision(req, res) {
     const objetivoEquipo = objetivos.find((o) => o.alcance === "equipo");
     const montoObjetivoEquipo = Number(objetivoEquipo?.montoObjetivo || 0);
 
-    const porOperador = mapearPagosPorOperador(pagosActuales, empleados);
+    const porOperador = mapearPagosPorOperador(pagosActuales, empleadosControlados);
     const objetivosOperador = new Map(
       objetivos.filter((o) => o.alcance === "operador").map((o) => [String(o.empleadoId?._id || o.empleadoId), Number(o.montoObjetivo || 0)])
     );
-
-    const minutosPorEmpleado = new Map();
-    for (const asistencia of asistencias) {
-      const key = String(asistencia.empleado);
-      minutosPorEmpleado.set(key, (minutosPorEmpleado.get(key) || 0) + minutosTrabajadosDesdeMarcas(asistencia.marcas));
-    }
+    const actividadMensual = resumirActividadMensual(gestionesActividadPeriodo);
+    const actividadHoy = actividadDeUsuarioEnFecha(gestionesActividadHoy, hoyClave);
 
     const novedadesPorEmpleado = new Map();
-    for (const novedad of novedadesHorario) {
+    for (const novedad of novedadesRRHH) {
       const key = String(novedad.empleadoId);
       if (!novedadesPorEmpleado.has(key)) novedadesPorEmpleado.set(key, []);
       novedadesPorEmpleado.get(key).push(novedad);
     }
 
     const operadores = porOperador.map((item) => {
-      const empleado = empleados.find((e) => String(e._id) === String(item.empleadoId));
+      const empleado = empleadosControlados.find((e) => String(e._id) === String(item.empleadoId));
       const objetivo = objetivosOperador.get(String(item.empleadoId)) || 0;
-      const minutos = minutosPorEmpleado.get(String(item.empleadoId)) || 0;
+      const actividad = actividadMensual.get(normalizeUsername(item.username)) || {};
+      const actividadDelDia = actividadHoy.get(normalizeUsername(item.username)) || {};
+      const minutos = Number(actividad.minutosFranja || 0);
       const novedadesEmpleado = novedadesPorEmpleado.get(String(item.empleadoId)) || [];
       const esperados = minutosEsperadosHastaHoy(empleado, mesSeleccionado, novedadesEmpleado);
       const horarioHoy = horarioEfectivoParaFecha(empleado, hoyClave, novedadesEmpleado);
@@ -215,6 +229,14 @@ export async function resumenSupervision(req, res) {
         minutosTrabajados: minutos,
         minutosEsperados: esperados,
         porcentajeHoras: esperados > 0 ? Math.round((minutos / esperados) * 1000) / 10 : null,
+        diasConActividad: Number(actividad.diasConActividad || 0),
+        gestionesPeriodo: Number(actividad.gestiones || 0),
+        baches30: Number(actividad.baches30 || 0),
+        baches60: Number(actividad.baches60 || 0),
+        bacheMaximoMin: Number(actividad.bacheMaximoMin || 0),
+        primeraGestionHoy: actividadDelDia.primeraGestion || "",
+        ultimaGestionHoy: actividadDelDia.ultimaGestion || "",
+        gestionesHoy: Number(actividadDelDia.gestiones || 0),
         horarioHoy: horarioHoy.etiqueta,
         horarioModificadoHoy: horarioHoy.cambioHorario,
         licenciaMedicaHoy: horarioHoy.licenciaMedica,
@@ -305,22 +327,25 @@ export async function resumenSupervision(req, res) {
 
     for (const acuerdo of acuerdosValidos) {
       const usuario = String(acuerdo.usuario || "Sin operador").trim() || "Sin operador";
-      const actual = acuerdosPorOperadorMap.get(usuario) || {
-        usuario,
-        total: 0,
-        montoTotal: 0,
-        primerPagoTotal: 0,
-        vencidos: 0,
-        venceHoy: 0,
-        proximos: 0,
-      };
-      actual.total += 1;
-      actual.montoTotal += Number(acuerdo.montoTotalAcuerdo || 0);
-      actual.primerPagoTotal += Number(acuerdo.primerPago || 0);
-      if (acuerdo.estadoVencimiento === "VENCIDO") actual.vencidos += 1;
-      if (acuerdo.estadoVencimiento === "VENCE HOY") actual.venceHoy += 1;
-      if (acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") actual.proximos += 1;
-      acuerdosPorOperadorMap.set(usuario, actual);
+      const usuarioControlado = usuariosControlados.has(normalizeUsername(usuario));
+      if (usuarioControlado) {
+        const actual = acuerdosPorOperadorMap.get(usuario) || {
+          usuario,
+          total: 0,
+          montoTotal: 0,
+          primerPagoTotal: 0,
+          vencidos: 0,
+          venceHoy: 0,
+          proximos: 0,
+        };
+        actual.total += 1;
+        actual.montoTotal += Number(acuerdo.montoTotalAcuerdo || 0);
+        actual.primerPagoTotal += Number(acuerdo.primerPago || 0);
+        if (acuerdo.estadoVencimiento === "VENCIDO") actual.vencidos += 1;
+        if (acuerdo.estadoVencimiento === "VENCE HOY") actual.venceHoy += 1;
+        if (acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") actual.proximos += 1;
+        acuerdosPorOperadorMap.set(usuario, actual);
+      }
 
       const tipo = acuerdo.tipoAcuerdo || "Sin clasificar";
       acuerdosPorTipoMap.set(tipo, (acuerdosPorTipoMap.get(tipo) || 0) + 1);
@@ -344,8 +369,8 @@ export async function resumenSupervision(req, res) {
       .map((o) => ({
         ...o,
         motivoRevision: o.minutosTrabajados <= 0
-          ? "Sin horas fichadas en el período"
-          : `Faltan ${Math.floor(o.deficitMinutos / 60)}h ${Math.round(o.deficitMinutos % 60)}m frente al horario base`,
+          ? "Sin gestiones en días laborables del período"
+          : `${Math.floor(o.minutosTrabajados / 60)}h ${Math.round(o.minutosTrabajados % 60)}m entre primera y última gestión por día · faltan ${Math.floor(o.deficitMinutos / 60)}h ${Math.round(o.deficitMinutos % 60)}m`,
       }));
 
     const objetivosParaRevisar = operadores
@@ -353,21 +378,41 @@ export async function resumenSupervision(req, res) {
       .sort((a, b) => a.porcentajeObjetivo - b.porcentajeObjetivo)
       .slice(0, 12);
 
-    const cambiosHorarioHoy = operadores
-      .filter((operador) => operador.horarioModificadoHoy)
-      .map((operador) => ({
-        empleadoId: operador.empleadoId,
-        username: operador.username,
-        nombre: operador.nombre,
-        horario: operador.horarioHoy,
-      }));
-    const licenciasMedicasHoy = operadores
-      .filter((operador) => operador.licenciaMedicaHoy)
-      .map((operador) => ({
-        empleadoId: operador.empleadoId,
-        username: operador.username,
-        nombre: operador.nombre,
-      }));
+    // Una novedad sin fechaHasta cubre solamente su fechaDesde. Esto evita que
+    // una falta de un día quede apareciendo como vigente para siempre.
+    const novedadActivaHoy = (novedad) => novedadCubreFecha(novedad, hoyClave);
+    const empleadoDeNovedad = (novedad) => empleadosControlados.find(
+      (empleado) => String(empleado._id) === String(novedad.empleadoId)
+    );
+    const novedadesHoy = novedadesRRHH.filter(novedadActivaHoy);
+    const cambiosHorarioHoy = novedadesHoy
+      .filter((novedad) => novedad.tipo === "cambio-horario")
+      .map((novedad) => {
+        const empleado = empleadoDeNovedad(novedad) || {};
+        const horario = [novedad.horaEntradaNueva, novedad.horaSalidaNueva].filter(Boolean).join(" a ");
+        return { empleadoId: novedad.empleadoId, username: empleado.username || "", nombre: empleado.nombre || "", horario: horario || "Horario especial" };
+      });
+    const licenciasMedicasHoy = novedadesHoy
+      .filter((novedad) => novedad.tipo === "licencia-medica")
+      .map((novedad) => {
+        const empleado = empleadoDeNovedad(novedad) || {};
+        return { empleadoId: novedad.empleadoId, username: empleado.username || "", nombre: empleado.nombre || "", descripcion: novedad.descripcion || "" };
+      });
+    const ausenciasHoy = novedadesHoy
+      .filter((novedad) => ["falta", "falta-justificada", "dia-estudio", "permiso"].includes(novedad.tipo))
+      .map((novedad) => {
+        const empleado = empleadoDeNovedad(novedad) || {};
+        return {
+          empleadoId: novedad.empleadoId,
+          username: empleado.username || "",
+          nombre: empleado.nombre || "",
+          tipo: novedad.tipo,
+          justificado: Boolean(novedad.justificado || novedad.tipo === "falta-justificada"),
+          descripcion: novedad.descripcion || "",
+        };
+      });
+    const faltasHoy = ausenciasHoy.filter((item) => ["falta", "falta-justificada"].includes(item.tipo));
+    const conGestionesHoy = actividadHoy.size;
 
     return res.json({
       mesActual: mesSeleccionado,
@@ -386,10 +431,14 @@ export async function resumenSupervision(req, res) {
       hoy: {
         pagosCantidad: Number(pagosHoyAgg?.[0]?.cantidad || 0),
         pagosTotal: Number(pagosHoyAgg?.[0]?.total || 0),
-        presentesAhora,
+        presentesAhora: conGestionesHoy,
+        conGestionesHoy,
+        fichadosAhora,
         jornadasSinSalida,
         cambiosHorario: cambiosHorarioHoy.length,
         licenciasMedicas: licenciasMedicasHoy.length,
+        faltas: faltasHoy.length,
+        ausencias: ausenciasHoy.length,
       },
       alertas: {
         proyeccionesCaidas,
@@ -401,6 +450,8 @@ export async function resumenSupervision(req, res) {
         objetivosParaRevisar,
         cambiosHorarioHoy,
         licenciasMedicasHoy,
+        faltasHoy,
+        ausenciasHoy,
       },
       acuerdos: {
         total: acuerdosValidos.length,

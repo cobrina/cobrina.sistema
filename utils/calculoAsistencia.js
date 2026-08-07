@@ -62,11 +62,18 @@ export function clavesEntre(desdeClave, hastaClave) {
   return claves;
 }
 
-function novedadCubreFecha(novedad, fechaClave) {
+export function novedadCubreFecha(novedad, fechaClave) {
   if (!novedad || novedad.estado === "anulado") return false;
   const desde = fechaClaveDesdeValor(novedad.fechaDesde);
   const hasta = fechaClaveDesdeValor(novedad.fechaHasta) || desde;
   return Boolean(desde && fechaClave >= desde && fechaClave <= hasta);
+}
+
+export function novedadSolapaRango(novedad, desdeClave, hastaClave) {
+  if (!novedad || novedad.estado === "anulado") return false;
+  const desde = fechaClaveDesdeValor(novedad.fechaDesde);
+  const hasta = fechaClaveDesdeValor(novedad.fechaHasta) || desde;
+  return Boolean(desde && desdeClave && hastaClave && desde <= hastaClave && hasta >= desdeClave);
 }
 
 function ultimaNovedad(novedades, tipo, fechaClave) {

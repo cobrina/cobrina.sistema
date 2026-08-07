@@ -7,9 +7,12 @@ import ObjetivoMensual from "../models/ObjetivoMensual.js";
 import AgendaItem from "../models/AgendaItem.js";
 import StickyNote from "../models/StickyNote.js";
 import Empleado from "../models/Empleado.js";
+import Asistencia from "../models/Asistencia.js";
 import mongoose from "mongoose";
 import { ROLES, normalizeStoredRole } from "../config/roles.js";
 import { transformarGestionEnAcuerdo } from "../services/acuerdosGestionesService.js";
+import { actividadDeUsuarioEnFecha, resumirActividadMensual } from "../utils/actividadGestiones.js";
+import { novedadSolapaRango } from "../utils/calculoAsistencia.js";
 
 function fechaArgentinaPartes() {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -41,6 +44,31 @@ function rangoActual() {
 
 function card(id, label, value, caption, to = "", format = "number") {
   return { id, label, value: Number(value || 0), caption, to, format };
+}
+
+
+function horaArgentina(value) {
+  if (!value) return "";
+  const fecha = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(fecha.getTime())) return "";
+  return new Intl.DateTimeFormat("es-AR", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(fecha);
+}
+
+function resumenFichaje(asistencia) {
+  const marcas = Array.isArray(asistencia?.marcas) ? asistencia.marcas : [];
+  const entradas = marcas.filter((marca) => marca?.tipo === "entrada" && marca?.fecha);
+  const salidas = marcas.filter((marca) => marca?.tipo === "salida" && marca?.fecha);
+  return {
+    ficho: marcas.length > 0,
+    estado: asistencia?.estado || "sin-fichar",
+    entrada: horaArgentina(entradas[0]?.fecha) || "",
+    salida: horaArgentina(salidas[salidas.length - 1]?.fecha) || "",
+  };
 }
 
 function fechaHoraAcuerdo(acuerdo) {
@@ -106,6 +134,84 @@ export async function resumenDashboard(req, res) {
     const ownOnly = [ROLES.OPERADOR, ROLES.OPERADOR_VIP].includes(role);
     const { mes, hoy, day, desdeMes, hastaMes, inicioHoy, finHoy } = rangoActual();
     const now = new Date();
+
+    // Dashboard de operador: prioriza la jornada de HOY y evita consultar/armar
+    // métricas mensuales que el operador no necesita ver. La agenda ya se carga
+    // en su bloque propio del dashboard, por eso tampoco se duplica aquí.
+    if (ownOnly) {
+      const gestionHoyQuery = {
+        fecha: { $gte: inicioHoy, $lte: finHoy },
+        borrado: { $ne: true },
+        usuario: username,
+      };
+      const pagoHoyQuery = {
+        fechaPago: { $gte: inicioHoy, $lte: finHoy },
+        $or: [{ operadorId: userObjectId }, { operadorUsername: username }],
+      };
+
+      const [gestionesHoyRows, pagosHoyAgg, asistenciaHoy, empleadoActual] = await Promise.all([
+        ReporteGestion.find(gestionHoyQuery)
+          .select("dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero createdAt updatedAt")
+          .sort({ hora: 1, _id: 1 })
+          .lean(),
+        Pago.aggregate([
+          { $match: pagoHoyQuery },
+          { $group: { _id: null, cantidad: { $sum: 1 }, monto: { $sum: "$monto" } } },
+        ]),
+        Asistencia.findOne({ empleado: userId, fechaClave: hoy }).select("estado marcas fechaClave").lean(),
+        Empleado.findById(userId).select("horarioLaboral").lean(),
+      ]);
+
+      const actividadHoy = actividadDeUsuarioEnFecha(gestionesHoyRows, hoy).get(username) || {};
+      const acuerdosHoy = gestionesHoyRows.map(transformarGestionEnAcuerdo).filter(Boolean);
+      const pagosHoyCantidad = Number(pagosHoyAgg[0]?.cantidad || 0);
+      const pagosHoyMonto = Number(pagosHoyAgg[0]?.monto || 0);
+      const fichaje = resumenFichaje(asistenciaHoy);
+      const actualizaciones = gestionesHoyRows
+        .map((row) => row?.updatedAt || row?.createdAt)
+        .map((value) => (value ? new Date(value) : null))
+        .filter((value) => value && !Number.isNaN(value.getTime()));
+      const ultimaActualizacion = actualizaciones.length
+        ? horaArgentina(new Date(Math.max(...actualizaciones.map((value) => value.getTime()))))
+        : "";
+
+      const operatorSnapshot = {
+        fecha: hoy,
+        ultimaActualizacionGestiones: ultimaActualizacion,
+        hoy: {
+          gestiones: Number(actividadHoy.gestiones || 0),
+          primeraGestion: actividadHoy.primeraGestion || "—",
+          ultimaGestion: actividadHoy.ultimaGestion || "—",
+          minutosFranja: Number(actividadHoy.minutosFranja || 0),
+          baches30: Number(actividadHoy.baches30 || 0),
+          baches60: Number(actividadHoy.baches60 || 0),
+          bacheMaximoMin: Number(actividadHoy.bacheMaximoMin || 0),
+        },
+        resultadosHoy: {
+          recaudacion: pagosHoyMonto,
+          pagosCantidad: pagosHoyCantidad,
+          acuerdos: acuerdosHoy.length,
+        },
+        asistencia: {
+          fichaje,
+          horario: empleadoActual?.horarioLaboral || {},
+        },
+      };
+
+      return res.json({
+        ok: true,
+        role,
+        mes,
+        cards: [],
+        focus: [],
+        agendaPendientes: [],
+        trelloHoy: [],
+        operatorSnapshot,
+        fuenteActividad: "reporte-gestiones-hoy",
+        fuenteAcuerdos: "reporte-gestiones-hoy",
+      });
+    }
+
     const usuarioFiltro = await filtroUsuariosActivos(ownOnly, username);
 
     const gestionQuery = {
@@ -130,8 +236,11 @@ export async function resumenDashboard(req, res) {
       ...(ownOnly ? { empleadoId: userId } : {}),
     };
 
-    const [gestiones, gestionesAcuerdo, pagosAgg, novedades, agendaPendientes, trelloHoy, objetivosActivos] = await Promise.all([
+    const [gestiones, gestionesActividad, gestionesAcuerdo, pagosAgg, novedades, agendaPendientes, trelloHoy, objetivosActivos] = await Promise.all([
       ReporteGestion.countDocuments(gestionQuery),
+      ownOnly
+        ? ReporteGestion.find(gestionQuery).select("fecha hora usuario").lean()
+        : Promise.resolve([]),
       ReporteGestion.find(acuerdoQuery)
         .select("dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero")
         .sort({ fecha: -1, hora: -1, _id: -1 })
@@ -140,7 +249,7 @@ export async function resumenDashboard(req, res) {
         { $match: pagoQuery },
         { $group: { _id: null, cantidad: { $sum: 1 }, monto: { $sum: "$monto" } } },
       ]),
-      NovedadRRHH.find(novedadQuery).select("tipo empleadoId").lean(),
+      NovedadRRHH.find(novedadQuery).select("tipo empleadoId fechaDesde fechaHasta estado").lean(),
       AgendaItem.find({ propietario: userId, fechaClave: hoy, completada: false })
         .select("hora titulo tipo asignadaPorOtro creadoPorUsername")
         .sort({ hora: 1 })
@@ -159,6 +268,9 @@ export async function resumenDashboard(req, res) {
     ]);
 
     const acuerdos = gestionesAcuerdo.map(transformarGestionEnAcuerdo).filter(Boolean);
+    const desdeMesClave = `${mes}-01`;
+    const hastaMesClave = new Date(hastaMes.getTime() - 1).toISOString().slice(0, 10);
+    const novedadesPeriodo = novedades.filter((item) => novedadSolapaRango(item, desdeMesClave, hastaMesClave));
     const pagosCantidad = Number(pagosAgg[0]?.cantidad || 0);
     const pagosMonto = Number(pagosAgg[0]?.monto || 0);
     const vencidosSinPago = await contarAcuerdosVencidosSinPago({
@@ -168,11 +280,18 @@ export async function resumenDashboard(req, res) {
       username,
       now,
     });
-    const faltas = novedades.filter((item) => ["falta", "falta-justificada"].includes(item.tipo)).length;
-    const tardes = novedades.filter((item) => item.tipo === "llegada-tarde").length;
-    const apercibimientos = novedades.filter((item) => ["apercibimiento", "error-grave-gestion"].includes(item.tipo)).length;
+    const faltas = novedadesPeriodo.filter((item) => ["falta", "falta-justificada"].includes(item.tipo)).length;
+    const tardes = novedadesPeriodo.filter((item) => item.tipo === "llegada-tarde").length;
+    const apercibimientos = novedadesPeriodo.filter((item) => ["apercibimiento", "error-grave-gestion"].includes(item.tipo)).length;
+    const actividadOperador = ownOnly
+      ? (resumirActividadMensual(gestionesActividad).get(username) || {})
+      : {};
+    const actividadHoy = ownOnly
+      ? ((actividadOperador.dias || []).find((item) => item.fechaClave === hoy) || {})
+      : {};
 
     let cards = [];
+    let operatorSnapshot = null;
     let focus = [
       card(
         "agenda-hoy",
@@ -190,17 +309,7 @@ export async function resumenDashboard(req, res) {
       ),
     ];
 
-    if ([ROLES.OPERADOR, ROLES.OPERADOR_VIP].includes(role)) {
-      cards = [
-        card("gestiones", "Gestiones del mes", gestiones, "Tus gestiones cargadas", "/dashboard/proyecciones"),
-        card("acuerdos", "Acuerdos del mes", acuerdos.length, "Detectados en Reporte de gestiones", "/dashboard/proyecciones"),
-        card("vencidos", "Vencidos sin pago", vencidosSinPago, "Para priorizar hoy", "/dashboard/colchon"),
-        card("pagos", "Pagos acreditados", pagosCantidad, `${pagosMonto.toLocaleString("es-AR")} pesos en el mes`, "/dashboard/colchon"),
-        card("agenda", "Pendientes de agenda", agendaPendientes.length, "Tareas personales de hoy", "/dashboard/agenda"),
-        card("trello", "Tareas tipo Trello", trelloHoy.length, "Con vencimiento para hoy", "/controles/notas"),
-      ];
-      focus.push(card("asistencia", "Asistencia del mes", faltas + tardes, `${faltas} faltas · ${tardes} tardanzas`));
-    } else if (role === ROLES.CUOTERO) {
+    if (role === ROLES.CUOTERO) {
       const [colchonResumen, pagosInformados] = await Promise.all([
         Colchon.aggregate([
           { $group: { _id: null, cuotas: { $sum: 1 }, saldo: { $sum: "$saldoPendiente" } } },
@@ -270,6 +379,7 @@ export async function resumenDashboard(req, res) {
       agendaPendientes,
       trelloHoy,
       resumen: { gestiones, acuerdos: acuerdos.length, pagosCantidad, pagosMonto, vencidosSinPago, faltas, tardes },
+      operatorSnapshot,
       fuenteAcuerdos: "reporte-gestiones",
     });
   } catch (error) {
