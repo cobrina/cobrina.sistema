@@ -37,6 +37,108 @@ export function minutosDeHorario(entrada, salida) {
   return Math.max(0, sh * 60 + sm - (eh * 60 + em));
 }
 
+export function minutosHoraHHMM(value) {
+  const match = String(value || "").trim().match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+export function bloquesHorarioDesdeNovedad(novedad = null, base = {}) {
+  const entrada1 = String(novedad?.horaEntradaNueva || base?.entrada || "").trim();
+  const salida1 = String(novedad?.horaSalidaNueva || base?.salida || "").trim();
+  const bloques = minutosDeHorario(entrada1, salida1) > 0
+    ? [{ entrada: entrada1, salida: salida1 }]
+    : [];
+
+  const partida = Boolean(novedad?.jornadaPartidaNueva);
+  const entrada2 = String(novedad?.horaEntradaSegundaNueva || "").trim();
+  const salida2 = String(novedad?.horaSalidaSegundaNueva || "").trim();
+  if (partida && minutosDeHorario(entrada2, salida2) > 0) {
+    bloques.push({ entrada: entrada2, salida: salida2 });
+  }
+  return bloques;
+}
+
+export function minutosEsperadosBloques(bloques = []) {
+  return (Array.isArray(bloques) ? bloques : []).reduce(
+    (total, bloque) => total + minutosDeHorario(bloque?.entrada, bloque?.salida),
+    0
+  );
+}
+
+export function descansoProgramadoSolapadoMin(bloques = [], desdeMin, hastaMin) {
+  if (!Number.isFinite(desdeMin) || !Number.isFinite(hastaMin) || hastaMin <= desdeMin) return 0;
+  const ordenados = (Array.isArray(bloques) ? bloques : [])
+    .map((bloque) => ({
+      inicio: minutosHoraHHMM(bloque?.entrada),
+      fin: minutosHoraHHMM(bloque?.salida),
+    }))
+    .filter((bloque) => Number.isFinite(bloque.inicio) && Number.isFinite(bloque.fin) && bloque.fin > bloque.inicio)
+    .sort((a, b) => a.inicio - b.inicio);
+
+  let descanso = 0;
+  for (let index = 0; index < ordenados.length - 1; index += 1) {
+    const inicioDescanso = ordenados[index].fin;
+    const finDescanso = ordenados[index + 1].inicio;
+    if (finDescanso <= inicioDescanso) continue;
+    const inicio = Math.max(desdeMin, inicioDescanso);
+    const fin = Math.min(hastaMin, finDescanso);
+    if (fin > inicio) descanso += fin - inicio;
+  }
+  return Math.max(0, Math.round(descanso));
+}
+
+// Fuente principal de horas: primera a última gestión del día.
+// Si existe una jornada partida, el descanso programado entre bloques no se
+// considera tiempo trabajado. Las horas extra antes/después de la franja sí
+// quedan visibles porque son actividad elegida por el operador.
+export function minutosActividadSegunHorario(primeraMin, ultimaMin, horario = {}) {
+  if (!Number.isFinite(primeraMin) || !Number.isFinite(ultimaMin) || ultimaMin <= primeraMin) return 0;
+  const bruto = ultimaMin - primeraMin;
+  const descanso = descansoProgramadoSolapadoMin(horario?.bloquesHorario || [], primeraMin, ultimaMin);
+  return Math.max(0, Math.round(bruto - descanso));
+}
+
+export function intervalosAjustadosPorDescanso(intervalos = [], horario = {}) {
+  return (Array.isArray(intervalos) ? intervalos : []).map((intervalo) => {
+    const desdeMin = Number(intervalo?.desdeMin);
+    const hastaMin = Number(intervalo?.hastaMin);
+    const duracionMin = Number.isFinite(desdeMin) && Number.isFinite(hastaMin)
+      ? Math.max(0, hastaMin - desdeMin)
+      : Math.max(0, Number(intervalo?.duracionMin || 0));
+    const descansoMin = Number.isFinite(desdeMin) && Number.isFinite(hastaMin)
+      ? descansoProgramadoSolapadoMin(horario?.bloquesHorario || [], desdeMin, hastaMin)
+      : 0;
+    return {
+      ...intervalo,
+      duracionOriginalMin: Math.round(duracionMin),
+      descansoProgramadoMin: Math.round(descansoMin),
+      duracionMin: Math.max(0, Math.round(duracionMin - descansoMin)),
+    };
+  });
+}
+
+export function minutoDentroDeBloque(minuto, bloques = []) {
+  if (!Number.isFinite(minuto)) return false;
+  return (Array.isArray(bloques) ? bloques : []).some((bloque) => {
+    const inicio = minutosHoraHHMM(bloque?.entrada);
+    const fin = minutosHoraHHMM(bloque?.salida);
+    return Number.isFinite(inicio) && Number.isFinite(fin) && minuto >= inicio && minuto <= fin;
+  });
+}
+
+export function minutoEnDescansoProgramado(minuto, bloques = []) {
+  if (!Number.isFinite(minuto)) return false;
+  const ordenados = (Array.isArray(bloques) ? bloques : [])
+    .map((bloque) => ({ inicio: minutosHoraHHMM(bloque?.entrada), fin: minutosHoraHHMM(bloque?.salida) }))
+    .filter((bloque) => Number.isFinite(bloque.inicio) && Number.isFinite(bloque.fin) && bloque.fin > bloque.inicio)
+    .sort((a, b) => a.inicio - b.inicio);
+  for (let i = 0; i < ordenados.length - 1; i += 1) {
+    if (minuto > ordenados[i].fin && minuto < ordenados[i + 1].inicio) return true;
+  }
+  return false;
+}
+
 export function fechaClaveDesdeValor(value) {
   if (!value) return "";
   if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
@@ -102,8 +204,10 @@ export function horarioEfectivoParaFecha(empleado, fechaClave, novedades = []) {
       licenciaMedica: true,
       cambioHorario: false,
       horarioLibre: modalidad === "libre",
+      jornadaPartida: false,
       entrada: "",
       salida: "",
+      bloquesHorario: [],
       toleranciaMinutos: 0,
       minutosEsperados: 0,
       novedad: licencia,
@@ -117,8 +221,10 @@ export function horarioEfectivoParaFecha(empleado, fechaClave, novedades = []) {
       licenciaMedica: false,
       cambioHorario: false,
       horarioLibre: true,
+      jornadaPartida: false,
       entrada: "",
       salida: "",
+      bloquesHorario: [],
       toleranciaMinutos: 0,
       minutosEsperados: 0,
       novedad: null,
@@ -127,28 +233,34 @@ export function horarioEfectivoParaFecha(empleado, fechaClave, novedades = []) {
   }
 
   const cambio = ultimaNovedad(novedades, "cambio-horario", fechaClave);
-  const entradaCambio = String(cambio?.horaEntradaNueva || "").trim();
-  const salidaCambio = String(cambio?.horaSalidaNueva || "").trim();
-  const tieneCambioValido = Boolean(cambio && minutosDeHorario(entradaCambio, salidaCambio) > 0);
-  const entrada = tieneCambioValido ? entradaCambio : String(base.entrada || "").trim();
-  const salida = tieneCambioValido ? salidaCambio : String(base.salida || "").trim();
+  const bloquesCambio = cambio ? bloquesHorarioDesdeNovedad(cambio, {}) : [];
+  const tieneCambioValido = bloquesCambio.length > 0;
+  const bloquesBase = bloquesHorarioDesdeNovedad(null, base);
+  const bloquesHorario = tieneCambioValido ? bloquesCambio : bloquesBase;
+  const entrada = bloquesHorario[0]?.entrada || "";
+  const salida = bloquesHorario.at(-1)?.salida || "";
   const programado = tieneCambioValido || diasBase.includes(weekday);
-  const minutosEsperados = programado ? minutosDeHorario(entrada, salida) : 0;
+  const minutosEsperados = programado ? minutosEsperadosBloques(bloquesHorario) : 0;
   const toleranciaMinutos = tieneCambioValido
     ? Number(cambio?.toleranciaMinutosNueva ?? base.toleranciaMinutos ?? 10)
     : Number(base.toleranciaMinutos ?? 10);
+  const jornadaPartida = bloquesHorario.length > 1;
 
   return {
     programado: Boolean(programado && minutosEsperados > 0),
     licenciaMedica: false,
     cambioHorario: tieneCambioValido,
     horarioLibre: false,
+    jornadaPartida,
     entrada,
     salida,
+    bloquesHorario,
     toleranciaMinutos: Number.isFinite(toleranciaMinutos) ? toleranciaMinutos : 10,
     minutosEsperados,
     novedad: cambio,
-    etiqueta: minutosEsperados ? `${entrada}–${salida}` : "Sin horario",
+    etiqueta: minutosEsperados
+      ? bloquesHorario.map((bloque) => `${bloque.entrada}–${bloque.salida}`).join(" / ")
+      : "Sin horario",
   };
 }
 

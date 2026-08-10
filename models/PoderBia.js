@@ -12,8 +12,16 @@ const PoderBiaSchema = new mongoose.Schema(
     nombreTitular: { type: String, required: true, trim: true, uppercase: true },
     cartera: { type: String, default: "", trim: true },
     tratamiento: { type: String, enum: ["sr", "sra", ""], default: "", trim: true },
+    // Campos legacy: se conservan para que los poderes históricos sigan leyendo igual.
     tipoProducto: { type: String, default: "", trim: true },
     numeroProducto: { type: String, default: "", trim: true },
+    productos: {
+      type: [{
+        tipoProducto: { type: String, default: "", trim: true },
+        numeroProducto: { type: String, default: "", trim: true },
+      }],
+      default: [],
+    },
     fechaDocumento: { type: Date, required: true, index: true },
     entidadNumero: { type: Number, default: null, index: true },
     entidadNombre: { type: String, default: "", trim: true },

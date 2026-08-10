@@ -6,11 +6,9 @@ import AdelantoRRHH from "../models/AdelantoRRHH.js";
 import ObjetivoMensual from "../models/ObjetivoMensual.js";
 import Empleado from "../models/Empleado.js";
 import Pago from "../models/Pago.js";
-import ReporteGestion from "../models/ReporteGestion.js";
 import Entidad from "../models/Entidad.js";
 import SubCesion from "../models/SubCesion.js";
-import { minutosEsperadosHastaHoy, novedadSolapaRango, rangoMesLocal } from "../utils/calculoAsistencia.js";
-import { resumirActividadMensual } from "../utils/actividadGestiones.js";
+import { novedadSolapaRango, rangoMesLocal } from "../utils/calculoAsistencia.js";
 import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
 import { normalizarEntidadNumero } from "../utils/normalizacionNegocio.js";
 import { ROLES, normalizeStoredRole, normalizeUsername } from "../config/roles.js";
@@ -120,9 +118,25 @@ function validarDatosNovedad(tipo, body, fechaDesde, fechaHasta) {
     if (!horaValida(entrada) || !horaValida(salida)) {
       return "Completá un horario de entrada y salida válido";
     }
-    const [eh, em] = entrada.split(":").map(Number);
-    const [sh, sm] = salida.split(":").map(Number);
-    if (sh * 60 + sm <= eh * 60 + em) return "La hora de salida debe ser posterior a la entrada";
+    const aMinutos = (value) => {
+      const [h, m] = String(value || "").split(":").map(Number);
+      return h * 60 + m;
+    };
+    if (aMinutos(salida) <= aMinutos(entrada)) return "La hora de salida debe ser posterior a la entrada";
+
+    if (Boolean(body.jornadaPartidaNueva)) {
+      const entrada2 = String(body.horaEntradaSegundaNueva || "").trim();
+      const salida2 = String(body.horaSalidaSegundaNueva || "").trim();
+      if (!horaValida(entrada2) || !horaValida(salida2)) {
+        return "Completá el segundo bloque de la jornada partida";
+      }
+      if (aMinutos(salida2) <= aMinutos(entrada2)) {
+        return "La salida del segundo bloque debe ser posterior a su entrada";
+      }
+      if (aMinutos(entrada2) <= aMinutos(salida)) {
+        return "El segundo bloque debe comenzar después de finalizar el primero";
+      }
+    }
   }
   return "";
 }
@@ -183,11 +197,14 @@ export async function crearNovedad(req, res) {
 
     const entradaNueva = tipo === "cambio-horario" ? String(req.body.horaEntradaNueva || "").trim() : "";
     const salidaNueva = tipo === "cambio-horario" ? String(req.body.horaSalidaNueva || "").trim() : "";
+    const jornadaPartidaNueva = tipo === "cambio-horario" && Boolean(req.body.jornadaPartidaNueva);
+    const entradaSegundaNueva = jornadaPartidaNueva ? String(req.body.horaEntradaSegundaNueva || "").trim() : "";
+    const salidaSegundaNueva = jornadaPartidaNueva ? String(req.body.horaSalidaSegundaNueva || "").trim() : "";
     const horarioAnterior = tipo === "cambio-horario"
       ? `${empleado.horarioLaboral?.entrada || ""}-${empleado.horarioLaboral?.salida || ""}`
       : String(req.body.horarioAnterior || "");
     const horarioNuevo = tipo === "cambio-horario"
-      ? `${entradaNueva}-${salidaNueva}`
+      ? `${entradaNueva}-${salidaNueva}${jornadaPartidaNueva ? ` / ${entradaSegundaNueva}-${salidaSegundaNueva}` : ""}`
       : String(req.body.horarioNuevo || "");
 
     const item = await NovedadRRHH.create({
@@ -201,6 +218,9 @@ export async function crearNovedad(req, res) {
       horarioNuevo,
       horaEntradaNueva: entradaNueva,
       horaSalidaNueva: salidaNueva,
+      jornadaPartidaNueva,
+      horaEntradaSegundaNueva: entradaSegundaNueva,
+      horaSalidaSegundaNueva: salidaSegundaNueva,
       toleranciaMinutosNueva: tipo === "cambio-horario"
         ? Math.max(0, Math.min(180, Number(req.body.toleranciaMinutosNueva ?? empleado.horarioLaboral?.toleranciaMinutos ?? 10)))
         : 10,
@@ -255,7 +275,11 @@ export async function actualizarNovedad(req, res) {
       ? String(datosCombinados.motivoApercibimiento || "otro")
       : "";
     if (tipo === "cambio-horario") {
-      update.horarioNuevo = `${datosCombinados.horaEntradaNueva}-${datosCombinados.horaSalidaNueva}`;
+      const partida = Boolean(datosCombinados.jornadaPartidaNueva);
+      update.jornadaPartidaNueva = partida;
+      update.horaEntradaSegundaNueva = partida ? String(datosCombinados.horaEntradaSegundaNueva || "").trim() : "";
+      update.horaSalidaSegundaNueva = partida ? String(datosCombinados.horaSalidaSegundaNueva || "").trim() : "";
+      update.horarioNuevo = `${datosCombinados.horaEntradaNueva}-${datosCombinados.horaSalidaNueva}${partida ? ` / ${update.horaEntradaSegundaNueva}-${update.horaSalidaSegundaNueva}` : ""}`;
       update.toleranciaMinutosNueva = Math.max(0, Math.min(180, Number(datosCombinados.toleranciaMinutosNueva ?? 10)));
     }
 
@@ -783,7 +807,7 @@ export async function resumenEmpleados(req, res) {
     const ids = empleados.map((e) => e._id);
     const usernames = empleados.map((e) => normalizeUsername(e.username)).filter(Boolean);
 
-    const [pagosPorId, pagosPorUsername, gestionesActividad, objetivos, novedades, adelantos] = await Promise.all([
+    const [pagosPorId, pagosPorUsername, objetivos, novedades, adelantos] = await Promise.all([
       Pago.aggregate([
         { $match: { fechaPago: { $gte: desde, $lte: hasta }, operadorId: { $in: ids } } },
         { $group: { _id: "$operadorId", total: { $sum: "$monto" }, cantidad: { $sum: 1 } } },
@@ -802,11 +826,6 @@ export async function resumenEmpleados(req, res) {
         },
         { $group: { _id: "$operadorUsername", total: { $sum: "$monto" }, cantidad: { $sum: 1 } } },
       ]),
-      ReporteGestion.find({
-        fecha: { $gte: desdeNovedades, $lte: hastaNovedades },
-        borrado: { $ne: true },
-        usuario: { $in: usernames },
-      }).select("fecha hora usuario").lean(),
       ObjetivoMensual.find({ mes, alcance: "operador", activo: true }).lean(),
       NovedadRRHH.find({
         empleadoId: { $in: ids },
@@ -821,7 +840,6 @@ export async function resumenEmpleados(req, res) {
 
     const pagoIdMap = new Map(pagosPorId.map((p) => [String(p._id), p]));
     const pagoUserMap = new Map(pagosPorUsername.map((p) => [normalizeUsername(p._id), p]));
-    const actividadMap = resumirActividadMensual(gestionesActividad);
     const novedadesPeriodo = novedades.filter((novedad) => novedadSolapaRango(novedad, desdeClave, hastaClave));
     const objetivoMap = new Map(objetivos.map((o) => [String(o.empleadoId), o]));
 
@@ -832,10 +850,7 @@ export async function resumenEmpleados(req, res) {
       const recaudacion = Number(porId?.total || 0) + Number(porUser?.total || 0);
       const cantidadPagos = Number(porId?.cantidad || 0) + Number(porUser?.cantidad || 0);
       const objetivo = objetivoMap.get(id);
-      const actividad = actividadMap.get(normalizeUsername(empleado.username)) || {};
-      const horasMinutos = Number(actividad.minutosFranja || 0);
       const novedadesEmp = novedadesPeriodo.filter((n) => String(n.empleadoId) === id);
-      const esperados = minutosEsperadosHastaHoy(empleado, mes, novedadesEmp);
       const adelantosEmp = adelantos.filter((a) => String(a.empleadoId) === id);
       const montoAdelantos = adelantosEmp.reduce((sum, a) => sum + Number(a.monto || 0), 0);
       const montoObjetivo = Number(objetivo?.montoObjetivo || 0);
@@ -846,14 +861,6 @@ export async function resumenEmpleados(req, res) {
         objetivo: montoObjetivo,
         porcentajeObjetivo: montoObjetivo > 0 ? Math.round((recaudacion / montoObjetivo) * 1000) / 10 : null,
         llegoObjetivo: montoObjetivo > 0 ? recaudacion >= montoObjetivo : null,
-        minutosTrabajados: horasMinutos,
-        minutosEsperados: esperados,
-        diasConActividad: Number(actividad.diasConActividad || 0),
-        gestionesPeriodo: Number(actividad.gestiones || 0),
-        baches30: Number(actividad.baches30 || 0),
-        baches60: Number(actividad.baches60 || 0),
-        bacheMaximoMin: Number(actividad.bacheMaximoMin || 0),
-        porcentajeHoras: esperados > 0 ? Math.round((horasMinutos / esperados) * 1000) / 10 : null,
         horarioLibre: empleado.horarioLaboral?.modalidad === "libre",
         horarioBase: {
           modalidad: empleado.horarioLaboral?.modalidad === "libre" ? "libre" : "fijo",

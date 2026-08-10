@@ -9,8 +9,18 @@ import Colchon from "../models/Colchon.js";
 import ReporteGestion from "../models/ReporteGestion.js";
 import NovedadRRHH from "../models/NovedadRRHH.js";
 import AcuerdoPago from "../models/AcuerdoPago.js";
-import { horarioEfectivoParaFecha, minutosEsperadosHastaHoy, novedadCubreFecha, rangoMesLocal } from "../utils/calculoAsistencia.js";
-import { actividadDeUsuarioEnFecha, resumirActividadMensual } from "../utils/actividadGestiones.js";
+import {
+  horarioEfectivoParaFecha,
+  minutosEsperadosHastaHoy,
+  novedadCubreFecha,
+  rangoMesLocal,
+  minutosActividadSegunHorario,
+  intervalosAjustadosPorDescanso,
+  minutosHoraHHMM,
+  minutoEnDescansoProgramado,
+  descansoProgramadoSolapadoMin,
+} from "../utils/calculoAsistencia.js";
+import { actividadDeUsuarioEnFecha, horaGestionHHMM, resumirActividadMensual } from "../utils/actividadGestiones.js";
 import { filtrarEmpleadosControlados, usernamesControlados } from "../utils/controlEquipo.js";
 import { normalizeUsername } from "../config/roles.js";
 import { transformarGestionEnAcuerdo } from "../services/acuerdosGestionesService.js";
@@ -66,6 +76,75 @@ function mesesUltimosTres(base = new Date()) {
   return items;
 }
 
+function partesArgentina(fecha = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Argentina/Buenos_Aires",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(fecha);
+  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+}
+
+function minutoActualArgentina(fecha = new Date()) {
+  const values = partesArgentina(fecha);
+  return Number(values.hour || 0) * 60 + Number(values.minute || 0);
+}
+
+function etiquetaNovedadDia(novedad) {
+  const tipo = String(novedad?.tipo || "");
+  if (tipo === "licencia-medica") return "Licencia médica";
+  if (tipo === "falta-justificada") return "Falta justificada";
+  if (tipo === "falta") return "Falta sin justificar";
+  if (tipo === "dia-estudio") return "Día de estudio";
+  if (tipo === "permiso") return "Permiso / ausencia";
+  return "";
+}
+
+function bloquesActividadDia(actividad = {}) {
+  const primera = minutosHoraHHMM(actividad?.primeraGestion);
+  const ultima = minutosHoraHHMM(actividad?.ultimaGestion);
+  if (!Number.isFinite(primera) || !Number.isFinite(ultima)) return [];
+
+  const intervalos = [...(actividad?.intervalos || [])]
+    .filter((item) => Number.isFinite(Number(item?.desdeMin)) && Number.isFinite(Number(item?.hastaMin)))
+    .sort((a, b) => Number(a.desdeMin) - Number(b.desdeMin));
+
+  const bloques = [];
+  let inicio = primera;
+  let fin = primera;
+  for (const intervalo of intervalos) {
+    const desde = Number(intervalo.desdeMin);
+    const hasta = Number(intervalo.hastaMin);
+    const huecoReal = Math.max(0, hasta - desde);
+    if (huecoReal > 30) {
+      bloques.push({
+        desde: horaGestionHHMM(inicio),
+        hasta: horaGestionHHMM(fin),
+        duracionMin: Math.max(5, Math.round(fin - inicio + 5)),
+      });
+      inicio = hasta;
+    }
+    fin = hasta;
+  }
+  bloques.push({
+    desde: horaGestionHHMM(inicio),
+    hasta: horaGestionHHMM(fin),
+    duracionMin: Math.max(5, Math.round(fin - inicio + 5)),
+  });
+  return bloques;
+}
+
+function etiquetaTipoNovedad(tipo) {
+  if (tipo === "cambio-horario") return "Cambio de horario";
+  return etiquetaNovedadDia({ tipo }) || String(tipo || "Novedad");
+}
+
+function fechaClaveNovedad(value) {
+  if (!value) return "";
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 10);
+}
+
 function mapearPagosPorOperador(pagos, empleados) {
   const porId = new Map();
   const porUsername = new Map();
@@ -118,7 +197,7 @@ export async function resumenSupervision(req, res) {
 
     const [pagosTres, objetivos, novedadesRRHH, gestionesActividadPeriodo, gestionesActividadHoy,
       proyeccionesCaidas, colchonSinGestion, pendientesColchon, pendientesProyecciones, ultimaPago,
-      ultimaGestionAcuerdo, ultimaGestion, gestionesAcuerdoPeriodo, pagosHoyAgg, fichadosAhora,
+      ultimaGestionAcuerdo, ultimaGestion, gestionesAcuerdoPeriodo, pagosHoyAgg, pagosHoyDetalle, fichadosAhora,
       jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad] = await Promise.all([
       Pago.find({ fechaPago: { $gte: desdeTres, $lte: hasta } })
         .select("monto fechaPago operadorId operadorUsername entidadId subCesionId")
@@ -178,6 +257,9 @@ export async function resumenSupervision(req, res) {
         { $match: { fechaPago: { $gte: hoyDesde, $lte: hoyHasta } } },
         { $group: { _id: null, total: { $sum: "$monto" }, cantidad: { $sum: 1 } } },
       ]),
+      Pago.find({ fechaPago: { $gte: hoyDesde, $lte: hoyHasta } })
+        .select("monto operadorId operadorUsername")
+        .lean(),
       Asistencia.countDocuments({ empleado: { $in: idsControlados }, fechaClave: hoyClave, estado: "presente" }),
       Asistencia.countDocuments({ empleado: { $in: idsControlados }, fechaClave: { $lt: hoyClave }, estado: "presente" }),
       AcuerdoPago.findOne({ mes: mesSeleccionado })
@@ -213,15 +295,97 @@ export async function resumenSupervision(req, res) {
       novedadesPorEmpleado.get(key).push(novedad);
     }
 
+    const pagosHoyPorOperador = new Map(
+      mapearPagosPorOperador(pagosHoyDetalle || [], empleadosControlados)
+        .map((item) => [normalizeUsername(item.username), Number(item.total || 0)])
+    );
+    const ahoraMinArgentina = minutoActualArgentina();
+
     const operadores = porOperador.map((item) => {
       const empleado = empleadosControlados.find((e) => String(e._id) === String(item.empleadoId));
       const objetivo = objetivosOperador.get(String(item.empleadoId)) || 0;
       const actividad = actividadMensual.get(normalizeUsername(item.username)) || {};
       const actividadDelDia = actividadHoy.get(normalizeUsername(item.username)) || {};
-      const minutos = Number(actividad.minutosFranja || 0);
       const novedadesEmpleado = novedadesPorEmpleado.get(String(item.empleadoId)) || [];
+      const minutos = (actividad.dias || []).reduce((total, dia) => {
+        const horarioDia = horarioEfectivoParaFecha(empleado, dia.fechaClave, novedadesEmpleado);
+        return total + minutosActividadSegunHorario(
+          minutosHoraHHMM(dia.primeraGestion),
+          minutosHoraHHMM(dia.ultimaGestion),
+          horarioDia
+        );
+      }, 0);
       const esperados = minutosEsperadosHastaHoy(empleado, mesSeleccionado, novedadesEmpleado);
       const horarioHoy = horarioEfectivoParaFecha(empleado, hoyClave, novedadesEmpleado);
+      const novedadesDelDia = novedadesEmpleado.filter((novedad) => novedadCubreFecha(novedad, hoyClave));
+      const novedadDia = ["licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"]
+        .map((tipo) => novedadesDelDia.find((novedad) => novedad.tipo === tipo))
+        .find(Boolean) || null;
+      const ausenciaJustificadaHoy = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
+      const primeraMinHoy = minutosHoraHHMM(actividadDelDia.primeraGestion);
+      const ultimaMinHoy = minutosHoraHHMM(actividadDelDia.ultimaGestion);
+      const minutosTrabajadosHoy = minutosActividadSegunHorario(primeraMinHoy, ultimaMinHoy, horarioHoy);
+      const minutosProgramadosHoy = Number(horarioHoy.minutosEsperados || 0);
+      const minutosExigiblesHoy = ausenciaJustificadaHoy ? 0 : minutosProgramadosHoy;
+      const diferenciaHoyMin = minutosExigiblesHoy > 0 ? minutosTrabajadosHoy - minutosExigiblesHoy : null;
+      const faltanHoyMin = minutosExigiblesHoy > 0 ? Math.max(0, minutosExigiblesHoy - minutosTrabajadosHoy) : 0;
+      const extraHoyMin = minutosExigiblesHoy > 0 ? Math.max(0, minutosTrabajadosHoy - minutosExigiblesHoy) : 0;
+      const intervalosHoy = intervalosAjustadosPorDescanso(actividadDelDia.intervalos || [], horarioHoy);
+      const baches30Hoy = intervalosHoy.filter((intervalo) => intervalo.duracionMin > 30).length;
+      const baches60Hoy = intervalosHoy.filter((intervalo) => intervalo.duracionMin > 60).length;
+      const bacheMaximoHoyMin = intervalosHoy.reduce((maximo, intervalo) => Math.max(maximo, Number(intervalo.duracionMin || 0)), 0);
+      const salidaHoyMin = minutosHoraHHMM(horarioHoy.salida);
+      const entradaHoyMin = minutosHoraHHMM(horarioHoy.entrada);
+      const jornadaFinalizadaHoy = horarioHoy.programado && Number.isFinite(salidaHoyMin) && ahoraMinArgentina >= salidaHoyMin;
+      const enDescansoProgramadoHoy = minutoEnDescansoProgramado(ahoraMinArgentina, horarioHoy.bloquesHorario);
+      let minutosSinGestionHoy = null;
+      if (Number.isFinite(ultimaMinHoy) && ahoraMinArgentina >= ultimaMinHoy) {
+        minutosSinGestionHoy = Math.max(0, Math.round(
+          ahoraMinArgentina - ultimaMinHoy - descansoProgramadoSolapadoMin(horarioHoy.bloquesHorario, ultimaMinHoy, ahoraMinArgentina)
+        ));
+      }
+
+      let estadoJornadaHoy = "sin-jornada";
+      let estadoJornadaHoyLabel = horarioHoy.horarioLibre ? "Horario libre" : "Sin jornada hoy";
+      if (novedadDia) {
+        estadoJornadaHoy = novedadDia.tipo === "falta" ? "falta" : "novedad";
+        estadoJornadaHoyLabel = etiquetaNovedadDia(novedadDia);
+      } else if (horarioHoy.horarioLibre) {
+        estadoJornadaHoy = Number(actividadDelDia.gestiones || 0) > 0 ? "en-curso" : "sin-actividad";
+        estadoJornadaHoyLabel = Number(actividadDelDia.gestiones || 0) > 0 ? "Con actividad" : "Sin actividad";
+      } else if (horarioHoy.programado) {
+        if (Number.isFinite(entradaHoyMin) && ahoraMinArgentina < entradaHoyMin) {
+          estadoJornadaHoy = "pendiente";
+          estadoJornadaHoyLabel = "Todavía no inicia";
+        } else if (enDescansoProgramadoHoy) {
+          estadoJornadaHoy = "descanso";
+          estadoJornadaHoyLabel = "Descanso programado";
+        } else if (jornadaFinalizadaHoy) {
+          if (faltanHoyMin > 15) {
+            estadoJornadaHoy = "incompleta";
+            estadoJornadaHoyLabel = `Terminó · faltan ${Math.floor(faltanHoyMin / 60)}h ${faltanHoyMin % 60}m`;
+          } else if (extraHoyMin > 15) {
+            estadoJornadaHoy = "extra";
+            estadoJornadaHoyLabel = `Completa · +${Math.floor(extraHoyMin / 60)}h ${extraHoyMin % 60}m extra voluntaria`;
+          } else {
+            estadoJornadaHoy = "completa";
+            estadoJornadaHoyLabel = "Jornada completa";
+          }
+        } else if (!Number(actividadDelDia.gestiones || 0)) {
+          estadoJornadaHoy = "sin-actividad";
+          estadoJornadaHoyLabel = "Sin gestiones todavía";
+        } else if (Number(minutosSinGestionHoy || 0) > 60) {
+          estadoJornadaHoy = "alerta";
+          estadoJornadaHoyLabel = `Sin gestión hace ${Math.round(minutosSinGestionHoy)} min`;
+        } else if (Number(minutosSinGestionHoy || 0) > 30) {
+          estadoJornadaHoy = "atencion";
+          estadoJornadaHoyLabel = `Pausa actual ${Math.round(minutosSinGestionHoy)} min`;
+        } else {
+          estadoJornadaHoy = "en-curso";
+          estadoJornadaHoyLabel = "En curso";
+        }
+      }
+
       return {
         ...item,
         objetivo,
@@ -237,7 +401,26 @@ export async function resumenSupervision(req, res) {
         primeraGestionHoy: actividadDelDia.primeraGestion || "",
         ultimaGestionHoy: actividadDelDia.ultimaGestion || "",
         gestionesHoy: Number(actividadDelDia.gestiones || 0),
+        minutosTrabajadosHoy,
+        minutosProgramadosHoy,
+        minutosExigiblesHoy,
+        diferenciaHoyMin,
+        faltanHoyMin,
+        extraHoyMin,
+        baches30Hoy,
+        baches60Hoy,
+        bacheMaximoHoyMin,
+        minutosSinGestionHoy,
+        jornadaFinalizadaHoy,
+        enDescansoProgramadoHoy,
+        estadoJornadaHoy,
+        estadoJornadaHoyLabel,
+        novedadHoyTipo: novedadDia?.tipo || "",
+        novedadHoyDescripcion: novedadDia?.descripcion || "",
+        recaudadoHoy: pagosHoyPorOperador.get(normalizeUsername(item.username)) || 0,
         horarioHoy: horarioHoy.etiqueta,
+        bloquesHorarioHoy: horarioHoy.bloquesHorario || [],
+        bloquesActividadHoy: bloquesActividadDia(actividadDelDia),
         horarioModificadoHoy: horarioHoy.cambioHorario,
         licenciaMedicaHoy: horarioHoy.licenciaMedica,
         horarioLibre: horarioHoy.horarioLibre,
@@ -389,7 +572,11 @@ export async function resumenSupervision(req, res) {
       .filter((novedad) => novedad.tipo === "cambio-horario")
       .map((novedad) => {
         const empleado = empleadoDeNovedad(novedad) || {};
-        const horario = [novedad.horaEntradaNueva, novedad.horaSalidaNueva].filter(Boolean).join(" a ");
+        const primerBloque = [novedad.horaEntradaNueva, novedad.horaSalidaNueva].filter(Boolean).join(" a ");
+        const segundoBloque = novedad.jornadaPartidaNueva
+          ? [novedad.horaEntradaSegundaNueva, novedad.horaSalidaSegundaNueva].filter(Boolean).join(" a ")
+          : "";
+        const horario = [primerBloque, segundoBloque].filter(Boolean).join(" / ");
         return { empleadoId: novedad.empleadoId, username: empleado.username || "", nombre: empleado.nombre || "", horario: horario || "Horario especial" };
       });
     const licenciasMedicasHoy = novedadesHoy
@@ -412,6 +599,37 @@ export async function resumenSupervision(req, res) {
         };
       });
     const faltasHoy = ausenciasHoy.filter((item) => ["falta", "falta-justificada"].includes(item.tipo));
+    const historialRRHH = [...novedadesRRHH]
+      .filter((novedad) => {
+        const inicio = fechaClaveNovedad(novedad.fechaDesde);
+        const fin = fechaClaveNovedad(novedad.fechaHasta);
+        if (!inicio) return false;
+        if (!fin) return inicio >= desdeClave && inicio <= hastaClave;
+        return inicio <= hastaClave && fin >= desdeClave;
+      })
+      .sort((a, b) => new Date(b.fechaDesde || b.createdAt || 0) - new Date(a.fechaDesde || a.createdAt || 0))
+      .slice(0, 18)
+      .map((novedad) => {
+        const empleado = empleadoDeNovedad(novedad) || {};
+        const primerBloque = [novedad.horaEntradaNueva, novedad.horaSalidaNueva].filter(Boolean).join(" a ");
+        const segundoBloque = novedad.jornadaPartidaNueva
+          ? [novedad.horaEntradaSegundaNueva, novedad.horaSalidaSegundaNueva].filter(Boolean).join(" a ")
+          : "";
+        const horario = [primerBloque, segundoBloque].filter(Boolean).join(" / ");
+        return {
+          id: String(novedad._id || ""),
+          empleadoId: novedad.empleadoId,
+          username: empleado.username || "",
+          nombre: empleado.nombre || "",
+          tipo: novedad.tipo,
+          tipoLabel: etiquetaTipoNovedad(novedad.tipo),
+          fechaDesde: fechaClaveNovedad(novedad.fechaDesde),
+          fechaHasta: fechaClaveNovedad(novedad.fechaHasta),
+          descripcion: novedad.descripcion || "",
+          horario,
+          justificado: Boolean(novedad.justificado || novedad.tipo === "falta-justificada"),
+        };
+      });
     const conGestionesHoy = actividadHoy.size;
 
     return res.json({
@@ -452,6 +670,7 @@ export async function resumenSupervision(req, res) {
         licenciasMedicasHoy,
         faltasHoy,
         ausenciasHoy,
+        historialRRHH,
       },
       acuerdos: {
         total: acuerdosValidos.length,

@@ -51,14 +51,38 @@ function prepararDescarga(res, registro, filename) {
   res.setHeader("X-Cobrina-Document-Id", String(registro._id));
 }
 
+function normalizarProductos(body = {}) {
+  const recibidos = Array.isArray(body.productos) ? body.productos : [];
+  const productos = recibidos
+    .map((item) => ({
+      tipoProducto: String(item?.tipoProducto || item?.tipo || "").trim(),
+      numeroProducto: String(item?.numeroProducto || item?.numero || "").trim().toUpperCase(),
+    }))
+    .filter((item) => item.tipoProducto || item.numeroProducto);
+
+  // Compatibilidad con el frontend histórico que enviaba un único producto.
+  if (!productos.length && (body.tipoProducto || body.numeroProducto)) {
+    productos.push({
+      tipoProducto: String(body.tipoProducto || "").trim(),
+      numeroProducto: String(body.numeroProducto || "").trim().toUpperCase(),
+    });
+  }
+  return productos;
+}
+
 export async function generarPoderBia(req, res) {
   try {
     const dni = normalizarDni(req.body.dni);
     const nombreTitular = String(req.body.nombreTitular || "").trim().toUpperCase();
     const cartera = String(req.body.cartera || "").trim();
+    const productos = normalizarProductos(req.body);
+    const primerProducto = productos[0] || {};
     const fechaDocumento = req.body.fechaDocumento ? new Date(req.body.fechaDocumento) : new Date();
+    const productosInvalidos = productos.some((item) => !item.tipoProducto || !item.numeroProducto);
 
-    if (!dni || !nombreTitular || !cartera || Number.isNaN(fechaDocumento.getTime())) {
+    // Compatibilidad: un frontend anterior de BIA podía no enviar productos.
+    // El frontend nuevo los exige, pero el backend no rompe solicitudes históricas.
+    if (!dni || !nombreTitular || !cartera || productosInvalidos || Number.isNaN(fechaDocumento.getTime())) {
       return res.status(400).json({ error: "Completá DNI, titular, cartera y una fecha válida" });
     }
 
@@ -67,6 +91,10 @@ export async function generarPoderBia(req, res) {
       dni,
       nombreTitular,
       cartera,
+      // Compatibilidad histórica: el primer producto también queda en los campos legacy.
+      tipoProducto: primerProducto.tipoProducto,
+      numeroProducto: primerProducto.numeroProducto,
+      productos,
       fechaDocumento,
       entidadNumero: 54,
       entidadNombre: "GRUPO BIA",
@@ -109,9 +137,33 @@ export async function generarPoderBia(req, res) {
     doc.font("Helvetica-Bold").text("Propuesta de Prestación de Servicios de Agencia de Cobranzas", { continued: true });
     doc.font("Helvetica").text(", aceptada por BIA S.R.L. en calidad de titular.");
 
-    doc.image(firmaLucasPath, pageWidth / 2 - 85, 585, { width: 170, height: 69 });
-    doc.font("Helvetica").fontSize(11).text("Lucas Coronel", 0, 658, { align: "center" });
-    doc.text("Administrador", 0, 674, { align: "center" });
+    if (productos.length) {
+      const productosY = doc.y + 12;
+      if (productos.length === 1) {
+        const item = productos[0];
+        doc.font("Helvetica").fontSize(10.5).text("La gestión comprende el producto ", left, productosY, { width: bodyWidth, continued: true, lineGap: 3 });
+        doc.font("Helvetica-Bold").text(item.tipoProducto.toUpperCase(), { continued: true });
+        doc.font("Helvetica").text(", N° ", { continued: true });
+        doc.font("Helvetica-Bold").text(`${item.numeroProducto}.`);
+      } else {
+        doc.font("Helvetica").fontSize(10.5).text("La gestión comprende los siguientes productos:", left, productosY, { width: bodyWidth, lineGap: 3 });
+        productos.forEach((item, index) => {
+          doc.font("Helvetica").text(`${index + 1}. `, left + 18, doc.y + 4, { width: bodyWidth - 18, continued: true, lineGap: 2 });
+          doc.font("Helvetica-Bold").text(item.tipoProducto.toUpperCase(), { continued: true });
+          doc.font("Helvetica").text(" · N° ", { continued: true });
+          doc.font("Helvetica-Bold").text(item.numeroProducto);
+        });
+      }
+    }
+
+    let firmaY = Math.max(585, doc.y + 28);
+    if (firmaY > 665) {
+      doc.addPage();
+      firmaY = 500;
+    }
+    doc.image(firmaLucasPath, pageWidth / 2 - 85, firmaY, { width: 170, height: 69 });
+    doc.font("Helvetica").fontSize(11).text("Lucas Coronel", 0, firmaY + 73, { align: "center" });
+    doc.text("Administrador", 0, firmaY + 89, { align: "center" });
     doc.end();
   } catch (error) {
     console.error("Generar poder BIA:", error);
@@ -125,13 +177,14 @@ export async function generarPoderGreenLight(req, res) {
     const dni = normalizarDni(req.body.dni);
     const nombreTitular = String(req.body.nombreTitular || "").trim().toUpperCase();
     const cartera = String(req.body.cartera || "").trim().toUpperCase();
-    const tipoProducto = String(req.body.tipoProducto || "").trim();
-    const numeroProducto = String(req.body.numeroProducto || "").trim().toUpperCase();
+    const productos = normalizarProductos(req.body);
+    const primerProducto = productos[0] || {};
     const fechaDocumento = req.body.fechaDocumento ? new Date(req.body.fechaDocumento) : new Date();
 
-    if (!dni || !nombreTitular || !cartera || !tipoProducto || !numeroProducto || Number.isNaN(fechaDocumento.getTime())) {
+    const productosInvalidos = productos.some((item) => !item.tipoProducto || !item.numeroProducto);
+    if (!dni || !nombreTitular || !cartera || !productos.length || productosInvalidos || Number.isNaN(fechaDocumento.getTime())) {
       return res.status(400).json({
-        error: "Completá nombre, DNI, cartera, tipo de producto, número de producto y una fecha válida",
+        error: "Completá nombre, DNI, cartera y al menos un tipo + número de producto",
       });
     }
 
@@ -141,8 +194,10 @@ export async function generarPoderGreenLight(req, res) {
       nombreTitular,
       tratamiento: "",
       cartera,
-      tipoProducto,
-      numeroProducto,
+      // Se conservan los campos legacy con el primer producto.
+      tipoProducto: primerProducto.tipoProducto,
+      numeroProducto: primerProducto.numeroProducto,
+      productos,
       fechaDocumento,
       entidadNombre: "GREEN LIGHT - BRUBANK",
       creadoPor: req.user.id,
@@ -183,17 +238,43 @@ export async function generarPoderGreenLight(req, res) {
     doc.font("Helvetica-Bold").text(`${dni}.`);
 
     const y2 = doc.y + 24;
-    doc.font("Helvetica").text("Dicha obligación corresponde a un ", left, y2, { width: bodyWidth, align: "justify", continued: true, lineGap: 5 });
-    doc.font("Helvetica-Bold").text(tipoProducto.toUpperCase(), { continued: true });
-    doc.font("Helvetica").text(", número de producto N° ", { continued: true });
-    doc.font("Helvetica-Bold").text(numeroProducto, { continued: true });
-    doc.font("Helvetica").text(" originado en ", { continued: true });
-    doc.font("Helvetica-Bold").text(cartera, { continued: true });
-    doc.font("Helvetica").text("; siendo SW Invest (SWI) administrador y tenedor.");
+    if (productos.length === 1) {
+      const item = productos[0];
+      doc.font("Helvetica").text("Dicha obligación corresponde a un ", left, y2, { width: bodyWidth, align: "justify", continued: true, lineGap: 5 });
+      doc.font("Helvetica-Bold").text(item.tipoProducto.toUpperCase(), { continued: true });
+      doc.font("Helvetica").text(", número de producto N° ", { continued: true });
+      doc.font("Helvetica-Bold").text(item.numeroProducto, { continued: true });
+      doc.font("Helvetica").text(" originado en ", { continued: true });
+      doc.font("Helvetica-Bold").text(cartera, { continued: true });
+      doc.font("Helvetica").text("; siendo SW Invest (SWI) administrador y tenedor.");
+    } else {
+      doc.font("Helvetica").text(
+        "Dichas obligaciones corresponden a los siguientes productos:",
+        left,
+        y2,
+        { width: bodyWidth, align: "justify", lineGap: 5 }
+      );
+      productos.forEach((item, index) => {
+        doc.font("Helvetica").text(`${index + 1}. `, left + 18, doc.y + 5, { continued: true, width: bodyWidth - 18, lineGap: 3 });
+        doc.font("Helvetica-Bold").text(item.tipoProducto.toUpperCase(), { continued: true });
+        doc.font("Helvetica").text(" · N° ", { continued: true });
+        doc.font("Helvetica-Bold").text(item.numeroProducto);
+      });
+      doc.moveDown(0.6);
+      doc.font("Helvetica").text("Todos originados en ", left, doc.y, { width: bodyWidth, continued: true, lineGap: 5 });
+      doc.font("Helvetica-Bold").text(cartera, { continued: true });
+      doc.font("Helvetica").text("; siendo SW Invest (SWI) administrador y tenedor.");
+    }
 
-    doc.image(firmaBravoPath, pageWidth - 250, 610, { fit: [170, 105], align: "center", valign: "center" });
-    doc.font("Helvetica").fontSize(10.5).text("Saluda atentamente", pageWidth - 258, 720, { width: 180, align: "center" });
-    doc.text("Apoderado", pageWidth - 258, 736, { width: 180, align: "center" });
+    // La firma baja si se agregan varios productos para evitar superposiciones.
+    let firmaY = Math.max(610, doc.y + 45);
+    if (firmaY > 670) {
+      doc.addPage();
+      firmaY = 505;
+    }
+    doc.image(firmaBravoPath, pageWidth - 250, firmaY, { fit: [170, 105], align: "center", valign: "center" });
+    doc.font("Helvetica").fontSize(10.5).text("Saluda atentamente", pageWidth - 258, firmaY + 110, { width: 180, align: "center" });
+    doc.text("Apoderado", pageWidth - 258, firmaY + 126, { width: 180, align: "center" });
     doc.end();
   } catch (error) {
     console.error("Generar poder Green Light:", error);

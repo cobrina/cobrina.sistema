@@ -48,8 +48,13 @@ export function resumirGestionesPorUsuarioYDia(rows = []) {
     const primera = minutosOrdenados[0];
     const ultima = minutosOrdenados[minutosOrdenados.length - 1];
     const gaps = [];
+    const intervalos = [];
     for (let i = 1; i < minutosOrdenados.length; i += 1) {
-      gaps.push(Math.max(0, minutosOrdenados[i] - minutosOrdenados[i - 1]));
+      const desdeMin = minutosOrdenados[i - 1];
+      const hastaMin = minutosOrdenados[i];
+      const duracionMin = Math.max(0, hastaMin - desdeMin);
+      gaps.push(duracionMin);
+      intervalos.push({ desdeMin, hastaMin, duracionMin });
     }
     const resumenDia = {
       fechaClave: grupo.fechaClave,
@@ -60,6 +65,7 @@ export function resumirGestionesPorUsuarioYDia(rows = []) {
       baches30: gaps.filter((gap) => gap > 30).length,
       baches60: gaps.filter((gap) => gap > 60).length,
       bacheMaximoMin: gaps.length ? Math.round(Math.max(...gaps)) : 0,
+      intervalos,
     };
 
     if (!porUsuario.has(grupo.username)) porUsuario.set(grupo.username, []);

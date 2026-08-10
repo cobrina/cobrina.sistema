@@ -3,7 +3,15 @@ import Asistencia from "../models/Asistencia.js";
 import Empleado from "../models/Empleado.js";
 import NovedadRRHH from "../models/NovedadRRHH.js";
 import ReporteGestion from "../models/ReporteGestion.js";
-import { horarioEfectivoParaFecha, novedadCubreFecha } from "../utils/calculoAsistencia.js";
+import {
+  horarioEfectivoParaFecha,
+  novedadCubreFecha,
+  minutosActividadSegunHorario,
+  intervalosAjustadosPorDescanso,
+  minutosHoraHHMM,
+  minutoEnDescansoProgramado,
+  descansoProgramadoSolapadoMin,
+} from "../utils/calculoAsistencia.js";
 import { actividadDeUsuarioEnFecha } from "../utils/actividadGestiones.js";
 import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
 import { normalizeUsername } from "../config/roles.js";
@@ -29,6 +37,11 @@ function partesArgentina(fecha = new Date()) {
 function fechaClaveArgentina(fecha = new Date()) {
   const values = partesArgentina(fecha);
   return `${values.year}-${values.month}-${values.day}`;
+}
+
+function minutoActualArgentina(fecha = new Date()) {
+  const values = partesArgentina(fecha);
+  return Number(values.hour || 0) * 60 + Number(values.minute || 0);
 }
 
 function minutosArgentina(fecha = new Date()) {
@@ -441,6 +454,30 @@ export async function panel(req, res) {
       const novedadDia = prioridadNovedad
         .map((tipo) => novedadesDelDia.find((novedad) => novedad.tipo === tipo))
         .find(Boolean) || null;
+      const primeraMin = minutosHoraHHMM(actividad?.primeraGestion);
+      const ultimaMin = minutosHoraHHMM(actividad?.ultimaGestion);
+      const minutosTrabajadosHoy = minutosActividadSegunHorario(primeraMin, ultimaMin, horarioEfectivo);
+      const intervalosAjustados = intervalosAjustadosPorDescanso(actividad?.intervalos || [], horarioEfectivo);
+      const baches30Ajustados = intervalosAjustados.filter((intervalo) => intervalo.duracionMin > 30).length;
+      const baches60Ajustados = intervalosAjustados.filter((intervalo) => intervalo.duracionMin > 60).length;
+      const bacheMaximoAjustado = intervalosAjustados.reduce((maximo, intervalo) => Math.max(maximo, Number(intervalo.duracionMin || 0)), 0);
+      const ausenciaJustificada = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
+      const minutosProgramadosHoy = Number(horarioEfectivo.minutosEsperados || 0);
+      const minutosExigiblesHoy = ausenciaJustificada ? 0 : minutosProgramadosHoy;
+      const diferenciaHoyMin = minutosExigiblesHoy > 0 ? minutosTrabajadosHoy - minutosExigiblesHoy : null;
+      const esHoy = fechaClave === fechaClaveArgentina();
+      const ahoraMin = esHoy ? minutoActualArgentina() : null;
+      const salidaProgramadaMin = minutosHoraHHMM(horarioEfectivo.salida);
+      const jornadaFinalizada = horarioEfectivo.programado && Number.isFinite(salidaProgramadaMin)
+        ? (esHoy ? ahoraMin >= salidaProgramadaMin : fechaClave < fechaClaveArgentina())
+        : false;
+      const enDescansoProgramado = esHoy && minutoEnDescansoProgramado(ahoraMin, horarioEfectivo.bloquesHorario);
+      let minutosSinGestion = null;
+      if (esHoy && Number.isFinite(ultimaMin) && Number.isFinite(ahoraMin) && ahoraMin >= ultimaMin) {
+        minutosSinGestion = Math.max(0, Math.round(
+          ahoraMin - ultimaMin - descansoProgramadoSolapadoMin(horarioEfectivo.bloquesHorario, ultimaMin, ahoraMin)
+        ));
+      }
 
       return {
         _id: empleado._id,
@@ -452,20 +489,29 @@ export async function panel(req, res) {
         horarioEfectivo: {
           entrada: horarioEfectivo.entrada,
           salida: horarioEfectivo.salida,
+          bloquesHorario: horarioEfectivo.bloquesHorario || [],
+          jornadaPartida: horarioEfectivo.jornadaPartida,
           toleranciaMinutos: horarioEfectivo.toleranciaMinutos,
           etiqueta: horarioEfectivo.etiqueta,
           cambioTemporal: horarioEfectivo.cambioHorario,
           licenciaMedica: horarioEfectivo.licenciaMedica,
           horarioLibre: horarioEfectivo.horarioLibre,
+          minutosProgramadosHoy,
+          minutosExigiblesHoy,
         },
         actividadGestiones: {
           primeraGestion: actividad?.primeraGestion || "",
           ultimaGestion: actividad?.ultimaGestion || "",
           minutosFranja: Number(actividad?.minutosFranja || 0),
+          minutosTrabajadosHoy,
+          diferenciaHoyMin,
+          jornadaFinalizada,
+          enDescansoProgramado,
+          minutosSinGestion,
           gestiones: Number(actividad?.gestiones || 0),
-          baches30: Number(actividad?.baches30 || 0),
-          baches60: Number(actividad?.baches60 || 0),
-          bacheMaximoMin: Number(actividad?.bacheMaximoMin || 0),
+          baches30: baches30Ajustados,
+          baches60: baches60Ajustados,
+          bacheMaximoMin: bacheMaximoAjustado,
         },
         novedadDia: novedadDia
           ? {

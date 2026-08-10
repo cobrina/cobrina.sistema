@@ -8,6 +8,7 @@ import Entidad from "../models/Entidad.js";
 import Pago from "../models/Pago.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
 import { invalidateCalidadCache } from "./calidadGestionesController.js";
+import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
 import {
   transformarGestionEnAcuerdo,
   resumirAcuerdos,
@@ -763,10 +764,11 @@ export async function catalogos(req, res) {
 
     throwIfAborted(req);
 
-    const empleadosActivos = await Empleado.find({ isActive: true })
+    const empleadosActivosTodos = await Empleado.find({ isActive: true })
       .select("username nombre role horarioLaboral.modalidad horarioLaboral.entrada horarioLaboral.salida")
       .sort({ username: 1 })
       .lean();
+    const empleadosActivos = filtrarEmpleadosControlados(empleadosActivosTodos);
     const operadores = empleadosActivos.map((e) => String(e.username || ""));
     const operadoresDetalle = empleadosActivos
       .map((empleado) => ({

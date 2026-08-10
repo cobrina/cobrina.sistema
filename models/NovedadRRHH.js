@@ -55,6 +55,22 @@ const NovedadRRHHSchema = new mongoose.Schema(
       trim: true,
       match: [/^$|^([01]\d|2[0-3]):[0-5]\d$/, "Hora de salida inválida"],
     },
+    // Una excepción de horario puede dividir la jornada en dos bloques.
+    // Los campos anteriores siguen siendo el primer bloque para conservar
+    // compatibilidad con todas las novedades históricas.
+    jornadaPartidaNueva: { type: Boolean, default: false },
+    horaEntradaSegundaNueva: {
+      type: String,
+      default: "",
+      trim: true,
+      match: [/^$|^([01]\d|2[0-3]):[0-5]\d$/, "Hora de segunda entrada inválida"],
+    },
+    horaSalidaSegundaNueva: {
+      type: String,
+      default: "",
+      trim: true,
+      match: [/^$|^([01]\d|2[0-3]):[0-5]\d$/, "Hora de segunda salida inválida"],
+    },
     toleranciaMinutosNueva: { type: Number, default: 10, min: 0, max: 180 },
     minutosTarde: { type: Number, default: 0, min: 0 },
     justificado: { type: Boolean, default: false },
