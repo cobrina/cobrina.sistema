@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { fechaClaveArgentina, toDateOnly } from "../utils/fecha.util.js";
 
 const AdelantoRRHHSchema = new mongoose.Schema(
   {
@@ -8,7 +9,7 @@ const AdelantoRRHHSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
-    fechaSolicitud: { type: Date, required: true, default: Date.now, index: true },
+    fechaSolicitud: { type: Date, required: true, default: () => toDateOnly(fechaClaveArgentina()), index: true },
     monto: { type: Number, required: true, min: 0.01 },
     motivo: { type: String, required: true, trim: true, maxlength: 1000 },
     estado: {

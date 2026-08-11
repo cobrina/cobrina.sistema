@@ -5,26 +5,30 @@ import {
   normalizarEntidadNumero,
   normalizarSubCesionId,
 } from "../utils/normalizacionNegocio.js";
+import {
+  claveFechaCalendario,
+  fechaClaveArgentina,
+  finDiaCalendarioUTC,
+  inicioDiaCalendarioUTC,
+} from "../utils/fecha.util.js";
 
 function inicioDia(valor) {
-  if (!valor) return null;
-  const d = new Date(valor);
-  if (Number.isNaN(d.getTime())) return null;
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
+  return inicioDiaCalendarioUTC(valor);
 }
 
 function finDia(valor) {
-  const d = inicioDia(valor);
-  if (!d) return null;
-  d.setHours(23, 59, 59, 999);
-  return d;
+  return finDiaCalendarioUTC(valor);
 }
 
-export function rangoMesVigente(fecha = new Date()) {
-  const base = new Date(fecha);
+export function rangoMesVigente(fecha = null) {
+  const key = fecha == null
+    ? fechaClaveArgentina()
+    : (fecha instanceof Date ? fechaClaveArgentina(fecha) : claveFechaCalendario(fecha));
+  if (!key) return { desde: null, hasta: null };
+  const [y, m] = key.split("-").map(Number);
   return {
-    desde: new Date(base.getFullYear(), base.getMonth(), 1, 0, 0, 0, 0),
-    hasta: new Date(base.getFullYear(), base.getMonth() + 1, 0, 23, 59, 59, 999),
+    desde: new Date(Date.UTC(y, m - 1, 1)),
+    hasta: new Date(Date.UTC(y, m, 1) - 1),
   };
 }
 

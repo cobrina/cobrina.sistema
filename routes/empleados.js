@@ -17,6 +17,7 @@ import {
   isDesignatedSuperAdmin,
   normalizeAssignableRole,
 } from "../config/roles.js";
+import { fechaClaveArgentina, inicioDiaCalendarioUTC, finDiaCalendarioUTC } from "../utils/fecha.util.js";
 
 const router = express.Router();
 const gestoresUsuarios = [verifyToken, permitirModulos("usuarios")];
@@ -206,10 +207,9 @@ router.get("/paginated", ...gestoresUsuarios, async (req, res) => {
       Empleado.find(filtro).select("-password").sort({ username: 1 }).skip(skip).limit(limit).lean(),
     ]);
 
-    const hoy = new Date();
-    const hoyClave = `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, "0")}-${String(hoy.getDate()).padStart(2, "0")}`;
-    const hoyDesde = new Date(`${hoyClave}T00:00:00.000Z`);
-    const hoyHasta = new Date(`${hoyClave}T23:59:59.999Z`);
+    const hoyClave = fechaClaveArgentina();
+    const hoyDesde = inicioDiaCalendarioUTC(hoyClave);
+    const hoyHasta = finDiaCalendarioUTC(hoyClave);
     const licencias = empleados.length
       ? await NovedadRRHH.find({
           empleadoId: { $in: empleados.map((empleado) => empleado._id) },

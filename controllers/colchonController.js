@@ -18,6 +18,13 @@ import { resolverEntidadCanonica } from "../utils/normalizacionNegocio.js";
 import { buscarPagosMesVigente } from "../services/vinculacionPagosService.js";
 import ReporteGestion from "../models/ReporteGestion.js";
 import { PAGOS_FUENTE_UNICA_ACTIVA } from "../config/features.js";
+import {
+  claveFechaCalendario,
+  fechaClaveArgentina,
+  inicioDiaCalendarioUTC,
+  mesClaveArgentina,
+  toDateOnly,
+} from "../utils/fecha.util.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -80,14 +87,7 @@ const normalizarTurno = (value) => {
   return "";
 };
 
-const claveFechaPago = (value) => {
-  if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(
-    date.getDate()
-  ).padStart(2, "0")}`;
-};
+const claveFechaPago = (value) => claveFechaCalendario(value);
 
 const montoEnCentavos = (value) => Math.round(Number(value || 0) * 100);
 
@@ -912,15 +912,15 @@ export const importarExcel = async (req, res) => {
         "Cuota 90": 4,
         Caída: 5,
       };
-      const hoy = new Date();
+      const [anioHoy, mesHoy] = mesClaveArgentina().split("-").map(Number);
       const deudaMeses = meses[cuota.estadoOriginal] || 1;
       cuota.deudaPorMes = [];
 
       for (let i = deudaMeses - 1; i >= 0; i--) {
-        const fecha = new Date(hoy.getFullYear(), hoy.getMonth() - i, 1);
+        const fecha = new Date(Date.UTC(anioHoy, mesHoy - 1 - i, 1));
         cuota.deudaPorMes.push({
-          mes: fecha.toLocaleString("es-AR", { month: "long" }),
-          anio: fecha.getFullYear(),
+          mes: fecha.toLocaleString("es-AR", { month: "long", timeZone: "UTC" }),
+          anio: fecha.getUTCFullYear(),
           montoAdeudado: cuota.importeCuota,
         });
       }
@@ -1387,11 +1387,11 @@ export const agregarPago = async (req, res) => {
     }
     const { id } = req.params;
     const montoNum = Number(req.body.monto);
-    const fechaObj = new Date(req.body.fecha);
+    const fechaObj = inicioDiaCalendarioUTC(toDateOnly(req.body.fecha));
     if (!Number.isFinite(montoNum) || montoNum <= 0) {
       return res.status(400).json({ error: "Monto inválido (debe ser > 0)." });
     }
-    if (Number.isNaN(fechaObj.getTime())) {
+    if (!fechaObj) {
       return res.status(400).json({ error: "Fecha inválida." });
     }
 
@@ -1443,8 +1443,8 @@ export const informarPago = async (req, res) => {
       return res.status(400).json({ error: "Monto inválido (debe ser > 0)." });
     }
 
-    const fechaObj = new Date(fecha);
-    if (isNaN(fechaObj.getTime())) {
+    const fechaObj = inicioDiaCalendarioUTC(toDateOnly(fecha));
+    if (!fechaObj) {
       return res.status(400).json({ error: "Fecha inválida." });
     }
 
@@ -1586,7 +1586,7 @@ export const obtenerPagosInformadosPendientes = async (req, res) => {
 
 // 🔁 Actualiza deudaPorMes y saldoPendiente respetando estadoOriginal
 export const actualizarDeudaPorMes = (cuota) => {
-  const hoy = new Date();
+  const [anioHoy, mesHoy] = mesClaveArgentina().split("-").map(Number);
   const importe = Number(cuota.importeCuota || 0);
 
   const mesesSegunEstado = {
@@ -1602,10 +1602,10 @@ export const actualizarDeudaPorMes = (cuota) => {
   // construir la cola de deuda (de la más vieja a la más nueva)
   const deudaPorMes = [];
   for (let i = cantidadMeses - 1; i >= 0; i--) {
-    const f = new Date(hoy.getFullYear(), hoy.getMonth() - i, 1);
+    const f = new Date(Date.UTC(anioHoy, mesHoy - 1 - i, 1));
     deudaPorMes.push({
-      mes: String(f.getMonth() + 1),
-      anio: f.getFullYear(),
+      mes: String(f.getUTCMonth() + 1),
+      anio: f.getUTCFullYear(),
       montoAdeudado: importe,
     });
   }
@@ -1924,44 +1924,24 @@ export const importarPagosDesdeExcel = async (req, res) => {
       });
     }
 
-    // ——— Helpers para fechas ———
-    // Convierte un Date (posiblemente en UTC) a medianoche local del mismo día calendario
-    const aMedianocheLocal = (d) =>
-      new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0);
-
-    // Parse flexible: Date | "dd/mm/yyyy" | "yyyy-mm-dd" | ISO → Date (00:00 local)
+    // ——— Helpers para fechas calendario ———
+    // Pago.fecha representa un día, no un instante. Se conserva siempre YYYY-MM-DD.
     const parseFechaLocalFlexible = (valor) => {
-      if (valor instanceof Date) {
-        return aMedianocheLocal(valor);
-      }
-      if (typeof valor === "string") {
-        const s = valor.trim();
-        let dd, mm, yyyy, m;
+      if (valor == null || valor === "") return null;
+      if (valor instanceof Date) return inicioDiaCalendarioUTC(valor);
 
-        if ((m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/))) {
-          [, dd, mm, yyyy] = m;
-          return new Date(+yyyy, +mm - 1, +dd, 0, 0, 0);
-        }
-        if ((m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/))) {
-          [, yyyy, mm, dd] = m;
-          return new Date(+yyyy, +mm - 1, +dd, 0, 0, 0);
-        }
+      const s = String(valor).trim();
+      const canonical = toDateOnly(s);
+      if (canonical) return inicioDiaCalendarioUTC(canonical);
 
-        // Último intento: que el motor la entienda; luego la pasamos a 00:00 local
-        const d = new Date(s);
-        if (!isNaN(d.getTime())) {
-          return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0);
-        }
-      }
-      return null;
+      const m = s.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})$/);
+      if (!m) return null;
+      const [, dd, mm, yyyy] = m;
+      const parsed = toDateOnly(`${dd}-${mm}-${yyyy}`);
+      return parsed ? inicioDiaCalendarioUTC(parsed) : null;
     };
 
-    // Compara solo la parte de fecha (UTC yyyy-mm-dd)
-    const ymdUTC = (d) =>
-      `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(
-        2,
-        "0"
-      )}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    const ymdUTC = (d) => claveFechaCalendario(d);
 
     const resultados = {
       procesados: 0,

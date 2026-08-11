@@ -5,22 +5,15 @@ import StickyNote, {
   STICKY_PRIORITIES,
   STICKY_STATUSES,
 } from "../models/StickyNote.js";
+import { mesClaveArgentina, toDateOnly } from "../utils/fecha.util.js";
 
 const router = express.Router();
 const MAX_TASKS_PER_USER = 150;
 
 const userIdFrom = (req) => req.usuario?._id || req.user?._id || req.user?.id;
-const monthFromDate = (value) => {
-  const date = value ? new Date(value) : new Date();
-  if (Number.isNaN(date.getTime())) return "";
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
-};
+const monthFromDate = (value) => mesClaveArgentina(value ? new Date(value) : new Date());
 const cleanText = (value, max) => String(value ?? "").trim().slice(0, max);
-const parseDueDate = (value) => {
-  if (!value) return null;
-  const parsed = new Date(`${String(value).slice(0, 10)}T12:00:00`);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-};
+const parseDueDate = (value) => toDateOnly(value);
 const legacyTitle = (note) => {
   const firstLine = String(note?.text || "").split(/\r?\n/).find((line) => line.trim());
   return cleanText(firstLine || "Tarea sin título", 140);

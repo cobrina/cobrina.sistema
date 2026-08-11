@@ -13,6 +13,7 @@ import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
 import { normalizarEntidadNumero } from "../utils/normalizacionNegocio.js";
 import { ROLES, normalizeStoredRole, normalizeUsername } from "../config/roles.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
+import { fechaClaveArgentina, mesClaveArgentina, toDateOnly } from "../utils/fecha.util.js";
 
 const objectId = (value) =>
   mongoose.Types.ObjectId.isValid(String(value || ""))
@@ -40,8 +41,7 @@ function filtroFechaMes(campo, mes) {
 
 function parseDate(value, fallback = null) {
   if (!value) return fallback;
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
+  return toDateOnly(value);
 }
 
 const normalizarEncabezado = (value = "") =>
@@ -337,7 +337,7 @@ export async function crearAdelanto(req, res) {
     }
     const item = await AdelantoRRHH.create({
       empleadoId,
-      fechaSolicitud: parseDate(req.body.fechaSolicitud, new Date()),
+      fechaSolicitud: parseDate(req.body.fechaSolicitud, toDateOnly(fechaClaveArgentina())),
       monto,
       motivo: String(req.body.motivo).trim(),
       estado: req.body.estado || "solicitado",
@@ -376,9 +376,9 @@ export async function actualizarAdelanto(req, res) {
       }
     }
     if (["aprobado", "rechazado", "cancelado", "descontado"].includes(update.estado) && !update.fechaResolucion) {
-      update.fechaResolucion = new Date();
+      update.fechaResolucion = toDateOnly(fechaClaveArgentina());
     }
-    if (update.estado === "entregado" && !update.fechaEntrega) update.fechaEntrega = new Date();
+    if (update.estado === "entregado" && !update.fechaEntrega) update.fechaEntrega = toDateOnly(fechaClaveArgentina());
     const item = await AdelantoRRHH.findByIdAndUpdate(req.params.id, update, {
       new: true,
       runValidators: true,
@@ -671,7 +671,7 @@ export async function importarHorariosMasivos(req, res) {
 
 export async function descargarPlantillaObjetivos(req, res) {
   try {
-    const mes = new Date().toISOString().slice(0, 7);
+    const mes = mesClaveArgentina();
     const ejemplos = [
       { mes, alcance: "equipo", empleado: "", entidad: "", subcesion: "", monto: 1000000, observaciones: "Objetivo general" },
       { mes, alcance: "operador", empleado: "usuario.operador", entidad: "", subcesion: "", monto: 250000, observaciones: "" },

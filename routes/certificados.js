@@ -11,6 +11,8 @@ import Direccion from "../models/Direccion.js";
 import multer from "multer";
 import * as XLSX from "xlsx";
 
+import { fechaClaveArgentina } from "../utils/fecha.util.js";
+
 const router = express.Router();
 
 // 🆕 NUEVO: memory storage simple para upload
@@ -220,7 +222,7 @@ router.get("/carteras/export", ...soloAdmin, async (_req, res) => {
     const carteras = await Cartera.find().sort({ nombre: 1 }).lean();
 
     const fmtAR = (d) =>
-      d ? new Date(d).toLocaleString("es-AR", { hour12: false }) : "";
+      d ? new Date(d).toLocaleString("es-AR", { hour12: false, timeZone: "America/Argentina/Buenos_Aires" }) : "";
 
     const rows = carteras.map((c) => ({
       NOMBRE: c.nombre || "",
@@ -254,9 +256,7 @@ router.get("/carteras/export", ...soloAdmin, async (_req, res) => {
     );
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="carteras_${new Date()
-        .toISOString()
-        .slice(0, 10)}.xlsx"`
+      `attachment; filename="carteras_${fechaClaveArgentina()}.xlsx"`
     );
     return res.status(200).send(buf);
   } catch (e) {

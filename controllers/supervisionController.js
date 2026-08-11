@@ -15,7 +15,7 @@ import {
   novedadCubreFecha,
   rangoMesLocal,
   minutosActividadSegunHorario,
-  intervalosAjustadosPorDescanso,
+  intervalosLaboralesSinDescanso,
   minutosHoraHHMM,
   minutoEnDescansoProgramado,
   descansoProgramadoSolapadoMin,
@@ -23,7 +23,18 @@ import {
 import { actividadDeUsuarioEnFecha, horaGestionHHMM, resumirActividadMensual } from "../utils/actividadGestiones.js";
 import { filtrarEmpleadosControlados, usernamesControlados } from "../utils/controlEquipo.js";
 import { normalizeUsername } from "../config/roles.js";
-import { transformarGestionEnAcuerdo } from "../services/acuerdosGestionesService.js";
+import { transformarGestionEnAcuerdo, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
+import {
+  claveFechaCalendario,
+  fechaClaveArgentina,
+  inicioDiaCalendarioUTC,
+  finDiaCalendarioUTC,
+  mesClaveArgentina,
+} from "../utils/fecha.util.js";
+
+const BACHE_VISIBLE_MIN = 20;
+const BACHE_CRITICO_MIN = 60;
+const DEMORA_INICIO_VISIBLE_MIN = 20;
 
 function mesValido(valor) {
   const match = String(valor || "").match(/^(\d{4})-(\d{2})$/);
@@ -57,20 +68,19 @@ function fechaHoraGestionLocal(fecha, hora = "") {
 }
 
 function fechaBaseMes(mes) {
-  const normalizado = mesValido(mes);
-  if (!normalizado) return new Date();
+  const normalizado = mesValido(mes) || mesClaveArgentina();
   const [anio, numeroMes] = normalizado.split("-").map(Number);
-  return new Date(anio, numeroMes - 1, 1, 12, 0, 0, 0);
+  return new Date(Date.UTC(anio, numeroMes - 1, 1, 12, 0, 0, 0));
 }
 
-function mesesUltimosTres(base = new Date()) {
+function mesesUltimosTres(base = fechaBaseMes(mesClaveArgentina())) {
   const items = [];
   for (let i = 2; i >= 0; i -= 1) {
-    const d = new Date(base.getFullYear(), base.getMonth() - i, 1);
+    const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() - i, 1));
     items.push({
-      mes: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`,
-      desde: new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0),
-      hasta: new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999),
+      mes: `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`,
+      desde: new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)),
+      hasta: new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) - 1),
     });
   }
   return items;
@@ -116,7 +126,7 @@ function bloquesActividadDia(actividad = {}) {
     const desde = Number(intervalo.desdeMin);
     const hasta = Number(intervalo.hastaMin);
     const huecoReal = Math.max(0, hasta - desde);
-    if (huecoReal > 30) {
+    if (huecoReal > BACHE_VISIBLE_MIN) {
       bloques.push({
         desde: horaGestionHHMM(inicio),
         hasta: horaGestionHHMM(fin),
@@ -140,9 +150,7 @@ function etiquetaTipoNovedad(tipo) {
 }
 
 function fechaClaveNovedad(value) {
-  if (!value) return "";
-  const date = value instanceof Date ? value : new Date(value);
-  return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 10);
+  return claveFechaCalendario(value);
 }
 
 function mapearPagosPorOperador(pagos, empleados) {
@@ -168,21 +176,20 @@ function mapearPagosPorOperador(pagos, empleados) {
 
 export async function resumenSupervision(req, res) {
   try {
-    const hoyReal = new Date();
-    const mesReal = `${hoyReal.getFullYear()}-${String(hoyReal.getMonth() + 1).padStart(2, "0")}`;
+    const hoyReal = new Date(); // instante real, usado solo para métricas de actividad
+    const mesReal = mesClaveArgentina(hoyReal);
     const mesSolicitado = mesValido(req.query?.mes);
     const mesSeleccionado = mesSolicitado || mesReal;
     const meses = mesesUltimosTres(fechaBaseMes(mesSeleccionado));
     const { desde, hasta, desdeClave, hastaClave } = rangoMesLocal(mesSeleccionado);
     const desdeTres = meses[0].desde;
-    const ahora = hoyReal;
-    const hoyDesde = new Date(ahora.getFullYear(), ahora.getMonth(), ahora.getDate(), 0, 0, 0, 0);
-    const hoyHasta = new Date(ahora.getFullYear(), ahora.getMonth(), ahora.getDate(), 23, 59, 59, 999);
-    const hoyClave = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(2, "0")}-${String(ahora.getDate()).padStart(2, "0")}`;
-    const selectedDesdeUTC = new Date(`${desdeClave}T00:00:00.000Z`);
-    const selectedHastaUTC = new Date(`${hastaClave}T23:59:59.999Z`);
-    const hoyDesdeUTC = new Date(`${hoyClave}T00:00:00.000Z`);
-    const hoyHastaUTC = new Date(`${hoyClave}T23:59:59.999Z`);
+    const hoyClave = fechaClaveArgentina(hoyReal);
+    const hoyDesde = inicioDiaCalendarioUTC(hoyClave);
+    const hoyHasta = finDiaCalendarioUTC(hoyClave);
+    const selectedDesdeUTC = inicioDiaCalendarioUTC(desdeClave);
+    const selectedHastaUTC = finDiaCalendarioUTC(hastaClave);
+    const hoyDesdeUTC = hoyDesde;
+    const hoyHastaUTC = hoyHasta;
     const desdeNovedades = selectedDesdeUTC < hoyDesdeUTC ? selectedDesdeUTC : hoyDesdeUTC;
     const hastaNovedades = selectedHastaUTC > hoyHastaUTC ? selectedHastaUTC : hoyHastaUTC;
 
@@ -196,9 +203,9 @@ export async function resumenSupervision(req, res) {
     const listaUsuariosControlados = [...usuariosControlados];
 
     const [pagosTres, objetivos, novedadesRRHH, gestionesActividadPeriodo, gestionesActividadHoy,
-      proyeccionesCaidas, colchonSinGestion, pendientesColchon, pendientesProyecciones, ultimaPago,
+      proyeccionesCaidas, proyeccionesManuales, colchonSinGestion, pendientesColchon, pendientesProyecciones, ultimaPago,
       ultimaGestionAcuerdo, ultimaGestion, gestionesAcuerdoPeriodo, pagosHoyAgg, pagosHoyDetalle, fichadosAhora,
-      jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad] = await Promise.all([
+      jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad, resumenColchonAgg, ultimaColchon, ultimaNovedadRRHH] = await Promise.all([
       Pago.find({ fechaPago: { $gte: desdeTres, $lte: hasta } })
         .select("monto fechaPago operadorId operadorUsername entidadId subCesionId")
         .lean(),
@@ -229,6 +236,11 @@ export async function resumenSupervision(req, res) {
           { estado: "Promesa caída" },
           { importePagado: { $lte: 0 } },
         ],
+      }),
+      Proyeccion.countDocuments({
+        anio: Number(mesSeleccionado.slice(0, 4)),
+        mes: Number(mesSeleccionado.slice(5, 7)),
+        origen: { $ne: "mango-confirmado" },
       }),
       Colchon.countDocuments({
         $or: [{ ultimaGestion: null }, { ultimaGestion: { $lt: new Date(Date.now() - 7 * 86400000) } }],
@@ -267,17 +279,82 @@ export async function resumenSupervision(req, res) {
         .select("fechaHora createdAt fuenteArchivo operador")
         .lean(),
       AcuerdoPago.countDocuments({ mes: mesSeleccionado }),
+      Colchon.aggregate([
+        {
+          $project: {
+            importeCuota: { $ifNull: ["$importeCuota", 0] },
+            pagos: { $ifNull: ["$pagos", []] },
+          },
+        },
+        {
+          $project: {
+            importeCuota: 1,
+            pagado: {
+              $sum: {
+                $map: {
+                  input: "$pagos",
+                  as: "pago",
+                  in: { $ifNull: ["$$pago.monto", 0] },
+                },
+              },
+            },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            totalCuotas: { $sum: 1 },
+            importeTotal: { $sum: "$importeCuota" },
+            pagadoTotal: { $sum: "$pagado" },
+            cuotasConPago: { $sum: { $cond: [{ $gt: ["$pagado", 0] }, 1, 0] } },
+          },
+        },
+      ]),
+      Colchon.findOne().sort({ ultimaModificacion: -1, creado: -1 }).select("ultimaModificacion creado").lean(),
+      NovedadRRHH.findOne({ estado: { $ne: "anulado" } }).sort({ updatedAt: -1, createdAt: -1 }).select("updatedAt createdAt tipo fechaDesde").lean(),
     ]);
+
+    const diaCorteComparacion = mesSeleccionado === mesReal
+      ? Number(hoyClave.slice(8, 10))
+      : new Date(Date.UTC(Number(mesSeleccionado.slice(0, 4)), Number(mesSeleccionado.slice(5, 7)), 0)).getUTCDate();
 
     const recaudacionTresMeses = meses.map((m) => {
       const total = pagosTres
         .filter((p) => p.fechaPago >= m.desde && p.fechaPago <= m.hasta)
         .reduce((sum, p) => sum + Number(p.monto || 0), 0);
-      return { mes: m.mes, total };
+      const diasMes = new Date(Date.UTC(Number(m.mes.slice(0, 4)), Number(m.mes.slice(5, 7)), 0)).getUTCDate();
+      const corte = Math.min(diaCorteComparacion, diasMes);
+      const comparable = pagosTres
+        .filter((p) => p.fechaPago >= m.desde && p.fechaPago <= m.hasta && p.fechaPago.getUTCDate() <= corte)
+        .reduce((sum, p) => sum + Number(p.monto || 0), 0);
+      return { mes: m.mes, total, comparable, diaCorte: corte };
+    }).map((item, index, rows) => {
+      if (!index) return { ...item, variacionVsAnterior: null };
+      const anterior = Number(rows[index - 1]?.comparable || 0);
+      const actual = Number(item.comparable || 0);
+      const variacion = anterior > 0 ? Math.round((((actual - anterior) / anterior) * 100) * 10) / 10 : null;
+      return { ...item, variacionVsAnterior: variacion, diferenciaVsAnterior: actual - anterior };
     });
 
     const pagosActuales = pagosTres.filter((p) => p.fechaPago >= desde && p.fechaPago <= hasta);
     const totalActual = pagosActuales.reduce((sum, p) => sum + Number(p.monto || 0), 0);
+    const colchonBase = resumenColchonAgg?.[0] || {};
+    const colchonTotalCuotas = Number(colchonBase.totalCuotas || 0);
+    const colchonImporteTotal = Number(colchonBase.importeTotal || 0);
+    const colchonPagadoTotal = Number(colchonBase.pagadoTotal || 0);
+    const colchonCuotasConPago = Number(colchonBase.cuotasConPago || 0);
+    const resumenColchon = {
+      totalCuotas: colchonTotalCuotas,
+      importeTotal: colchonImporteTotal,
+      pagadoTotal: colchonPagadoTotal,
+      cuotasConPago: colchonCuotasConPago,
+      porcentajeCumplimientoMonto: colchonImporteTotal > 0
+        ? Math.round((colchonPagadoTotal / colchonImporteTotal) * 1000) / 10
+        : null,
+      porcentajeCuotasConPago: colchonTotalCuotas > 0
+        ? Math.round((colchonCuotasConPago / colchonTotalCuotas) * 1000) / 10
+        : null,
+    };
     const objetivoEquipo = objetivos.find((o) => o.alcance === "equipo");
     const montoObjetivoEquipo = Number(objetivoEquipo?.montoObjetivo || 0);
 
@@ -330,20 +407,59 @@ export async function resumenSupervision(req, res) {
       const diferenciaHoyMin = minutosExigiblesHoy > 0 ? minutosTrabajadosHoy - minutosExigiblesHoy : null;
       const faltanHoyMin = minutosExigiblesHoy > 0 ? Math.max(0, minutosExigiblesHoy - minutosTrabajadosHoy) : 0;
       const extraHoyMin = minutosExigiblesHoy > 0 ? Math.max(0, minutosTrabajadosHoy - minutosExigiblesHoy) : 0;
-      const intervalosHoy = intervalosAjustadosPorDescanso(actividadDelDia.intervalos || [], horarioHoy);
-      const baches30Hoy = intervalosHoy.filter((intervalo) => intervalo.duracionMin > 30).length;
-      const baches60Hoy = intervalosHoy.filter((intervalo) => intervalo.duracionMin > 60).length;
-      const bacheMaximoHoyMin = intervalosHoy.reduce((maximo, intervalo) => Math.max(maximo, Number(intervalo.duracionMin || 0)), 0);
       const salidaHoyMin = minutosHoraHHMM(horarioHoy.salida);
       const entradaHoyMin = minutosHoraHHMM(horarioHoy.entrada);
       const jornadaFinalizadaHoy = horarioHoy.programado && Number.isFinite(salidaHoyMin) && ahoraMinArgentina >= salidaHoyMin;
       const enDescansoProgramadoHoy = minutoEnDescansoProgramado(ahoraMinArgentina, horarioHoy.bloquesHorario);
-      let minutosSinGestionHoy = null;
-      if (Number.isFinite(ultimaMinHoy) && ahoraMinArgentina >= ultimaMinHoy) {
-        minutosSinGestionHoy = Math.max(0, Math.round(
-          ahoraMinArgentina - ultimaMinHoy - descansoProgramadoSolapadoMin(horarioHoy.bloquesHorario, ultimaMinHoy, ahoraMinArgentina)
-        ));
-      }
+
+      // Los baches se calculan solo dentro de los bloques laborales efectivos de RRHH.
+      // Se incluyen tanto los cortes cerrados entre dos gestiones como el corte abierto
+      // desde la última gestión hasta la hora actual (o desde el inicio del turno si aún
+      // no hubo gestiones). Los descansos programados se recortan por completo.
+      const intervalosLaboralesHoy = intervalosLaboralesSinDescanso(actividadDelDia.intervalos || [], horarioHoy);
+      const desdeCorteAbiertoMin = Number.isFinite(ultimaMinHoy)
+        ? ultimaMinHoy
+        : Number.isFinite(entradaHoyMin)
+          ? entradaHoyMin
+          : null;
+      const intervalosAbiertosHoy = Number.isFinite(desdeCorteAbiertoMin) && ahoraMinArgentina > desdeCorteAbiertoMin
+        ? intervalosLaboralesSinDescanso([{ desdeMin: desdeCorteAbiertoMin, hastaMin: ahoraMinArgentina }], horarioHoy)
+        : [];
+      const detallesCerrados = intervalosLaboralesHoy
+        .filter((intervalo) => Number(intervalo.duracionMin || 0) > BACHE_VISIBLE_MIN)
+        .map((intervalo) => ({
+          desde: horaGestionHHMM(intervalo.desdeMin),
+          hasta: horaGestionHHMM(intervalo.hastaMin),
+          duracionMin: Math.round(Number(intervalo.duracionMin || 0)),
+          actual: false,
+        }));
+      const detallesAbiertos = intervalosAbiertosHoy
+        .filter((intervalo) => Number(intervalo.duracionMin || 0) > BACHE_VISIBLE_MIN)
+        .map((intervalo) => ({
+          desde: horaGestionHHMM(intervalo.desdeMin),
+          hasta: horaGestionHHMM(intervalo.hastaMin),
+          duracionMin: Math.round(Number(intervalo.duracionMin || 0)),
+          actual: !jornadaFinalizadaHoy,
+        }));
+      const bachesDetalleHoy = [...detallesCerrados, ...detallesAbiertos]
+        .sort((a, b) => minutosHoraHHMM(a.desde) - minutosHoraHHMM(b.desde));
+      const baches20Hoy = bachesDetalleHoy.length;
+      // Se conserva el campo histórico +30 para no romper consumidores anteriores.
+      const baches30Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > 30).length;
+      const baches60Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > BACHE_CRITICO_MIN).length;
+      const bacheMaximoHoyMin = bachesDetalleHoy.reduce((maximo, intervalo) => Math.max(maximo, Number(intervalo.duracionMin || 0)), 0);
+
+      const minutosSinGestionHoy = intervalosAbiertosHoy.length
+        ? Math.round(intervalosAbiertosHoy.reduce((sum, intervalo) => sum + Number(intervalo.duracionMin || 0), 0))
+        : Number.isFinite(ultimaMinHoy) && ahoraMinArgentina >= ultimaMinHoy
+          ? 0
+          : null;
+      const tardanzaInicioHoyMin = Number.isFinite(primeraMinHoy) && Number.isFinite(entradaHoyMin)
+        ? Math.max(0, Math.round(primeraMinHoy - entradaHoyMin))
+        : 0;
+      const inicioAnticipadoHoyMin = Number.isFinite(primeraMinHoy) && Number.isFinite(entradaHoyMin)
+        ? Math.max(0, Math.round(entradaHoyMin - primeraMinHoy))
+        : 0;
 
       let estadoJornadaHoy = "sin-jornada";
       let estadoJornadaHoyLabel = horarioHoy.horarioLibre ? "Horario libre" : "Sin jornada hoy";
@@ -351,12 +467,17 @@ export async function resumenSupervision(req, res) {
         estadoJornadaHoy = novedadDia.tipo === "falta" ? "falta" : "novedad";
         estadoJornadaHoyLabel = etiquetaNovedadDia(novedadDia);
       } else if (horarioHoy.horarioLibre) {
-        estadoJornadaHoy = Number(actividadDelDia.gestiones || 0) > 0 ? "en-curso" : "sin-actividad";
-        estadoJornadaHoyLabel = Number(actividadDelDia.gestiones || 0) > 0 ? "Con actividad" : "Sin actividad";
+        // Un horario libre sin gestiones no debe verse igual que alguien que está
+        // incumpliendo un turno fijo. Se mantiene visible para control, pero neutral.
+        estadoJornadaHoy = Number(actividadDelDia.gestiones || 0) > 0 ? "en-curso" : "sin-jornada";
+        estadoJornadaHoyLabel = Number(actividadDelDia.gestiones || 0) > 0 ? "Horario libre · con actividad" : "Horario libre · sin actividad";
       } else if (horarioHoy.programado) {
-        if (Number.isFinite(entradaHoyMin) && ahoraMinArgentina < entradaHoyMin) {
+        if (Number.isFinite(entradaHoyMin) && ahoraMinArgentina < entradaHoyMin && !Number(actividadDelDia.gestiones || 0)) {
           estadoJornadaHoy = "pendiente";
           estadoJornadaHoyLabel = "Todavía no inicia";
+        } else if (Number.isFinite(entradaHoyMin) && ahoraMinArgentina < entradaHoyMin && Number(actividadDelDia.gestiones || 0) > 0) {
+          estadoJornadaHoy = "en-curso";
+          estadoJornadaHoyLabel = inicioAnticipadoHoyMin > 0 ? `Actividad antes del horario · inició ${inicioAnticipadoHoyMin} min antes` : "Actividad antes del horario";
         } else if (enDescansoProgramadoHoy) {
           estadoJornadaHoy = "descanso";
           estadoJornadaHoyLabel = "Descanso programado";
@@ -374,12 +495,18 @@ export async function resumenSupervision(req, res) {
         } else if (!Number(actividadDelDia.gestiones || 0)) {
           estadoJornadaHoy = "sin-actividad";
           estadoJornadaHoyLabel = "Sin gestiones todavía";
-        } else if (Number(minutosSinGestionHoy || 0) > 60) {
+        } else if (Number(minutosSinGestionHoy || 0) > BACHE_CRITICO_MIN) {
           estadoJornadaHoy = "alerta";
-          estadoJornadaHoyLabel = `Sin gestión hace ${Math.round(minutosSinGestionHoy)} min`;
-        } else if (Number(minutosSinGestionHoy || 0) > 30) {
+          estadoJornadaHoyLabel = `Pausa actual ${Math.round(minutosSinGestionHoy)} min`;
+        } else if (Number(minutosSinGestionHoy || 0) > BACHE_VISIBLE_MIN) {
           estadoJornadaHoy = "atencion";
           estadoJornadaHoyLabel = `Pausa actual ${Math.round(minutosSinGestionHoy)} min`;
+        } else if (tardanzaInicioHoyMin > DEMORA_INICIO_VISIBLE_MIN) {
+          estadoJornadaHoy = "atencion";
+          estadoJornadaHoyLabel = `En curso · inició ${tardanzaInicioHoyMin} min tarde`;
+        } else if (inicioAnticipadoHoyMin > DEMORA_INICIO_VISIBLE_MIN) {
+          estadoJornadaHoy = "en-curso";
+          estadoJornadaHoyLabel = `En curso · inició ${inicioAnticipadoHoyMin} min antes`;
         } else {
           estadoJornadaHoy = "en-curso";
           estadoJornadaHoyLabel = "En curso";
@@ -407,9 +534,13 @@ export async function resumenSupervision(req, res) {
         diferenciaHoyMin,
         faltanHoyMin,
         extraHoyMin,
+        baches20Hoy,
         baches30Hoy,
         baches60Hoy,
         bacheMaximoHoyMin,
+        bachesDetalleHoy,
+        tardanzaInicioHoyMin,
+        inicioAnticipadoHoyMin,
         minutosSinGestionHoy,
         jornadaFinalizadaHoy,
         enDescansoProgramadoHoy,
@@ -496,6 +627,55 @@ export async function resumenSupervision(req, res) {
       // El filtro se hace en JS para que nombres con mayúsculas/minúsculas distintas
       // no oculten acuerdos que sí aparecen en Reporte de gestiones.
       .filter((acuerdo) => usuariosActivos.has(String(acuerdo.usuario || "").trim().toLowerCase()));
+
+    // Para Supervisión no alcanza con saber que un acuerdo "venció" por fecha: si ya
+    // tiene un pago válido cruzado por DNI + entidad, no debe aparecer como vencido
+    // pendiente. Reutilizamos exactamente el criterio del Reporte de Acuerdos.
+    let acuerdosConPagos = acuerdosValidos;
+    let crucePagosDisponible = false;
+    let crucePagosHasta = "";
+    let pagosCruceCantidad = 0;
+    if (ultimaPago && acuerdosValidos.length) {
+      try {
+        const dnisAcuerdos = [...new Set(
+          acuerdosValidos
+            .map((row) => String(row?.dni || "").replace(/\D/g, ""))
+            .filter(Boolean)
+        )];
+        const fechasAcuerdos = acuerdosValidos
+          .map((row) => String(row?.fecha || "").slice(0, 10))
+          .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))
+          .sort();
+        const primeraFecha = fechasAcuerdos[0] ? inicioDiaCalendarioUTC(fechasAcuerdos[0]) : null;
+        const pagoDesde = primeraFecha ? new Date(primeraFecha.getTime() - 90 * 86400000) : selectedDesdeUTC;
+        const pagoHasta = selectedHastaUTC < hoyReal ? selectedHastaUTC : hoyReal;
+        const pagosCruce = dnisAcuerdos.length
+          ? await Pago.find({
+              dni: { $in: dnisAcuerdos },
+              fechaPago: { $gte: pagoDesde, $lte: pagoHasta },
+            })
+              .select("idPago dni entidadId subCesionId fechaPago monto conceptoCodigo estado operadorUsername")
+              .sort({ fechaPago: 1, _id: 1 })
+              .lean()
+              .maxTimeMS(15000)
+          : [];
+        acuerdosConPagos = vincularPagosPosteriores(acuerdosValidos, pagosCruce, entidades, { disponible: true });
+        crucePagosDisponible = true;
+        crucePagosHasta = fechaClaveArgentina(pagoHasta);
+        pagosCruceCantidad = pagosCruce.length;
+      } catch (error) {
+        console.warn("Cruce opcional acuerdos/pagos en Supervisión no disponible:", error?.message || error);
+      }
+    }
+
+    const estadosConPagoValido = new Set([
+      "CON PAGO POSTERIOR",
+      "CON PAGO VÁLIDO",
+      "PAGO MISMO DÍA",
+      "PAGO MISMO DÍA VÁLIDO",
+    ]);
+    const tienePagoValido = (acuerdo) => crucePagosDisponible && estadosConPagoValido.has(String(acuerdo?.estadoPagoAcuerdo || ""));
+
     const ultimoAcuerdoMango = acuerdosValidos[0] || null;
     const ultimaFechaAcuerdoMango = ultimoAcuerdoMango?.fecha
       ? fechaHoraGestionLocal(ultimoAcuerdoMango.fecha, ultimoAcuerdoMango.hora)
@@ -505,41 +685,111 @@ export async function resumenSupervision(req, res) {
     let montoTotalAcuerdos = 0;
     let primerPagoTotal = 0;
     let acuerdosVencidos = 0;
+    let acuerdosVencidosHistoricos = 0;
+    let acuerdosVencidosConPago = 0;
     let acuerdosVenceHoy = 0;
     let acuerdosProximos = 0;
+    let acuerdosConPago = 0;
+    let montoPagadoAcuerdos = 0;
+    let acuerdosExigibles = 0;
+    let acuerdosExigiblesConPago = 0;
+    let primerPagoExigibleTotal = 0;
+    let montoPagadoExigibles = 0;
 
-    for (const acuerdo of acuerdosValidos) {
-      const usuario = String(acuerdo.usuario || "Sin operador").trim() || "Sin operador";
+    for (const acuerdo of acuerdosConPagos) {
+      // operadorGestion conserva quién cargó el acuerdo aunque el cruce encuentre
+      // que el pago fue imputado por otro operador.
+      const usuario = String(acuerdo.operadorGestion || acuerdo.usuario || "Sin operador").trim() || "Sin operador";
       const usuarioControlado = usuariosControlados.has(normalizeUsername(usuario));
+      const conPago = tienePagoValido(acuerdo);
+      const montoPagado = conPago ? Number(acuerdo.montoPagosValidos || acuerdo.montoPagosPosteriores || 0) : 0;
+      const tipo = acuerdo.tipoAcuerdo || "Sin clasificar";
+
       if (usuarioControlado) {
         const actual = acuerdosPorOperadorMap.get(usuario) || {
           usuario,
           total: 0,
           montoTotal: 0,
           primerPagoTotal: 0,
+          conPago: 0,
+          montoPagado: 0,
+          sinPago: 0,
           vencidos: 0,
+          vencidosHistoricos: 0,
+          vencidosConPago: 0,
           venceHoy: 0,
           proximos: 0,
+          exigibles: 0,
+          exigiblesConPago: 0,
+          primerPagoExigibleTotal: 0,
+          montoPagadoExigibles: 0,
+          tiposMap: new Map(),
         };
         actual.total += 1;
         actual.montoTotal += Number(acuerdo.montoTotalAcuerdo || 0);
         actual.primerPagoTotal += Number(acuerdo.primerPago || 0);
-        if (acuerdo.estadoVencimiento === "VENCIDO") actual.vencidos += 1;
-        if (acuerdo.estadoVencimiento === "VENCE HOY") actual.venceHoy += 1;
-        if (acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") actual.proximos += 1;
+        if (conPago) {
+          actual.conPago += 1;
+          actual.montoPagado += montoPagado;
+        } else {
+          actual.sinPago += 1;
+        }
+        actual.tiposMap.set(tipo, (actual.tiposMap.get(tipo) || 0) + 1);
+        if (acuerdo.estadoVencimiento === "VENCIDO") {
+          actual.vencidosHistoricos += 1;
+          if (conPago) actual.vencidosConPago += 1;
+          else actual.vencidos += 1;
+        }
+        if (!conPago && acuerdo.estadoVencimiento === "VENCE HOY") actual.venceHoy += 1;
+        if (!conPago && acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") actual.proximos += 1;
+        if (["VENCIDO", "VENCE HOY"].includes(acuerdo.estadoVencimiento)) {
+          actual.exigibles += 1;
+          actual.primerPagoExigibleTotal += Number(acuerdo.primerPago || 0);
+          if (conPago) {
+            actual.exigiblesConPago += 1;
+            actual.montoPagadoExigibles += montoPagado;
+          }
+        }
         acuerdosPorOperadorMap.set(usuario, actual);
       }
 
-      const tipo = acuerdo.tipoAcuerdo || "Sin clasificar";
       acuerdosPorTipoMap.set(tipo, (acuerdosPorTipoMap.get(tipo) || 0) + 1);
       montoTotalAcuerdos += Number(acuerdo.montoTotalAcuerdo || 0);
       primerPagoTotal += Number(acuerdo.primerPago || 0);
-      if (acuerdo.estadoVencimiento === "VENCIDO") acuerdosVencidos += 1;
-      if (acuerdo.estadoVencimiento === "VENCE HOY") acuerdosVenceHoy += 1;
-      if (acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") acuerdosProximos += 1;
+      if (conPago) {
+        acuerdosConPago += 1;
+        montoPagadoAcuerdos += montoPagado;
+      }
+      if (acuerdo.estadoVencimiento === "VENCIDO") {
+        acuerdosVencidosHistoricos += 1;
+        if (conPago) acuerdosVencidosConPago += 1;
+        else acuerdosVencidos += 1;
+      }
+      if (!conPago && acuerdo.estadoVencimiento === "VENCE HOY") acuerdosVenceHoy += 1;
+      if (!conPago && acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") acuerdosProximos += 1;
+      if (["VENCIDO", "VENCE HOY"].includes(acuerdo.estadoVencimiento)) {
+        acuerdosExigibles += 1;
+        primerPagoExigibleTotal += Number(acuerdo.primerPago || 0);
+        if (conPago) {
+          acuerdosExigiblesConPago += 1;
+          montoPagadoExigibles += montoPagado;
+        }
+      }
     }
 
     const acuerdosPorOperador = [...acuerdosPorOperadorMap.values()]
+      .map(({ tiposMap, ...item }) => ({
+        ...item,
+        porcentajeCumplimiento: item.exigibles > 0
+          ? Math.round((item.exigiblesConPago / item.exigibles) * 1000) / 10
+          : null,
+        porcentajeCumplimientoMonto: item.primerPagoExigibleTotal > 0
+          ? Math.round((item.montoPagadoExigibles / item.primerPagoExigibleTotal) * 1000) / 10
+          : null,
+        tipos: [...tiposMap.entries()]
+          .map(([tipo, total]) => ({ tipo, total }))
+          .sort((a, b) => b.total - a.total || String(a.tipo).localeCompare(String(b.tipo), "es")),
+      }))
       .sort((a, b) => b.total - a.total || b.montoTotal - a.montoTotal);
     const acuerdosPorTipo = [...acuerdosPorTipoMap.entries()]
       .map(([tipo, total]) => ({ tipo, total }))
@@ -637,9 +887,11 @@ export async function resumenSupervision(req, res) {
       mesSeleccionado,
       esMesActual: mesSeleccionado === mesReal,
       alertasEnTiempoReal: true,
+      evaluadoEn: hoyReal,
       recaudacion: {
         ultimosTresMeses: recaudacionTresMeses,
         mesActual: totalActual,
+        pagosCantidadPeriodo: pagosActuales.length,
         objetivoEquipo: montoObjetivoEquipo,
         porcentajeObjetivoEquipo: montoObjetivoEquipo > 0 ? Math.round((totalActual / montoObjetivoEquipo) * 1000) / 10 : null,
         porOperador: operadores.sort((a, b) => b.total - a.total),
@@ -660,6 +912,7 @@ export async function resumenSupervision(req, res) {
       },
       alertas: {
         proyeccionesCaidas,
+        proyeccionesManuales,
         colchonSinGestion,
         pagosInformadosPendientes: pendientesColchon + pendientesProyecciones,
         pagosInformadosColchon: pendientesColchon,
@@ -676,13 +929,36 @@ export async function resumenSupervision(req, res) {
         total: acuerdosValidos.length,
         montoTotal: montoTotalAcuerdos,
         primerPagoTotal,
+        conPago: acuerdosConPago,
+        sinPago: Math.max(0, acuerdosValidos.length - acuerdosConPago),
+        montoPagado: montoPagadoAcuerdos,
+        exigibles: acuerdosExigibles,
+        exigiblesConPago: acuerdosExigiblesConPago,
+        primerPagoExigibleTotal,
+        montoPagadoExigibles,
+        porcentajeCumplimiento: acuerdosExigibles > 0
+          ? Math.round((acuerdosExigiblesConPago / acuerdosExigibles) * 1000) / 10
+          : null,
+        porcentajeCumplimientoMonto: primerPagoExigibleTotal > 0
+          ? Math.round((montoPagadoExigibles / primerPagoExigibleTotal) * 1000) / 10
+          : null,
+        // "vencidos" significa vencidos que siguen sin pago válido. Los que ya
+        // tienen pago se informan aparte para evitar falsas alertas.
         vencidos: acuerdosVencidos,
+        vencidosHistoricos: acuerdosVencidosHistoricos,
+        vencidosConPago: acuerdosVencidosConPago,
         venceHoy: acuerdosVenceHoy,
         proximos: acuerdosProximos,
         porOperador: acuerdosPorOperador,
         porTipo: acuerdosPorTipo,
+        crucePagos: {
+          disponible: crucePagosDisponible,
+          pagosConsultados: pagosCruceCantidad,
+          periodoHasta: crucePagosHasta,
+        },
         fuente: "reporte-gestiones",
       },
+      colchon: resumenColchon,
       actualizaciones: {
         pagos: ultimaPago,
         acuerdos: ultimaGestionAcuerdo,
@@ -699,6 +975,13 @@ export async function resumenSupervision(req, res) {
           fuente: "Reporte de gestiones",
         },
         gestiones: ultimaGestion,
+        colchon: ultimaColchon ? {
+          fecha: ultimaColchon.ultimaModificacion || ultimaColchon.creado || null,
+        } : null,
+        rrhh: ultimaNovedadRRHH ? {
+          fecha: ultimaNovedadRRHH.updatedAt || ultimaNovedadRRHH.createdAt || ultimaNovedadRRHH.fechaDesde || null,
+          tipo: ultimaNovedadRRHH.tipo || "",
+        } : null,
       },
       objetivos,
     });

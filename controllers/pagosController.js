@@ -5,88 +5,73 @@ import SubCesion from "../models/SubCesion.js";
 import Empleado from "../models/Empleado.js";
 import JobProceso from "../models/JobProceso.js";
 import ExcelJS from "exceljs";
+import {
+  claveFechaCalendario,
+  fechaClaveArgentina,
+  inicioDiaCalendarioUTC,
+  siguienteDiaCalendarioUTC,
+  toDateOnly,
+} from "../utils/fecha.util.js";
 
 /* ──────────────────────────────────────────────────────────────
-   Helpers locales
+   Helpers de fecha calendario
+   - fechaPago NO es un instante: es un día calendario.
+   - Se persiste/consulta por componentes UTC para que 11/08 siga siendo 11/08.
+   - “Hoy” se obtiene siempre con el calendario de Buenos Aires.
    ────────────────────────────────────────────────────────────── */
-const startOfDay = (d) => {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
-};
+const startOfDay = (value) => inicioDiaCalendarioUTC(value);
 
-// ✅ FIX FECHAS: soporta Date (Excel) sin corrimiento por timezone,
-// y soporta dd/mm/aaaa, dd-mm-aaaa, dd/mm, dd-mm (año actual), yy (2000+)
 const parseFechaDDMMYYYY = (val) => {
   if (val === null || val === undefined || val === "") return null;
 
-  // ExcelJS puede devolver un objeto con result (fórmulas)
   if (val && typeof val === "object" && val.result != null) {
     return parseFechaDDMMYYYY(val.result);
   }
 
-  // ExcelJS fechas como Date suelen estar en UTC 00:00Z.
-  // En AR eso puede caer el día anterior si se usa "startOfDay" en local.
-  if (val instanceof Date && !isNaN(val)) {
-    const y = val.getUTCFullYear();
-    const m = val.getUTCMonth();
-    const d = val.getUTCDate();
-    const x = new Date(y, m, d, 0, 0, 0, 0); // medianoche local, mismo día "humano"
-    x.setHours(0, 0, 0, 0);
-    return x;
+  if (val instanceof Date && !Number.isNaN(val.getTime())) {
+    return inicioDiaCalendarioUTC(val);
   }
 
   const s = String(val).trim();
-  // dd/mm/aaaa | dd-mm-aaaa | dd/mm | dd-mm | dd/mm/yy | dd-mm-yy
-  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2}|\d{4}))?$/);
-  if (!m) return null;
 
-  const dd = Number(m[1]);
-  const mm = Number(m[2]);
-  let yyyy = m[3] ? Number(m[3]) : new Date().getFullYear();
+  // yyyy-mm-dd / ISO: conservar literalmente el día calendario.
+  const isoKey = claveFechaCalendario(s);
+  if (isoKey) return inicioDiaCalendarioUTC(isoKey);
+
+  // dd/mm/aaaa | dd-mm-aaaa | dd/mm | dd-mm | dd/mm/yy | dd-mm-yy
+  const match = s.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2}|\d{4}))?$/);
+  if (!match) return null;
+
+  const dd = Number(match[1]);
+  const mm = Number(match[2]);
+  const anioActualArgentina = Number(fechaClaveArgentina().slice(0, 4));
+  let yyyy = match[3] ? Number(match[3]) : anioActualArgentina;
+  if (match[3] && String(match[3]).length === 2) yyyy = 2000 + yyyy;
   if (!Number.isFinite(dd) || !Number.isFinite(mm) || !Number.isFinite(yyyy)) return null;
 
-  if (m[3] && String(m[3]).length === 2) yyyy = 2000 + yyyy;
-
-  const d = new Date(yyyy, mm - 1, dd, 0, 0, 0, 0);
-  return isNaN(d) ? null : startOfDay(d);
+  const canonical = toDateOnly(`${String(dd).padStart(2, "0")}-${String(mm).padStart(2, "0")}-${yyyy}`);
+  return canonical ? inicioDiaCalendarioUTC(canonical) : null;
 };
 
-// helpers arriba del controller (podés ponerlo junto a los demás)
 function formatDateOnlyUTC(v) {
-  if (!v) return "";
-  const d = new Date(v);
-  if (isNaN(d)) return "";
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const yyyy = d.getUTCFullYear();
+  const key = claveFechaCalendario(v);
+  if (!key) return "";
+  const [yyyy, mm, dd] = key.split("-");
   return `${dd}/${mm}/${yyyy}`;
 }
 
-// ✅ Para mostrar valores de input en errores sin "US/inglés"
 function formatFechaInput(val) {
   if (val === null || val === undefined || val === "") return "";
-  if (val instanceof Date && !isNaN(val)) return formatDateOnlyUTC(val);
   const parsed = parseFechaDDMMYYYY(val);
   return parsed ? formatDateOnlyUTC(parsed) : String(val).trim();
 }
 
-// --- RANGO LOCAL (sin UTC shift) ---
-// Crea un Date a las 00:00 *locales* para 'YYYY-MM-DD'
 function parseLocalYMD(ymd) {
-  if (!ymd) return null;
-  const [y, m, d] = String(ymd).split("-").map(Number);
-  if (!y || !m || !d) return null;
-  return new Date(y, m - 1, d, 0, 0, 0, 0); // medianoche local
+  return inicioDiaCalendarioUTC(ymd);
 }
 
-// Devuelve el inicio del día siguiente (00:00 locales)
 function nextDay(date) {
-  if (!(date instanceof Date) || isNaN(date)) return null;
-  const x = new Date(date);
-  x.setDate(x.getDate() + 1);
-  x.setHours(0, 0, 0, 0);
-  return x;
+  return siguienteDiaCalendarioUTC(date);
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -106,24 +91,22 @@ function applyOperadorMatch(match, operador) {
   match.operadorUsername = ops.length === 1 ? ops[0] : { $in: ops };
 }
 
-function countBusinessDaysInclusiveLocal(startInclusive, endInclusive) {
+function countBusinessDaysInclusiveCalendar(startInclusive, endInclusive) {
   if (!(startInclusive instanceof Date) || isNaN(startInclusive)) return 0;
   if (!(endInclusive instanceof Date) || isNaN(endInclusive)) return 0;
 
-  // Normalizamos horas por si vienen con algo raro
-  const a = new Date(startInclusive);
-  a.setHours(0, 0, 0, 0);
-  const b = new Date(endInclusive);
-  b.setHours(0, 0, 0, 0);
+  const a = inicioDiaCalendarioUTC(startInclusive);
+  const b = inicioDiaCalendarioUTC(endInclusive);
+  if (!a || !b) return 0;
 
   if (a > b) return 0;
 
   let count = 0;
   const cur = new Date(a);
   while (cur <= b) {
-    const wd = cur.getDay(); // 0 domingo, 6 sábado
+    const wd = cur.getUTCDay(); // 0 domingo, 6 sábado
     if (wd !== 0 && wd !== 6) count++;
-    cur.setDate(cur.getDate() + 1);
+    cur.setUTCDate(cur.getUTCDate() + 1);
   }
   return count;
 }
@@ -702,8 +685,8 @@ export const exportPagos = async (req, res) => {
         nroRemesa: p.nroRemesa,
         estado: p.estado,
         observaciones: p.observaciones,
-        createdAt: new Date(p.createdAt).toLocaleString("es-AR"),
-        updatedAt: new Date(p.updatedAt).toLocaleString("es-AR"),
+        createdAt: new Date(p.createdAt).toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" }),
+        updatedAt: new Date(p.updatedAt).toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" }),
       });
     });
 
@@ -905,7 +888,7 @@ export const importPagos = async (req, res) => {
         continue;
       }
 
-      
+
       // ✅ FIX DUPLICADOS: clave de negocio (por día UTC) para evitar que se inserte el mismo pago
       // aunque haya diferencias de hora/minuto o el índice único no esté creado en Atlas.
       const fechaKey = formatDateOnlyUTC(fechaPago);
@@ -1608,10 +1591,9 @@ export const kpiHoyVsMesAnterior = async (req, res) => {
       operador, // ✅
     } = req.query;
 
-    const hoy = new Date();
-    hoy.setHours(0, 0, 0, 0);
-    const mañana = new Date(hoy);
-    mañana.setDate(mañana.getDate() + 1);
+    const hoyClave = fechaClaveArgentina();
+    const hoy = inicioDiaCalendarioUTC(hoyClave);
+    const mañana = siguienteDiaCalendarioUTC(hoyClave);
 
     const base = {};
     if (dni) base.dni = dni;
@@ -1629,10 +1611,11 @@ export const kpiHoyVsMesAnterior = async (req, res) => {
       { $group: { _id: null, total: { $sum: "$monto" } } },
     ]);
 
-    const ref = new Date(hoy);
-    ref.setMonth(ref.getMonth() - 1);
-    const refEnd = new Date(ref);
-    refEnd.setDate(ref.getDate() + 1);
+    const [hy, hm, hd] = hoyClave.split("-").map(Number);
+    const prevMonthLastDay = new Date(Date.UTC(hy, hm - 1, 0)).getUTCDate();
+    const refDay = Math.min(hd, prevMonthLastDay);
+    const ref = new Date(Date.UTC(hy, hm - 2, refDay));
+    const refEnd = siguienteDiaCalendarioUTC(ref);
 
     const totalRef = await Pago.aggregate([
       { $match: { ...base, fechaPago: { $gte: ref, $lt: refEnd } } },
@@ -1701,24 +1684,25 @@ export const kpiMtdVsPrev = async (req, res) => {
       operador, // ✅
     } = req.query;
 
-    // 1) Anchor (local)
-    const anchor = parseLocalYMD(fechaHasta) || new Date();
+    // 1) Anchor: día calendario de Buenos Aires si no llega fechaHasta.
+    const anchorKey = claveFechaCalendario(fechaHasta) || fechaClaveArgentina();
+    const anchor = inicioDiaCalendarioUTC(anchorKey);
 
-    const y = anchor.getFullYear();
-    const m = anchor.getMonth();
-    const d = anchor.getDate();
+    const y = anchor.getUTCFullYear();
+    const m = anchor.getUTCMonth();
+    const d = anchor.getUTCDate();
 
     const py = m === 0 ? y - 1 : y;
     const pm = (m + 11) % 12;
 
-    const prevDays = new Date(py, pm + 1, 0).getDate();
+    const prevDays = new Date(Date.UTC(py, pm + 1, 0)).getUTCDate();
     const pCut = Math.min(d, prevDays);
 
-    const curStart = new Date(y, m, 1, 0, 0, 0, 0);
-    const curEndExcl = nextDay(new Date(y, m, d, 0, 0, 0, 0)); // $lt
+    const curStart = new Date(Date.UTC(y, m, 1));
+    const curEndExcl = siguienteDiaCalendarioUTC(new Date(Date.UTC(y, m, d)));
 
-    const prevStart = new Date(py, pm, 1, 0, 0, 0, 0);
-    const prevEndExcl = nextDay(new Date(py, pm, pCut, 0, 0, 0, 0)); // $lt
+    const prevStart = new Date(Date.UTC(py, pm, 1));
+    const prevEndExcl = siguienteDiaCalendarioUTC(new Date(Date.UTC(py, pm, pCut)));
 
     // 2) Filtros base
     const base = {};
@@ -1808,12 +1792,12 @@ export const kpiWindowVsPrev = async (req, res) => {
     const b = nextDay(bInclusive); // $lt
 
     // Misma ventana del mes anterior (cuidando fin de mes)
-    const y = a.getFullYear(),
-      m = a.getMonth(),
-      d = a.getDate();
-    const y2 = bInclusive.getFullYear(),
-      m2 = bInclusive.getMonth(),
-      d2 = bInclusive.getDate();
+    const y = a.getUTCFullYear(),
+      m = a.getUTCMonth(),
+      d = a.getUTCDate();
+    const y2 = bInclusive.getUTCFullYear(),
+      m2 = bInclusive.getUTCMonth(),
+      d2 = bInclusive.getUTCDate();
 
     const prevY1 = m === 0 ? y - 1 : y;
     const prevM1 = (m + 11) % 12;
@@ -1821,12 +1805,12 @@ export const kpiWindowVsPrev = async (req, res) => {
     const prevM2 = (m2 + 11) % 12;
 
     // clamp del día si el mes anterior no tiene ese día
-    const lastDay = (yy, mm) => new Date(yy, mm + 1, 0).getDate();
+    const lastDay = (yy, mm) => new Date(Date.UTC(yy, mm + 1, 0)).getUTCDate();
     const pd1 = Math.min(d, lastDay(prevY1, prevM1));
     const pd2 = Math.min(d2, lastDay(prevY2, prevM2));
 
-    const prevStart = new Date(prevY1, prevM1, pd1, 0, 0, 0, 0);
-    const prevEndExcl = nextDay(new Date(prevY2, prevM2, pd2, 0, 0, 0, 0));
+    const prevStart = new Date(Date.UTC(prevY1, prevM1, pd1));
+    const prevEndExcl = siguienteDiaCalendarioUTC(new Date(Date.UTC(prevY2, prevM2, pd2)));
 
     // Filtros comunes (igual que en kpiMtdVsPrev)
     const base = {};
@@ -1861,7 +1845,7 @@ export const kpiWindowVsPrev = async (req, res) => {
     const pad2 = (n) => String(n).padStart(2, "0");
 
     const ymd = (dt) =>
-      `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
+      `${dt.getUTCFullYear()}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
     const lastKey = `${ymd(a)} → ${ymd(new Date(b.getTime() - 1))}`;
     const prevKey = `${ymd(prevStart)} → ${ymd(new Date(prevEndExcl.getTime() - 1))}`;
 
@@ -1930,7 +1914,7 @@ export const analyticsResumen = async (req, res) => {
 
     applyOperadorMatch(match, operador);
 
-    const diasHabiles = countBusinessDaysInclusiveLocal(a, bInclusive);
+    const diasHabiles = countBusinessDaysInclusiveCalendar(a, bInclusive);
 
     const cutoffDays = Number(pendientesDias);
     const safeCutoff = Number.isFinite(cutoffDays) && cutoffDays > 0 ? cutoffDays : 7;
@@ -2215,9 +2199,8 @@ export const kpiUltimosTresMeses = async (req, res) => {
     };
 
     // ====== Ventana de 3 meses en UTC ======
-    const now = new Date();
-    const yNow = now.getUTCFullYear();
-    const mNow = now.getUTCMonth();
+    const [yNow, mesAhora] = fechaClaveArgentina().split("-").map(Number);
+    const mNow = mesAhora - 1;
 
     // ej si hoy es 10/10 -> [ago, sep, oct]
     const start = new Date(Date.UTC(yNow, mNow - 2, 1, 0, 0, 0, 0));

@@ -1,6 +1,6 @@
 import Proyeccion from "../models/Proyeccion.js";
 import ExcelJS from "exceljs";
-import { formatearFecha } from "../utils/formatearFecha.js";
+import { formatearFecha, formatearFechaArgentina } from "../utils/formatearFecha.js";
 import Entidad from "../models/Entidad.js";
 import SubCesion from "../models/SubCesion.js";
 import Empleado from "../models/Empleado.js";
@@ -17,6 +17,16 @@ import ReporteGestion from "../models/ReporteGestion.js";
 import Pago from "../models/Pago.js";
 import PagoInformadoMango from "../models/PagoInformadoMango.js";
 import { transformarGestionEnAcuerdo, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
+import {
+  claveFechaCalendario,
+  fechaClaveArgentina,
+  finDiaArgentinaUTC,
+  finDiaCalendarioUTC,
+  inicioDiaArgentinaUTC,
+  inicioDiaCalendarioUTC,
+  siguienteDiaCalendarioUTC,
+  toDateOnly,
+} from "../utils/fecha.util.js";
 
 const rolDe = (req) => req.user.role || req.user.rol;
 const esGestorGlobal = (req) => [ROLES.SUPERVISOR, ROLES.SUPER_ADMIN].includes(rolDe(req));
@@ -91,17 +101,24 @@ const determinarEstadoCierre = (proy) => {
   return "Cerrada incumplida";
 };
 
-const crearFechaLocal = (fechaStr, finDelDia = false) => {
-  const [anio, mes, dia] = fechaStr.split("-").map(Number);
-  return new Date(
-    anio,
-    mes - 1,
-    dia,
-    finDelDia ? 23 : 0,
-    finDelDia ? 59 : 0,
-    finDelDia ? 59 : 0,
-    finDelDia ? 999 : 0
-  );
+// Campos de fecha calendario (promesa/llamado/ReporteGestion) se consultan
+// por su día UTC canónico. Los timestamps reales (creado/modificado) usan
+// límites del día de Buenos Aires convertidos a UTC.
+const crearFechaLocal = (fechaStr, finDelDia = false) =>
+  finDelDia ? finDiaCalendarioUTC(fechaStr) : inicioDiaCalendarioUTC(fechaStr);
+
+const rangoFechaProyeccion = (desde, hasta, tipoFecha = "fechaPromesa") => {
+  const campo = ({
+    fechaPromesa: "fechaPromesa",
+    creado: "creado",
+    modificado: "ultimaModificacion",
+  }[tipoFecha]) || "fechaPromesa";
+  const esTimestamp = campo === "creado" || campo === "ultimaModificacion";
+  return {
+    campo,
+    inicio: esTimestamp ? inicioDiaArgentinaUTC(desde) : inicioDiaCalendarioUTC(desde),
+    fin: esTimestamp ? finDiaArgentinaUTC(hasta) : finDiaCalendarioUTC(hasta),
+  };
 };
 
 
@@ -385,11 +402,7 @@ const enriquecerProyeccionesConFuentes = async (docs = []) => {
     const subId = String(p?.subCesionId?._id || p?.subCesionId || "");
     const clavePago = `${normalizarDni(p?.dni)}|${entidadNumero}|${subId}`;
     const pagosCaso = pagosPorClave.get(clavePago) || [];
-    const fechaSoloISO = (raw) => {
-      if (!raw) return "";
-      const fecha = new Date(raw);
-      return Number.isNaN(fecha.getTime()) ? "" : fecha.toISOString().slice(0, 10);
-    };
+    const fechaSoloISO = (raw) => claveFechaCalendario(raw);
     const corteISO = fechaSoloISO(
       p?.creado || p?.createdAt || p?.fechaPromesaInicial || p?.fechaPromesa
     );
@@ -484,18 +497,17 @@ const construirQueryProyeccionesAdmin = (source = {}, { ids = [] } = {}) => {
   if (sinGestion === true || sinGestion === "true") {
     filtros.push({ $or: [{ vecesTocada: { $exists: false } }, { vecesTocada: null }, { vecesTocada: { $lte: 0 } }] });
   }
-  const hoy = new Date();
-  hoy.setHours(0, 0, 0, 0);
-  const manana = new Date(hoy);
-  manana.setDate(hoy.getDate() + 1);
+  const hoyClave = fechaClaveArgentina();
+  const hoy = inicioDiaCalendarioUTC(hoyClave);
+  const manana = siguienteDiaCalendarioUTC(hoyClave);
   if (promesaHoy === true || promesaHoy === "true") filtros.push({ fechaPromesa: { $gte: hoy, $lt: manana } });
   if (llamadoHoy === true || llamadoHoy === "true") filtros.push({ fechaProximoLlamado: { $gte: hoy, $lt: manana } });
 
   const start = fechaDesde || desde;
   const end = fechaHasta || hasta;
   if (start && end && !Number.isNaN(Date.parse(start)) && !Number.isNaN(Date.parse(end))) {
-    const field = ({ fechaPromesa: "fechaPromesa", creado: "creado", modificado: "ultimaModificacion" }[tipoFecha]) || "fechaPromesa";
-    filtros.push({ [field]: { $gte: crearFechaLocal(start), $lte: crearFechaLocal(end, true) } });
+    const { campo, inicio, fin } = rangoFechaProyeccion(start, end, tipoFecha);
+    filtros.push({ [campo]: { $gte: inicio, $lte: fin } });
   }
   if (buscar) {
     const value = String(buscar).trim();
@@ -511,50 +523,36 @@ const construirQueryProyeccionesAdmin = (source = {}, { ids = [] } = {}) => {
 function parseExcelDate(v) {
   if (v === undefined || v === null || v === "") return null;
 
-  if (v instanceof Date && !isNaN(v)) {
-    const d = new Date(v.getTime());
-    d.setHours(12, 0, 0, 0); // mediodía local para evitar corrimientos
-    return d;
+  if (v instanceof Date && !Number.isNaN(v.getTime())) return toDateOnly(v);
+
+  if (typeof v === "number" && Number.isFinite(v)) {
+    // Mantiene la convención histórica de Excel (epoch 1899-12-30),
+    // pero anclada al mediodía UTC para que el día no dependa del servidor.
+    const epoch = Date.UTC(1899, 11, 30);
+    const d = new Date(epoch + Math.round(v * 86400000));
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 12, 0, 0, 0));
   }
-  if (typeof v === "number" && isFinite(v)) {
-    const epoch = new Date(Date.UTC(1899, 11, 30)); // base Excel
-    const ms = Math.round(v * 86400000);
-    const d = new Date(epoch.getTime() + ms);
-    d.setHours(12, 0, 0, 0);
-    return isNaN(d) ? null : d;
-  }
+
   if (typeof v === "string") {
     const s = v.trim();
     let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$/);
     if (m) {
-      const dd = +m[1],
-        mm = +m[2] - 1;
-      let yy = +m[3];
+      const dd = Number(m[1]);
+      const mm = Number(m[2]);
+      let yy = Number(m[3]);
       if (yy < 100) yy += 2000;
-      const d = new Date(yy, mm, dd, 12, 0, 0, 0);
-      return isNaN(d) ? null : d;
+      return toDateOnly(`${yy}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`);
     }
-    m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
-    if (m) {
-      const d = new Date(+m[1], +m[2] - 1, +m[3], 12, 0, 0, 0);
-      return isNaN(d) ? null : d;
-    }
-    const d = new Date(s);
-    if (!isNaN(d)) {
-      d.setHours(12, 0, 0, 0);
-      return d;
-    }
+    const normalizada = toDateOnly(s);
+    if (normalizada) return normalizada;
   }
   return null;
 }
 
 function clasificarEstado(fechaPromesa) {
-  const hoy = new Date();
-  hoy.setHours(0, 0, 0, 0);
-  const f = fechaPromesa ? new Date(fechaPromesa) : null;
-  if (f && f >= hoy) return "Promesa activa";
-  if (f && f < hoy) return "Promesa caída";
-  return "Pendiente";
+  const clave = claveFechaCalendario(fechaPromesa);
+  if (!clave) return "Pendiente";
+  return clave >= fechaClaveArgentina() ? "Promesa activa" : "Promesa caída";
 }
 
 const estaCerrada = (p) =>
@@ -577,12 +575,11 @@ export const actualizarEstadoAutomaticamente = async (proy) => {
     return proy; // nada que hacer
   }
 
-  const hoy = new Date();
-  hoy.setHours(0, 0, 0, 0);
+  const hoyClave = fechaClaveArgentina();
 
   const importe = parseFloat(proy.importe || 0);
   const pagado = parseFloat(proy.importePagado || 0);
-  const fechaPromesa = proy.fechaPromesa ? new Date(proy.fechaPromesa) : null;
+  const fechaPromesaClave = claveFechaCalendario(proy.fechaPromesa);
 
   let nuevoEstado = proy.estado;
 
@@ -590,12 +587,9 @@ export const actualizarEstadoAutomaticamente = async (proy) => {
     nuevoEstado = "Pagado";
   } else if (pagado > 0 && pagado < importe) {
     nuevoEstado = "Pagado parcial";
-  } else if (pagado === 0 && fechaPromesa) {
-    const fecha = new Date(fechaPromesa);
-    fecha.setHours(0, 0, 0, 0);
-
-    if (fecha.getTime() < hoy.getTime()) nuevoEstado = "Promesa caída";
-    else if (fecha.getTime() === hoy.getTime()) nuevoEstado = "Pendiente";
+  } else if (pagado === 0 && fechaPromesaClave) {
+    if (fechaPromesaClave < hoyClave) nuevoEstado = "Promesa caída";
+    else if (fechaPromesaClave === hoyClave) nuevoEstado = "Pendiente";
     else nuevoEstado = "Promesa activa";
   }
 
@@ -656,11 +650,13 @@ export const crearProyeccion = async (req, res) => {
     const errorIdentidad = validarIdentidadProyeccion({ dni, nombreTitular });
     if (errorIdentidad) return res.status(400).json({ error: errorIdentidad });
 
-    // ✅ Fechas
-    if (isNaN(Date.parse(fechaPromesa))) {
+    // ✅ Fechas calendario: se normalizan una sola vez y se guardan al mediodía UTC.
+    const fechaPromesaDate = parseExcelDate(fechaPromesa);
+    const fechaProximoLlamadoDate = parseExcelDate(fechaProximoLlamado);
+    if (!fechaPromesaDate) {
       return res.status(400).json({ error: "Fecha de promesa inválida" });
     }
-    if (isNaN(Date.parse(fechaProximoLlamado))) {
+    if (!fechaProximoLlamadoDate) {
       return res.status(400).json({ error: "Fecha próximo llamado inválida" });
     }
 
@@ -711,10 +707,9 @@ export const crearProyeccion = async (req, res) => {
       };
     }
 
-    // Datos derivados
-    const fecha = new Date(`${fechaPromesa}T12:00:00`);
-    const anio = fecha.getFullYear();
-    const mes = fecha.getMonth() + 1;
+    // Datos derivados de la fecha calendario canónica.
+    const anio = fechaPromesaDate.getUTCFullYear();
+    const mes = fechaPromesaDate.getUTCMonth() + 1;
 
     // 🔑 ID lógico normalizado
     const idProyeccionLogico = `${dni}-${entidadId}-${subCesionId}`;
@@ -733,9 +728,9 @@ export const crearProyeccion = async (req, res) => {
       subCesionId,
       idProyeccionLogico,
 
-      fechaPromesa,
-      fechaProximoLlamado,
-      fechaPromesaInicial: fechaPromesa,
+      fechaPromesa: fechaPromesaDate,
+      fechaProximoLlamado: fechaProximoLlamadoDate,
+      fechaPromesaInicial: fechaPromesaDate,
       anio,
       mes,
       ...otrosCampos,
@@ -882,11 +877,13 @@ export const actualizarProyeccion = async (req, res) => {
     const errorIdentidadEdicion = validarIdentidadProyeccion({ dni, nombreTitular });
     if (errorIdentidadEdicion) return res.status(400).json({ error: errorIdentidadEdicion });
 
-    // ✅ fechas (si vienen)
-    if (fechaPromesa && isNaN(Date.parse(fechaPromesa))) {
+    // ✅ fechas calendario (si vienen)
+    const fechaPromesaDate = fechaPromesa ? parseExcelDate(fechaPromesa) : null;
+    const fechaProximoLlamadoDate = fechaProximoLlamado ? parseExcelDate(fechaProximoLlamado) : null;
+    if (fechaPromesa && !fechaPromesaDate) {
       return res.status(400).json({ error: "Fecha de promesa inválida" });
     }
-    if (fechaProximoLlamado && isNaN(Date.parse(fechaProximoLlamado))) {
+    if (fechaProximoLlamado && !fechaProximoLlamadoDate) {
       return res.status(400).json({ error: "Fecha próximo llamado inválida" });
     }
 
@@ -944,8 +941,8 @@ export const actualizarProyeccion = async (req, res) => {
       entidadId,
       entidadNumero: entidadCanonica.entidadNumero,
       subCesionId,
-      fechaPromesa,
-      fechaProximoLlamado,
+      fechaPromesa: fechaPromesaDate || proyeccion.fechaPromesa,
+      fechaProximoLlamado: fechaProximoLlamadoDate || proyeccion.fechaProximoLlamado,
       ultimaModificacion: new Date(),
       ...resto,
     };
@@ -953,10 +950,9 @@ export const actualizarProyeccion = async (req, res) => {
     // 🔑 id lógico coherente si cambió algo de la clave
     updateData.idProyeccionLogico = `${dni}-${entidadId}-${subCesionId}`;
 
-    if (fechaPromesa) {
-      const f = new Date(fechaPromesa);
-      updateData.mes = f.getMonth() + 1;
-      updateData.anio = f.getFullYear();
+    if (fechaPromesaDate) {
+      updateData.mes = fechaPromesaDate.getUTCMonth() + 1;
+      updateData.anio = fechaPromesaDate.getUTCFullYear();
     }
 
     let actualizada = await Proyeccion.findByIdAndUpdate(
@@ -1144,18 +1140,15 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
     }
 
     // Hoy (promesas y llamados)
-    const hoy = new Date();
-    hoy.setHours(0, 0, 0, 0);
-    const mañana = new Date(hoy);
-    mañana.setDate(hoy.getDate() + 1);
+    const hoyClave = fechaClaveArgentina();
+    const hoy = inicioDiaCalendarioUTC(hoyClave);
+    const mañana = siguienteDiaCalendarioUTC(hoyClave);
     if (promesaHoy === "true") filtros.push({ fechaPromesa: { $gte: hoy, $lt: mañana } });
     if (llamadoHoy === "true") filtros.push({ fechaProximoLlamado: { $gte: hoy, $lt: mañana } });
 
     // Rango por tipoFecha
     if (fechaDesde && fechaHasta && !isNaN(Date.parse(fechaDesde)) && !isNaN(Date.parse(fechaHasta))) {
-      const inicio = crearFechaLocal(fechaDesde);
-      const fin = crearFechaLocal(fechaHasta, true);
-      const campoFecha = ({ fechaPromesa: "fechaPromesa", creado: "creado", modificado: "ultimaModificacion" }[tipoFecha]) || "fechaPromesa";
+      const { campo: campoFecha, inicio, fin } = rangoFechaProyeccion(fechaDesde, fechaHasta, tipoFecha);
       filtros.push({ [campoFecha]: { $gte: inicio, $lte: fin } });
     }
 
@@ -1534,21 +1527,15 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
       !Number.isNaN(Date.parse(fechaDesde)) &&
       !Number.isNaN(Date.parse(fechaHasta))
     ) {
-      rangoDesde = crearFechaLocal(fechaDesde);
-      rangoHasta = crearFechaLocal(fechaHasta, true);
-      const campoFecha =
-        {
-          fechaPromesa: "fechaPromesa",
-          creado: "creado",
-          modificado: "ultimaModificacion",
-        }[tipoFecha] || "fechaPromesa";
-      filtros.push({ [campoFecha]: { $gte: rangoDesde, $lte: rangoHasta } });
+      const rango = rangoFechaProyeccion(fechaDesde, fechaHasta, tipoFecha);
+      rangoDesde = rango.inicio;
+      rangoHasta = rango.fin;
+      filtros.push({ [rango.campo]: { $gte: rangoDesde, $lte: rangoHasta } });
     }
 
-    const hoy = new Date();
-    hoy.setHours(0, 0, 0, 0);
-    const manana = new Date(hoy);
-    manana.setDate(hoy.getDate() + 1);
+    const hoyClave = fechaClaveArgentina();
+    const hoy = inicioDiaCalendarioUTC(hoyClave);
+    const manana = siguienteDiaCalendarioUTC(hoyClave);
     if (promesaHoy === "true") {
       filtros.push({ fechaPromesa: { $gte: hoy, $lt: manana } });
     }
@@ -1818,20 +1805,12 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
       _detUsuarios: {},
     };
 
-    const hoyDate = new Date();
-    hoyDate.setHours(0, 0, 0, 0);
-    const normalizarFechaResumen = (raw) => {
-      if (!raw) return null;
-      const date = new Date(raw);
-      return Number.isNaN(date.getTime()) ? null : date;
-    };
-    const estaEnRangoPagos = (date) =>
-      !rangoDesde || !rangoHasta || (date >= rangoDesde && date <= rangoHasta);
-    const claveFecha = (date) =>
-      `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
-        2,
-        "0"
-      )}-${String(date.getDate()).padStart(2, "0")}`;
+    const hoyClaveResumen = fechaClaveArgentina();
+    const rangoDesdeClave = rangoDesde ? claveFechaCalendario(rangoDesde) : "";
+    const rangoHastaClave = rangoHasta ? claveFechaCalendario(rangoHasta) : "";
+    const normalizarFechaResumen = (raw) => claveFechaCalendario(raw);
+    const estaEnRangoPagos = (clave) =>
+      !rangoDesdeClave || !rangoHastaClave || (clave >= rangoDesdeClave && clave <= rangoHastaClave);
 
     for (const registro of registrosResumen) {
       const importe = Number(registro.importe || 0) || 0;
@@ -1856,7 +1835,7 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
         estadoRegistro === "Promesa caída" &&
         pagado === 0 &&
         fechaPromesa &&
-        fechaPromesa < hoyDate
+        fechaPromesa < hoyClaveResumen
       ) {
         resumen.vencidasSinPago += 1;
       }
@@ -1869,14 +1848,12 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
         (resumen.subCesiones[subCesionNombre] || 0) + 1;
 
       if (fechaPromesa) {
-        const key = claveFecha(fechaPromesa);
-        resumen.porDia[key] = (resumen.porDia[key] || 0) + 1;
+        resumen.porDia[fechaPromesa] = (resumen.porDia[fechaPromesa] || 0) + 1;
       }
-      const fechaCreacion = normalizarFechaResumen(registro.creado);
+      const fechaCreacion = registro.creado ? fechaClaveArgentina(registro.creado) : "";
       if (fechaCreacion) {
-        const key = claveFecha(fechaCreacion);
-        resumen.porDiaCreacion[key] =
-          (resumen.porDiaCreacion[key] || 0) + 1;
+        resumen.porDiaCreacion[fechaCreacion] =
+          (resumen.porDiaCreacion[fechaCreacion] || 0) + 1;
       }
 
       resumen.porUsuario[usuario] = resumen.porUsuario[usuario] || {
@@ -1903,11 +1880,10 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
           pago.fecha || pago.fechaPago || pago.creado || pago.createdAt
         );
         if (!fechaPago || !estaEnRangoPagos(fechaPago)) continue;
-        const key = claveFecha(fechaPago);
         const montoPago = Number(pago.monto ?? pago.importe ?? 0) || 0;
-        resumen.pagosPorDia[key] = (resumen.pagosPorDia[key] || 0) + 1;
-        resumen.montosPagosPorDia[key] =
-          (resumen.montosPagosPorDia[key] || 0) + montoPago;
+        resumen.pagosPorDia[fechaPago] = (resumen.pagosPorDia[fechaPago] || 0) + 1;
+        resumen.montosPagosPorDia[fechaPago] =
+          (resumen.montosPagosPorDia[fechaPago] || 0) + montoPago;
         resumen.totalPagos += 1;
         resumen.montoPagos += montoPago;
         detalle.cantPagos += 1;
@@ -2030,16 +2006,11 @@ export const informarPago = async (req, res) => {
     }
 
     // Evitar duplicados (mismo día y mismo monto ya cargado y no erróneo)
-    const y = fechaJS.getFullYear();
-    const m = fechaJS.getMonth();
-    const d = fechaJS.getDate();
+    const fechaClave = claveFechaCalendario(fechaJS);
     const duplicado = (proy.pagosInformados || []).some((p) => {
       if (p.erroneo) return false;
-      const pf = new Date(p.fecha);
       return (
-        pf.getFullYear() === y &&
-        pf.getMonth() === m &&
-        pf.getDate() === d &&
+        claveFechaCalendario(p.fecha) === fechaClave &&
         Number(p.monto || 0) === Number(montoNum)
       );
     });
@@ -2451,23 +2422,8 @@ export const importarPagosMasivo = async (req, res) => {
       });
     }
 
-    // Fecha: número Excel, Date o string (dd/mm/yyyy o ISO)
-    const parseFecha = (v) => {
-      if (v == null) return null;
-      if (v instanceof Date) return v;
-      if (typeof v === "number") {
-        const ms = (v - 25569) * 86400 * 1000;
-        const d = new Date(ms);
-        return isNaN(d) ? null : d;
-      }
-      const s = String(v).trim();
-      if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) {
-        const [d, m, a] = s.split("/").map(Number);
-        return new Date(a, m - 1, d, 12, 0, 0, 0);
-      }
-      const d2 = new Date(s);
-      return isNaN(d2) ? null : d2;
-    };
+    // Fecha de pago: misma normalización calendario que el resto del módulo.
+    const parseFecha = (v) => parseExcelDate(v);
 
     const parseMonto = (v) => {
       if (v == null) return NaN;
@@ -2529,16 +2485,11 @@ export const importarPagosMasivo = async (req, res) => {
 
     // Duplicado: mismo día y mismo monto (no erróneo)
     const esDuplicado = (proy, fechaJS, montoNum) => {
-      const y = fechaJS.getFullYear();
-      const m = fechaJS.getMonth();
-      const d = fechaJS.getDate();
+      const fechaClave = claveFechaCalendario(fechaJS);
       return (proy.pagosInformados || []).some((p) => {
         if (p.erroneo) return false;
-        const pf = new Date(p.fecha);
         return (
-          pf.getFullYear() === y &&
-          pf.getMonth() === m &&
-          pf.getDate() === d &&
+          claveFechaCalendario(p.fecha) === fechaClave &&
           Number(p.monto || 0) === Number(montoNum)
         );
       });
@@ -2813,18 +2764,10 @@ export const exportarProyeccionesExcel = async (req, res) => {
       !isNaN(Date.parse(_fechaDesde)) &&
       !isNaN(Date.parse(_fechaHasta))
     ) {
-      const desdeLocal = crearFechaLocal(_fechaDesde);
-      const hastaLocal = crearFechaLocal(_fechaHasta, true);
-
-      const campoFecha = {
-        fechaPromesa: "fechaPromesa",
-        creado: "creado",
-        modificado: "ultimaModificacion",
-      }[tipoFecha];
-
-      if (campoFecha) {
+      const rango = rangoFechaProyeccion(_fechaDesde, _fechaHasta, tipoFecha);
+      if (rango.campo) {
         filtros.push({
-          [campoFecha]: { $gte: desdeLocal, $lte: hastaLocal },
+          [rango.campo]: { $gte: rango.inicio, $lte: rango.fin },
         });
       }
     }
@@ -2919,10 +2862,10 @@ export const exportarProyeccionesExcel = async (req, res) => {
         ),
         fechaPromesa: formatearFecha(p.fechaPromesa),
         fechaProximoLlamado: formatearFecha(p.fechaProximoLlamado),
-        creado: formatearFecha(p.creado),
-        ultimaModificacion: formatearFecha(p.ultimaModificacion),
+        creado: formatearFechaArgentina(p.creado),
+        ultimaModificacion: formatearFechaArgentina(p.ultimaModificacion),
         vecesTocada: p.vecesTocada ?? 0,
-        ultimaGestion: formatearFecha(p.ultimaGestion),
+        ultimaGestion: formatearFechaArgentina(p.ultimaGestion),
         observaciones: p.observaciones,
       });
     });
@@ -2988,15 +2931,10 @@ export const exportarPagosExcel = async (req, res) => {
       !isNaN(Date.parse(fechaDesde)) &&
       !isNaN(Date.parse(fechaHasta))
     ) {
-      rangoDesde = crearFechaLocal(fechaDesde);
-      rangoHasta = crearFechaLocal(fechaHasta, true);
-      const campoFecha =
-        {
-          fechaPromesa: "fechaPromesa",
-          creado: "creado",
-          modificado: "ultimaModificacion",
-        }[tipoFecha] || "fechaPromesa";
-      filtros.push({ [campoFecha]: { $gte: rangoDesde, $lte: rangoHasta } });
+      const rango = rangoFechaProyeccion(fechaDesde, fechaHasta, tipoFecha);
+      rangoDesde = rango.inicio;
+      rangoHasta = rango.fin;
+      filtros.push({ [rango.campo]: { $gte: rangoDesde, $lte: rangoHasta } });
     }
 
     // búsqueda libre
@@ -3363,8 +3301,8 @@ export const importarProyeccionesMasivo = async (req, res) => {
         // SubCesión GLOBAL (por nombre)
         const sub = await getSubCesion(subNombre);
 
-        const anio = fechaProm.getFullYear();
-        const mes = fechaProm.getMonth() + 1;
+        const anio = fechaProm.getUTCFullYear();
+        const mes = fechaProm.getUTCMonth() + 1;
 
         const k = keyPair(dni, entidad._id, sub._id);
 
@@ -3826,8 +3764,7 @@ const calcularEstadoSeguimientoMango = (acuerdo = {}) => {
   }
 
   if (vencimientoISO) {
-    const hoy = new Date();
-    const hoyISO = `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, "0")}-${String(hoy.getDate()).padStart(2, "0")}`;
+    const hoyISO = fechaClaveArgentina();
     if (vencimientoISO < hoyISO) return "Promesa caída";
   }
 
@@ -4121,10 +4058,8 @@ export const informarPagoAcuerdoMango = async (req, res) => {
     if (!fecha || Number.isNaN(fecha.getTime())) return res.status(400).json({ error: "Fecha inválida" });
     if (!Number.isFinite(monto) || monto <= 0) return res.status(400).json({ error: "Monto inválido" });
 
-    const inicio = new Date(fecha);
-    inicio.setHours(0, 0, 0, 0);
-    const fin = new Date(fecha);
-    fin.setHours(23, 59, 59, 999);
+    const inicio = inicioDiaCalendarioUTC(fecha);
+    const fin = finDiaCalendarioUTC(fecha);
     const duplicado = await PagoInformadoMango.exists({
       acuerdoGestionId: req.params.id,
       fecha: { $gte: inicio, $lte: fin },
@@ -4269,7 +4204,7 @@ export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
     worksheet.autoFilter = { from: "A1", to: "T1" };
 
     const buffer = await workbook.xlsx.writeBuffer();
-    const suffix = new Date().toISOString().slice(0, 10);
+    const suffix = fechaClaveArgentina();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename=acuerdos_mango_${suffix}.xlsx`);
     return res.send(Buffer.from(buffer));

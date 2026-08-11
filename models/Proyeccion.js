@@ -190,8 +190,8 @@ proyeccionSchema.pre("validate", function (next) {
 
   if (this.fechaPromesa instanceof Date && !isNaN(this.fechaPromesa)) {
     const d = new Date(this.fechaPromesa);
-    if (!this.anio) this.anio = d.getFullYear();
-    if (!this.mes)  this.mes  = d.getMonth() + 1;
+    if (!this.anio) this.anio = d.getUTCFullYear();
+    if (!this.mes)  this.mes  = d.getUTCMonth() + 1;
     if (!this.fechaPromesaInicial) this.fechaPromesaInicial = this.fechaPromesa;
   }
 
@@ -233,8 +233,8 @@ proyeccionSchema.pre("findOneAndUpdate", async function (next) {
   if ($set.fechaPromesa) {
     const d = new Date($set.fechaPromesa);
     if (!isNaN(d)) {
-      $set.anio = d.getFullYear();
-      $set.mes  = d.getMonth() + 1;
+      $set.anio = d.getUTCFullYear();
+      $set.mes  = d.getUTCMonth() + 1;
       if (!$set.fechaPromesaInicial) $set.fechaPromesaInicial = $set.fechaPromesa;
     }
   }

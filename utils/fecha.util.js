@@ -4,7 +4,119 @@
    Fechas y Horas – utilidades estables para COBRINA / Reportes
    ============================================================ */
 
+export const ZONA_HORARIA_ARGENTINA = "America/Argentina/Buenos_Aires";
+
 const EXCEL_EPOCH = Date.UTC(1899, 11, 31);
+
+const pad2 = (value) => String(value).padStart(2, "0");
+
+function fechaUTCValida(anio, mes, dia) {
+  const d = new Date(Date.UTC(anio, mes - 1, dia, 12, 0, 0, 0));
+  return (
+    d.getUTCFullYear() === anio &&
+    d.getUTCMonth() === mes - 1 &&
+    d.getUTCDate() === dia
+  );
+}
+
+/** YYYY-MM-DD según el reloj/calendario oficial de Buenos Aires. */
+export function fechaClaveArgentina(fecha = new Date()) {
+  const d = fecha instanceof Date ? fecha : new Date(fecha);
+  if (Number.isNaN(d.getTime())) return "";
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: ZONA_HORARIA_ARGENTINA,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(d);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+/** YYYY-MM según Buenos Aires. */
+export function mesClaveArgentina(fecha = new Date()) {
+  return fechaClaveArgentina(fecha).slice(0, 7);
+}
+
+function offsetZonaMinutos(fecha, timeZone = ZONA_HORARIA_ARGENTINA) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    timeZoneName: "longOffset",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(fecha);
+  const name = parts.find((part) => part.type === "timeZoneName")?.value || "GMT+00:00";
+  const match = name.match(/GMT([+-])(\d{2}):(\d{2})/);
+  if (!match) return 0;
+  const minutes = Number(match[2]) * 60 + Number(match[3]);
+  return match[1] === "-" ? -minutes : minutes;
+}
+
+/** Inicio del día de Buenos Aires convertido a instante UTC. */
+export function inicioDiaArgentinaUTC(value = fechaClaveArgentina()) {
+  const key = typeof value === "string" && /^\d{4}-\d{2}-\d{2}/.test(value)
+    ? value.slice(0, 10)
+    : fechaClaveArgentina(value);
+  const [y, m, d] = key.split("-").map(Number);
+  if (!fechaUTCValida(y, m, d)) return null;
+  const referencia = new Date(Date.UTC(y, m - 1, d, 12, 0, 0, 0));
+  const offsetMin = offsetZonaMinutos(referencia);
+  return new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0) - offsetMin * 60000);
+}
+
+export function siguienteDiaArgentinaUTC(value = fechaClaveArgentina()) {
+  const inicio = inicioDiaArgentinaUTC(value);
+  if (!inicio) return null;
+  const key = typeof value === "string" && /^\d{4}-\d{2}-\d{2}/.test(value)
+    ? value.slice(0, 10)
+    : fechaClaveArgentina(value);
+  const [y, m, d] = key.split("-").map(Number);
+  const nextKeyDate = new Date(Date.UTC(y, m - 1, d + 1, 12));
+  const nextKey = `${nextKeyDate.getUTCFullYear()}-${pad2(nextKeyDate.getUTCMonth() + 1)}-${pad2(nextKeyDate.getUTCDate())}`;
+  return inicioDiaArgentinaUTC(nextKey);
+}
+
+export function finDiaArgentinaUTC(value = fechaClaveArgentina()) {
+  const next = siguienteDiaArgentinaUTC(value);
+  return next ? new Date(next.getTime() - 1) : null;
+}
+
+/**
+ * Extrae el día de calendario de un valor persistido como Date/date-only.
+ * Una cadena ISO que empieza con YYYY-MM-DD conserva literalmente ese día.
+ */
+export function claveFechaCalendario(value) {
+  if (value == null || value === "") return "";
+  if (typeof value === "string") {
+    const match = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})(?:$|T|\s)/);
+    if (match) {
+      const [, y, m, d] = match;
+      return fechaUTCValida(Number(y), Number(m), Number(d)) ? `${y}-${m}-${d}` : "";
+    }
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())}`;
+}
+
+export function inicioDiaCalendarioUTC(value) {
+  const key = claveFechaCalendario(value);
+  if (!key) return null;
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+}
+
+export function finDiaCalendarioUTC(value) {
+  const start = inicioDiaCalendarioUTC(value);
+  return start ? new Date(start.getTime() + 86400000 - 1) : null;
+}
+
+export function siguienteDiaCalendarioUTC(value) {
+  const start = inicioDiaCalendarioUTC(value);
+  return start ? new Date(start.getTime() + 86400000) : null;
+}
+
 
 /** Convierte un serial de Excel (día) a Date UTC "solo fecha". */
 export function fromExcelSerial(n) {
@@ -26,6 +138,13 @@ function isYearInRange(y) {
  */
 export function toDateOnly(raw) {
   if (raw == null) return null;
+
+  // Un Date ya persistido como fecha-calendario se lee por sus componentes UTC.
+  if (raw instanceof Date) {
+    if (Number.isNaN(raw.getTime())) return null;
+    return new Date(Date.UTC(raw.getUTCFullYear(), raw.getUTCMonth(), raw.getUTCDate(), 12, 0, 0, 0));
+  }
+
   const sRaw = String(raw).trim();
 
   // 1) número → serial Excel
@@ -49,9 +168,8 @@ export function toDateOnly(raw) {
   if (m) {
     const [, dd, mm, yyyy] = m.map(Number);
     if (!isYearInRange(yyyy)) return null;
-    const d = new Date(Date.UTC(yyyy, mm - 1, dd));
-    d.setUTCHours(12, 0, 0, 0);
-    return isNaN(d) ? null : d;
+    if (!fechaUTCValida(yyyy, mm, dd)) return null;
+    return new Date(Date.UTC(yyyy, mm - 1, dd, 12, 0, 0, 0));
   }
 
   // yyyy-mm-dd
@@ -59,9 +177,8 @@ export function toDateOnly(raw) {
   if (m) {
     const [, yyyy, mm, dd] = m.map(Number);
     if (!isYearInRange(yyyy)) return null;
-    const d = new Date(Date.UTC(yyyy, mm - 1, dd));
-    d.setUTCHours(12, 0, 0, 0);
-    return isNaN(d) ? null : d;
+    if (!fechaUTCValida(yyyy, mm, dd)) return null;
+    return new Date(Date.UTC(yyyy, mm - 1, dd, 12, 0, 0, 0));
   }
 
   return null;

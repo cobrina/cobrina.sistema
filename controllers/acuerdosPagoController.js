@@ -6,6 +6,7 @@ import AcuerdoPago from "../models/AcuerdoPago.js";
 import { parseRowToAcuerdoPago } from "../utils/acuerdosPagoParser.js";
 import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
+import { fechaClaveArgentina } from "../utils/fecha.util.js";
 
 /** Helpers token (igual estilo Reportes Gestiones) */
 function getUsuarioId(req) {
@@ -861,9 +862,7 @@ export async function exportarXlsx(req, res) {
     );
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="acuerdos_pago_${new Date()
-        .toISOString()
-        .slice(0, 10)}.xlsx"`
+      `attachment; filename="acuerdos_pago_${fechaClaveArgentina()}.xlsx"`
     );
 
     return res.status(200).send(buf);

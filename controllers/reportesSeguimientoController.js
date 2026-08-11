@@ -7,8 +7,9 @@ import {
   horarioEfectivoParaFecha,
   minutosEsperadosEnRango,
   minutosActividadSegunHorario,
-  descansoProgramadoSolapadoMin,
+  intervalosLaboralesSinDescanso,
   minutosHoraHHMM,
+  minutoEnDescansoProgramado,
   novedadCubreFecha,
 } from "../utils/calculoAsistencia.js";
 import { toDateOnly } from "../utils/fecha.util.js";
@@ -18,9 +19,9 @@ import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
 const CACHE_TTL_MS = 120_000;
 const cache = new Map();
 
-const CONTINUIDAD_MIN = 30;
+const CONTINUIDAD_MIN = 20;
 const PAUSA_NORMAL_MAX = 15;
-const PAUSA_BREVE_MAX = 30;
+const PAUSA_BREVE_MAX = 20;
 const PAUSA_CRITICA_MIN = 60;
 const MIN_BLOQUE_MIN = 5;
 const TOLERANCIA_FIN_MIN = 30;
@@ -208,7 +209,7 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
     const novedadDia = novedadLaboralDelDia(novedadesEmpleado, item.day);
     const ausenciaJustificada = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
 
-    const gaps = [];
+    const rawIntervals = [];
     const blocks = [];
     let blockStart = first;
     let blockLast = first;
@@ -223,9 +224,7 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
       const previous = item.events[index - 1].minute;
       const current = item.events[index].minute;
       const rawGap = Math.max(0, current - previous);
-      const scheduledRest = descansoProgramadoSolapadoMin(horarioEfectivo.bloquesHorario, previous, current);
-      const gap = Math.max(0, rawGap - scheduledRest);
-      gaps.push(gap);
+      rawIntervals.push({ desdeMin: previous, hastaMin: current, duracionMin: rawGap });
       // Visualmente se conserva el corte real entre gestiones para que la tira
       // muestre los bloques, aunque el descanso programado no penalice como bache.
       if (rawGap > CONTINUIDAD_MIN) {
@@ -236,44 +235,83 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
     }
     blocks.push({ start: blockStart, end: blockLast, durationMin: Math.max(MIN_BLOQUE_MIN, blockLast - blockStart + MIN_BLOQUE_MIN) });
 
-    const brief = gaps.filter((gap) => gap > PAUSA_NORMAL_MAX && gap <= PAUSA_BREVE_MAX);
-    const long = gaps.filter((gap) => gap > PAUSA_BREVE_MAX);
-    const critical = gaps.filter((gap) => gap > PAUSA_CRITICA_MIN);
+    const gapsLaborales = intervalosLaboralesSinDescanso(rawIntervals, horarioEfectivo);
     const workedMin = minutosActividadSegunHorario(first, last, horarioEfectivo);
-    const longTotal = long.reduce((sum, gap) => sum + gap, 0);
     const scheduledStart = minutesOfDay(horarioEfectivo.entrada);
     const scheduledEnd = minutesOfDay(horarioEfectivo.salida);
     const expectedProgrammed = Number(horarioEfectivo.minutosEsperados || 0);
     const expectedMin = ausenciaJustificada ? 0 : expectedProgrammed;
-    const tolerance = Number(horarioEfectivo.toleranciaMinutos || 10);
-    const lateMin = !horarioEfectivo.programado || scheduledStart == null ? 0 : Math.max(0, first - scheduledStart - tolerance);
+    const todayKey = fechaClaveArgentina();
+    const nowMin = minutoActualArgentina();
+    const isToday = item.day === todayKey;
+    const dayEnded = item.day < todayKey || (isToday && Number.isFinite(scheduledEnd) && nowMin >= scheduledEnd);
+    const enDescansoProgramado = isToday && minutoEnDescansoProgramado(nowMin, horarioEfectivo.bloquesHorario);
+
+    // Para la vista de hoy se agrega el corte abierto desde la última gestión hasta
+    // la hora actual. intervalosLaboralesSinDescanso lo recorta por los bloques RRHH,
+    // por lo que un descanso programado jamás se suma al bache.
+    const openGaps = isToday && nowMin > last
+      ? intervalosLaboralesSinDescanso([{ desdeMin: last, hastaMin: nowMin }], horarioEfectivo)
+          .map((gap) => ({ ...gap, actual: !dayEnded }))
+      : [];
+    const allGaps = [
+      ...gapsLaborales.map((gap) => ({ ...gap, actual: false })),
+      ...openGaps,
+    ];
+    const brief = allGaps.filter((gap) => gap.duracionMin > PAUSA_NORMAL_MAX && gap.duracionMin <= PAUSA_BREVE_MAX);
+    const long = allGaps.filter((gap) => gap.duracionMin > PAUSA_BREVE_MAX);
+    const critical = long.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN);
+    const longTotal = long.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
+    const currentPauseMin = openGaps.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
+    const lateMin = !horarioEfectivo.programado || scheduledStart == null ? 0 : Math.max(0, first - scheduledStart);
+    const earlyStartMin = !horarioEfectivo.programado || scheduledStart == null ? 0 : Math.max(0, scheduledStart - first);
     const earlyMin = !horarioEfectivo.programado || scheduledEnd == null ? 0 : Math.max(0, scheduledEnd - last - TOLERANCIA_FIN_MIN);
     const sortedHours = [...hourly.values()].sort((a, b) => b - a);
     const topTwo = (sortedHours[0] || 0) + (sortedHours[1] || 0);
     const concentrationPct = item.events.length ? (topTwo * 100) / item.events.length : 0;
     const uniqueCases = new Set(item.events.map((event) => event.dni).filter(Boolean)).size;
     const diff = expectedMin > 0 ? Math.round(workedMin - expectedMin) : null;
-    const todayKey = fechaClaveArgentina();
-    const nowMin = minutoActualArgentina();
-    const dayEnded = item.day < todayKey || (item.day === todayKey && Number.isFinite(scheduledEnd) && nowMin >= scheduledEnd);
     let estadoHoras = "sin-horario";
     let estadoHorasLabel = horarioEfectivo.horarioLibre ? "Horario libre" : "Sin horario esperado";
     if (novedadDia) {
       estadoHoras = novedadDia.tipo === "falta" ? "falta" : "novedad";
       estadoHorasLabel = etiquetaNovedad(novedadDia);
     } else if (expectedMin > 0) {
-      if (diff >= 16) {
-        estadoHoras = "extra";
-        estadoHorasLabel = `+${humanMinutes(diff)} extra voluntaria`;
-      } else if (diff >= -15) {
-        estadoHoras = "completa";
-        estadoHorasLabel = "Jornada completa";
+      if (isToday && Number.isFinite(scheduledStart) && nowMin < scheduledStart && !item.events.length) {
+        estadoHoras = "pendiente";
+        estadoHorasLabel = `Todavía no inicia · ${horarioEfectivo.entrada}`;
+      } else if (isToday && Number.isFinite(scheduledStart) && nowMin < scheduledStart && item.events.length) {
+        estadoHoras = "en-curso";
+        estadoHorasLabel = earlyStartMin > 0 ? `Actividad antes del horario · inició ${humanMinutes(earlyStartMin)} antes` : "Actividad antes del horario";
+      } else if (enDescansoProgramado) {
+        estadoHoras = "descanso";
+        estadoHorasLabel = "Descanso programado";
       } else if (dayEnded) {
-        estadoHoras = "incompleta";
-        estadoHorasLabel = `Faltan ${humanMinutes(Math.abs(diff))}`;
+        if (diff >= 16) {
+          estadoHoras = "extra";
+          estadoHorasLabel = `+${humanMinutes(diff)} extra voluntaria`;
+        } else if (diff >= -15) {
+          estadoHoras = "completa";
+          estadoHorasLabel = "Jornada completa";
+        } else {
+          estadoHoras = "incompleta";
+          estadoHorasLabel = `Faltan ${humanMinutes(Math.abs(diff))}`;
+        }
+      } else if (currentPauseMin > PAUSA_CRITICA_MIN) {
+        estadoHoras = "alerta";
+        estadoHorasLabel = `Pausa actual ${humanMinutes(currentPauseMin)}`;
+      } else if (currentPauseMin > PAUSA_BREVE_MAX) {
+        estadoHoras = "atencion";
+        estadoHorasLabel = `Pausa actual ${humanMinutes(currentPauseMin)}`;
+      } else if (lateMin > PAUSA_BREVE_MAX) {
+        estadoHoras = "atencion";
+        estadoHorasLabel = `En curso · inició ${humanMinutes(lateMin)} tarde`;
+      } else if (earlyStartMin > PAUSA_BREVE_MAX) {
+        estadoHoras = "en-curso";
+        estadoHorasLabel = `En curso · inició ${humanMinutes(earlyStartMin)} antes`;
       } else {
         estadoHoras = "en-curso";
-        estadoHorasLabel = `En curso · faltan ${humanMinutes(Math.abs(diff))}`;
+        estadoHorasLabel = `En curso · faltan ${humanMinutes(Math.max(0, Math.abs(diff || 0)))}`;
       }
     }
 
@@ -299,7 +337,14 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
       pausasCriticas: critical.length,
       pausaLargaTotalMin: Math.round(longTotal),
       pausaLargaPromedioMin: long.length ? Math.round(longTotal / long.length) : 0,
-      pausaMaximaMin: long.length ? Math.round(Math.max(...long)) : 0,
+      pausaMaximaMin: long.length ? Math.round(Math.max(...long.map((gap) => Number(gap.duracionMin || 0)))) : 0,
+      pausasDetalle: long.map((gap) => ({
+        desde: hhmm(gap.desdeMin),
+        hasta: hhmm(gap.hastaMin),
+        duracionMin: Math.round(Number(gap.duracionMin || 0)),
+        actual: Boolean(gap.actual),
+      })),
+      pausaActualMin: Math.round(currentPauseMin),
       bloques: blocks.map((block) => ({
         desde: hhmm(block.start),
         hasta: hhmm(block.end),
@@ -314,6 +359,7 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
       estadoHoras,
       estadoHorasLabel,
       inicioTardioMin: Math.round(lateMin),
+      inicioAnticipadoMin: Math.round(earlyStartMin),
       finAnticipadoMin: Math.round(earlyMin),
       concentracionDosHorasPct: Math.round(concentrationPct * 10) / 10,
     });
@@ -669,21 +715,43 @@ export async function seguimientoOperadores(req, res) {
         const ausenciaJustificada = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
         const esperado = ausenciaJustificada ? 0 : Number(horario.minutosEsperados || 0);
         const todayKey = fechaClaveArgentina();
+        const startMin = minutesOfDay(horario.entrada);
         const endMin = minutesOfDay(horario.salida);
-        const dayEnded = fecha < todayKey || (fecha === todayKey && Number.isFinite(endMin) && minutoActualArgentina() >= endMin);
+        const nowMin = minutoActualArgentina();
+        const dayEnded = fecha < todayKey || (fecha === todayKey && Number.isFinite(endMin) && nowMin >= endMin);
+        const notStarted = fecha === todayKey && Number.isFinite(startMin) && nowMin < startMin;
+        const enDescanso = fecha === todayKey && minutoEnDescansoProgramado(nowMin, horario.bloquesHorario);
+        const openDesde = Number.isFinite(startMin) ? startMin : null;
+        const openGaps = fecha === todayKey && Number.isFinite(openDesde) && nowMin > openDesde
+          ? intervalosLaboralesSinDescanso([{ desdeMin: openDesde, hastaMin: nowMin }], horario)
+          : [];
+        const pausaActualMin = openGaps.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
+        const pausasDetalle = openGaps.filter((gap) => Number(gap.duracionMin || 0) > PAUSA_BREVE_MAX).map((gap) => ({
+          desde: hhmm(gap.desdeMin), hasta: hhmm(gap.hastaMin), duracionMin: Math.round(Number(gap.duracionMin || 0)), actual: !dayEnded,
+        }));
+        const estadoSinActividad = novedadDia
+          ? (novedadDia.tipo === "falta" ? "falta" : "novedad")
+          : esperado > 0
+            ? (notStarted ? "pendiente" : enDescanso ? "descanso" : dayEnded ? "incompleta" : pausaActualMin > PAUSA_CRITICA_MIN ? "alerta" : "sin-actividad")
+            : "sin-horario";
+        const etiquetaSinActividad = novedadDia
+          ? etiquetaNovedad(novedadDia)
+          : esperado > 0
+            ? (notStarted ? `Todavía no inicia · ${horario.entrada}` : enDescanso ? "Descanso programado" : dayEnded ? `Faltan ${humanMinutes(esperado)}` : `Sin gestiones desde ${horario.entrada} · ${humanMinutes(pausaActualMin)}`)
+            : (horario.horarioLibre ? "Horario libre" : "Sin horario esperado");
         diasSalida = [{
           username, fecha, horarioAsignado: horario.etiqueta, bloquesHorario: horario.bloquesHorario || [],
           jornadaPartida: horario.jornadaPartida, horarioModificado: horario.cambioHorario,
           licenciaMedica: horario.licenciaMedica, horarioLibre: horario.horarioLibre,
           novedadDia: novedadDia ? { tipo: novedadDia.tipo, descripcion: novedadDia.descripcion || "", etiqueta: etiquetaNovedad(novedadDia) } : null,
           primeraGestion: "—", ultimaGestion: "—", franjaTotalMin: 0, horasTrabajadasMin: 0, gestiones: 0, casos: 0,
-          gestionesPorHora: 0, pausasBreves: 0, pausasLargas: 0, pausasCriticas: 0, pausaLargaTotalMin: 0,
-          pausaLargaPromedioMin: 0, pausaMaximaMin: 0, bloques: [], esperadoProgramadoMin: Number(horario.minutosEsperados || 0),
+          gestionesPorHora: 0, pausasBreves: 0, pausasLargas: pausasDetalle.length, pausasCriticas: pausasDetalle.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN).length, pausaLargaTotalMin: pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0),
+          pausaLargaPromedioMin: pausasDetalle.length ? Math.round(pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0) / pausasDetalle.length) : 0, pausaMaximaMin: pausasDetalle.length ? Math.max(...pausasDetalle.map((gap) => gap.duracionMin)) : 0, pausasDetalle, pausaActualMin: Math.round(pausaActualMin), bloques: [], esperadoProgramadoMin: Number(horario.minutosEsperados || 0),
           esperadoMin: esperado, diferenciaPrevistaMin: esperado > 0 ? -esperado : null, faltanMin: esperado, extraMin: 0,
           cumplimientoPct: esperado > 0 ? 0 : null,
-          estadoHoras: novedadDia ? (novedadDia.tipo === "falta" ? "falta" : "novedad") : esperado > 0 ? (dayEnded ? "incompleta" : "en-curso") : "sin-horario",
-          estadoHorasLabel: novedadDia ? etiquetaNovedad(novedadDia) : esperado > 0 ? (dayEnded ? `Faltan ${humanMinutes(esperado)}` : `En curso · faltan ${humanMinutes(esperado)}`) : (horario.horarioLibre ? "Horario libre" : "Sin horario esperado"),
-          inicioTardioMin: 0, finAnticipadoMin: 0, concentracionDosHorasPct: 0,
+          estadoHoras: estadoSinActividad,
+          estadoHorasLabel: etiquetaSinActividad,
+          inicioTardioMin: 0, inicioAnticipadoMin: 0, finAnticipadoMin: 0, concentracionDosHorasPct: 0,
         }];
         alerts.unshift('Sin actividad registrada en el rango seleccionado.');
       }

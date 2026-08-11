@@ -2,7 +2,7 @@
 import mongoose from "mongoose";
 import ReporteGestion from "../models/ReporteGestion.js";
 import { extraerEmails } from "../utils/email.util.js";
-import { toDateOnly, normalizarHora } from "../utils/fecha.util.js";
+import { toDateOnly, normalizarHora, fechaClaveArgentina } from "../utils/fecha.util.js";
 import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
 import Pago from "../models/Pago.js";
@@ -2494,7 +2494,7 @@ async function vincularPagosConAcuerdosSinRomper(acuerdos = [], { fechaHasta = "
         pagosConsultados: payments.length,
         acuerdosEvaluados: acuerdos.length,
         periodoDesde: paymentStart?.toISOString().slice(0, 10) || "",
-        periodoHasta: paymentEnd.toISOString().slice(0, 10),
+        periodoHasta: fechaClaveArgentina(paymentEnd),
       },
     };
   } catch (error) {

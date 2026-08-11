@@ -1,3 +1,5 @@
+import { claveFechaCalendario, fechaClaveArgentina, mesClaveArgentina } from "./fecha.util.js";
+
 export function minutosTrabajadosDesdeMarcas(marcas = []) {
   const ordenadas = [...(Array.isArray(marcas) ? marcas : [])]
     .filter((m) => m?.fecha)
@@ -18,15 +20,18 @@ export function minutosTrabajadosDesdeMarcas(marcas = []) {
 
 export function rangoMesLocal(mes) {
   const match = String(mes || "").match(/^(\d{4})-(\d{2})$/);
-  const ahora = new Date();
-  const anio = match ? Number(match[1]) : ahora.getFullYear();
-  const numeroMes = match ? Number(match[2]) : ahora.getMonth() + 1;
+  const mesBase = match ? `${match[1]}-${match[2]}` : mesClaveArgentina();
+  const [anio, numeroMes] = mesBase.split("-").map(Number);
+  const ultimoDia = new Date(Date.UTC(anio, numeroMes, 0, 12)).getUTCDate();
+  const desdeClave = `${anio}-${String(numeroMes).padStart(2, "0")}-01`;
+  const hastaClave = `${anio}-${String(numeroMes).padStart(2, "0")}-${String(ultimoDia).padStart(2, "0")}`;
   return {
-    mes: `${anio}-${String(numeroMes).padStart(2, "0")}`,
-    desde: new Date(anio, numeroMes - 1, 1, 0, 0, 0, 0),
-    hasta: new Date(anio, numeroMes, 0, 23, 59, 59, 999),
-    desdeClave: `${anio}-${String(numeroMes).padStart(2, "0")}-01`,
-    hastaClave: `${anio}-${String(numeroMes).padStart(2, "0")}-${String(new Date(anio, numeroMes, 0).getDate()).padStart(2, "0")}`,
+    mes: mesBase,
+    // Los campos de pago/novedad son fechas calendario persistidas en UTC.
+    desde: new Date(Date.UTC(anio, numeroMes - 1, 1, 0, 0, 0, 0)),
+    hasta: new Date(Date.UTC(anio, numeroMes, 0, 23, 59, 59, 999)),
+    desdeClave,
+    hastaClave,
   };
 }
 
@@ -118,6 +123,52 @@ export function intervalosAjustadosPorDescanso(intervalos = [], horario = {}) {
   });
 }
 
+// Convierte los huecos entre gestiones en tramos que realmente caen dentro de
+// horas laborales. Si hay jornada partida, el descanso entre bloques se corta
+// por completo: nunca se suma ni se presenta como bache. En horario libre, al
+// no existir una franja fija, se conservan los intervalos reales entre gestiones.
+export function intervalosLaboralesSinDescanso(intervalos = [], horario = {}) {
+  const fuente = (Array.isArray(intervalos) ? intervalos : [])
+    .map((intervalo) => ({
+      ...intervalo,
+      desdeMin: Number(intervalo?.desdeMin),
+      hastaMin: Number(intervalo?.hastaMin),
+    }))
+    .filter((intervalo) => Number.isFinite(intervalo.desdeMin) && Number.isFinite(intervalo.hastaMin) && intervalo.hastaMin > intervalo.desdeMin);
+
+  const bloques = (Array.isArray(horario?.bloquesHorario) ? horario.bloquesHorario : [])
+    .map((bloque) => ({
+      inicio: minutosHoraHHMM(bloque?.entrada),
+      fin: minutosHoraHHMM(bloque?.salida),
+    }))
+    .filter((bloque) => Number.isFinite(bloque.inicio) && Number.isFinite(bloque.fin) && bloque.fin > bloque.inicio)
+    .sort((a, b) => a.inicio - b.inicio);
+
+  if (!bloques.length) {
+    return fuente.map((intervalo) => ({
+      ...intervalo,
+      duracionMin: Math.max(0, Math.round(intervalo.hastaMin - intervalo.desdeMin)),
+    }));
+  }
+
+  const resultado = [];
+  for (const intervalo of fuente) {
+    for (const bloque of bloques) {
+      const desdeMin = Math.max(intervalo.desdeMin, bloque.inicio);
+      const hastaMin = Math.min(intervalo.hastaMin, bloque.fin);
+      if (hastaMin <= desdeMin) continue;
+      resultado.push({
+        ...intervalo,
+        desdeMin,
+        hastaMin,
+        duracionMin: Math.max(0, Math.round(hastaMin - desdeMin)),
+        recortadoPorHorario: desdeMin !== intervalo.desdeMin || hastaMin !== intervalo.hastaMin,
+      });
+    }
+  }
+  return resultado.sort((a, b) => a.desdeMin - b.desdeMin || a.hastaMin - b.hastaMin);
+}
+
 export function minutoDentroDeBloque(minuto, bloques = []) {
   if (!Number.isFinite(minuto)) return false;
   return (Array.isArray(bloques) ? bloques : []).some((bloque) => {
@@ -140,11 +191,7 @@ export function minutoEnDescansoProgramado(minuto, bloques = []) {
 }
 
 export function fechaClaveDesdeValor(value) {
-  if (!value) return "";
-  if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
-  return date.toISOString().slice(0, 10);
+  return claveFechaCalendario(value);
 }
 
 function fechaClaveADateUTC(fechaClave) {
@@ -272,10 +319,9 @@ export function minutosEsperadosEnRango(empleado, desdeClave, hastaClave, noveda
 }
 
 export function minutosEsperadosHastaHoy(empleado, mes, novedades = []) {
-  const { desde, hasta, desdeClave, hastaClave } = rangoMesLocal(mes);
-  const hoy = new Date();
-  const fin = hoy < hasta && hoy >= desde ? hoy : hasta;
-  if (fin < desde) return 0;
-  const finClave = `${fin.getFullYear()}-${String(fin.getMonth() + 1).padStart(2, "0")}-${String(fin.getDate()).padStart(2, "0")}`;
-  return minutosEsperadosEnRango(empleado, desdeClave, finClave || hastaClave, novedades);
+  const { desdeClave, hastaClave } = rangoMesLocal(mes);
+  const hoyClave = fechaClaveArgentina();
+  if (hoyClave < desdeClave) return 0;
+  const finClave = hoyClave < hastaClave ? hoyClave : hastaClave;
+  return minutosEsperadosEnRango(empleado, desdeClave, finClave, novedades);
 }

@@ -11,7 +11,6 @@ export const USUARIOS_NO_CONTROLADOS = new Set([
   "probando",
   "probando-admin",
   "merlo.alejandra",
-  "residual",
   "ksalinas",
 ]);
 

@@ -3,6 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import PoderBia from "../models/PoderBia.js";
 import { normalizarDni } from "../utils/normalizacionNegocio.js";
+import { fechaClaveArgentina, toDateOnly } from "../utils/fecha.util.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -51,7 +52,7 @@ function prepararDescarga(res, registro, filename) {
   res.setHeader("X-Cobrina-Document-Id", String(registro._id));
 }
 
-function normalizarProductos(body = {}) {
+function normalizarProductosGreenLight(body = {}) {
   const recibidos = Array.isArray(body.productos) ? body.productos : [];
   const productos = recibidos
     .map((item) => ({
@@ -75,14 +76,9 @@ export async function generarPoderBia(req, res) {
     const dni = normalizarDni(req.body.dni);
     const nombreTitular = String(req.body.nombreTitular || "").trim().toUpperCase();
     const cartera = String(req.body.cartera || "").trim();
-    const productos = normalizarProductos(req.body);
-    const primerProducto = productos[0] || {};
-    const fechaDocumento = req.body.fechaDocumento ? new Date(req.body.fechaDocumento) : new Date();
-    const productosInvalidos = productos.some((item) => !item.tipoProducto || !item.numeroProducto);
+    const fechaDocumento = toDateOnly(req.body.fechaDocumento || fechaClaveArgentina());
 
-    // Compatibilidad: un frontend anterior de BIA podía no enviar productos.
-    // El frontend nuevo los exige, pero el backend no rompe solicitudes históricas.
-    if (!dni || !nombreTitular || !cartera || productosInvalidos || Number.isNaN(fechaDocumento.getTime())) {
+    if (!dni || !nombreTitular || !cartera || !fechaDocumento) {
       return res.status(400).json({ error: "Completá DNI, titular, cartera y una fecha válida" });
     }
 
@@ -91,10 +87,6 @@ export async function generarPoderBia(req, res) {
       dni,
       nombreTitular,
       cartera,
-      // Compatibilidad histórica: el primer producto también queda en los campos legacy.
-      tipoProducto: primerProducto.tipoProducto,
-      numeroProducto: primerProducto.numeroProducto,
-      productos,
       fechaDocumento,
       entidadNumero: 54,
       entidadNombre: "GRUPO BIA",
@@ -137,25 +129,6 @@ export async function generarPoderBia(req, res) {
     doc.font("Helvetica-Bold").text("Propuesta de Prestación de Servicios de Agencia de Cobranzas", { continued: true });
     doc.font("Helvetica").text(", aceptada por BIA S.R.L. en calidad de titular.");
 
-    if (productos.length) {
-      const productosY = doc.y + 12;
-      if (productos.length === 1) {
-        const item = productos[0];
-        doc.font("Helvetica").fontSize(10.5).text("La gestión comprende el producto ", left, productosY, { width: bodyWidth, continued: true, lineGap: 3 });
-        doc.font("Helvetica-Bold").text(item.tipoProducto.toUpperCase(), { continued: true });
-        doc.font("Helvetica").text(", N° ", { continued: true });
-        doc.font("Helvetica-Bold").text(`${item.numeroProducto}.`);
-      } else {
-        doc.font("Helvetica").fontSize(10.5).text("La gestión comprende los siguientes productos:", left, productosY, { width: bodyWidth, lineGap: 3 });
-        productos.forEach((item, index) => {
-          doc.font("Helvetica").text(`${index + 1}. `, left + 18, doc.y + 4, { width: bodyWidth - 18, continued: true, lineGap: 2 });
-          doc.font("Helvetica-Bold").text(item.tipoProducto.toUpperCase(), { continued: true });
-          doc.font("Helvetica").text(" · N° ", { continued: true });
-          doc.font("Helvetica-Bold").text(item.numeroProducto);
-        });
-      }
-    }
-
     let firmaY = Math.max(585, doc.y + 28);
     if (firmaY > 665) {
       doc.addPage();
@@ -177,12 +150,12 @@ export async function generarPoderGreenLight(req, res) {
     const dni = normalizarDni(req.body.dni);
     const nombreTitular = String(req.body.nombreTitular || "").trim().toUpperCase();
     const cartera = String(req.body.cartera || "").trim().toUpperCase();
-    const productos = normalizarProductos(req.body);
+    const productos = normalizarProductosGreenLight(req.body);
     const primerProducto = productos[0] || {};
-    const fechaDocumento = req.body.fechaDocumento ? new Date(req.body.fechaDocumento) : new Date();
+    const fechaDocumento = toDateOnly(req.body.fechaDocumento || fechaClaveArgentina());
 
     const productosInvalidos = productos.some((item) => !item.tipoProducto || !item.numeroProducto);
-    if (!dni || !nombreTitular || !cartera || !productos.length || productosInvalidos || Number.isNaN(fechaDocumento.getTime())) {
+    if (!dni || !nombreTitular || !cartera || !productos.length || productosInvalidos || !fechaDocumento) {
       return res.status(400).json({
         error: "Completá nombre, DNI, cartera y al menos un tipo + número de producto",
       });

@@ -11,7 +11,8 @@
     "check": "node --check server.js && npm run check:perfiles",
     "check:perfiles": "node scripts/verificarPerfiles.js",
     "diagnosticar:entidades": "node scripts/entidadesCanonicas.js",
-    "migrar:entidades": "node scripts/entidadesCanonicas.js --apply"
+    "migrar:entidades": "node scripts/entidadesCanonicas.js --apply",
+    "check:fechas": "node scripts/verificarFechas.js"
   },
   "keywords": [],
   "author": "",
