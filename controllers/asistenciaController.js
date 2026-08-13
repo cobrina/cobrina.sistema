@@ -7,10 +7,11 @@ import {
   horarioEfectivoParaFecha,
   novedadCubreFecha,
   minutosActividadSegunHorario,
-  intervalosAjustadosPorDescanso,
+  intervalosLaboralesSinDescanso,
+  aplicarBreakFlexible,
+  minutosBreakFlexiblePermitido,
   minutosHoraHHMM,
   minutoEnDescansoProgramado,
-  descansoProgramadoSolapadoMin,
 } from "../utils/calculoAsistencia.js";
 import { actividadDeUsuarioEnFecha } from "../utils/actividadGestiones.js";
 import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
@@ -457,26 +458,37 @@ export async function panel(req, res) {
       const primeraMin = minutosHoraHHMM(actividad?.primeraGestion);
       const ultimaMin = minutosHoraHHMM(actividad?.ultimaGestion);
       const minutosTrabajadosHoy = minutosActividadSegunHorario(primeraMin, ultimaMin, horarioEfectivo);
-      const intervalosAjustados = intervalosAjustadosPorDescanso(actividad?.intervalos || [], horarioEfectivo);
-      const baches30Ajustados = intervalosAjustados.filter((intervalo) => intervalo.duracionMin > 30).length;
-      const baches60Ajustados = intervalosAjustados.filter((intervalo) => intervalo.duracionMin > 60).length;
-      const bacheMaximoAjustado = intervalosAjustados.reduce((maximo, intervalo) => Math.max(maximo, Number(intervalo.duracionMin || 0)), 0);
+      const intervalosLaborales = intervalosLaboralesSinDescanso(actividad?.intervalos || [], horarioEfectivo)
+        .map((intervalo) => ({ ...intervalo, origen: "cerrado" }));
       const ausenciaJustificada = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
       const minutosProgramadosHoy = Number(horarioEfectivo.minutosEsperados || 0);
       const minutosExigiblesHoy = ausenciaJustificada ? 0 : minutosProgramadosHoy;
       const diferenciaHoyMin = minutosExigiblesHoy > 0 ? minutosTrabajadosHoy - minutosExigiblesHoy : null;
       const esHoy = fechaClave === fechaClaveArgentina();
       const ahoraMin = esHoy ? minutoActualArgentina() : null;
+      const entradaProgramadaMin = minutosHoraHHMM(horarioEfectivo.entrada);
       const salidaProgramadaMin = minutosHoraHHMM(horarioEfectivo.salida);
+      const jornadaIniciada = horarioEfectivo.programado && Number.isFinite(entradaProgramadaMin)
+        ? (esHoy ? ahoraMin >= entradaProgramadaMin : fechaClave < fechaClaveArgentina())
+        : false;
       const jornadaFinalizada = horarioEfectivo.programado && Number.isFinite(salidaProgramadaMin)
         ? (esHoy ? ahoraMin >= salidaProgramadaMin : fechaClave < fechaClaveArgentina())
         : false;
       const enDescansoProgramado = esHoy && minutoEnDescansoProgramado(ahoraMin, horarioEfectivo.bloquesHorario);
+      const intervalosAbiertos = esHoy && Number.isFinite(ultimaMin) && Number.isFinite(ahoraMin) && ahoraMin >= ultimaMin
+        ? intervalosLaboralesSinDescanso([{ desdeMin: ultimaMin, hastaMin: ahoraMin }], horarioEfectivo)
+            .map((intervalo) => ({ ...intervalo, origen: "abierto", actual: true }))
+        : [];
+      const ajusteBreak = aplicarBreakFlexible([...intervalosLaborales, ...intervalosAbiertos], horarioEfectivo);
+      const intervalosConBreak = ajusteBreak.intervalos;
+      const intervalosCerradosAjustados = intervalosConBreak.filter((intervalo) => intervalo.origen === "cerrado");
+      const intervalosAbiertosAjustados = intervalosConBreak.filter((intervalo) => intervalo.origen === "abierto");
+      const baches30Ajustados = intervalosCerradosAjustados.filter((intervalo) => intervalo.duracionMin > 30).length;
+      const baches60Ajustados = intervalosCerradosAjustados.filter((intervalo) => intervalo.duracionMin > 60).length;
+      const bacheMaximoAjustado = intervalosCerradosAjustados.reduce((maximo, intervalo) => Math.max(maximo, Number(intervalo.duracionMin || 0)), 0);
       let minutosSinGestion = null;
-      if (esHoy && Number.isFinite(ultimaMin) && Number.isFinite(ahoraMin) && ahoraMin >= ultimaMin) {
-        minutosSinGestion = Math.max(0, Math.round(
-          ahoraMin - ultimaMin - descansoProgramadoSolapadoMin(horarioEfectivo.bloquesHorario, ultimaMin, ahoraMin)
-        ));
+      if (esHoy && intervalosAbiertosAjustados.length) {
+        minutosSinGestion = Math.max(0, Math.round(intervalosAbiertosAjustados.reduce((sum, intervalo) => sum + Number(intervalo.duracionMin || 0), 0)));
       }
 
       return {
@@ -505,6 +517,7 @@ export async function panel(req, res) {
           minutosFranja: Number(actividad?.minutosFranja || 0),
           minutosTrabajadosHoy,
           diferenciaHoyMin,
+          jornadaIniciada,
           jornadaFinalizada,
           enDescansoProgramado,
           minutosSinGestion,
@@ -512,6 +525,15 @@ export async function panel(req, res) {
           baches30: baches30Ajustados,
           baches60: baches60Ajustados,
           bacheMaximoMin: bacheMaximoAjustado,
+          breakPermitidoMin: ajusteBreak.permitidoMin || minutosBreakFlexiblePermitido(horarioEfectivo),
+          breakConsiderado: ajusteBreak.breakDetalle ? {
+            desdeMin: ajusteBreak.breakDetalle.desdeMin,
+            hastaMin: ajusteBreak.breakDetalle.hastaMin,
+            duracionOriginalMin: ajusteBreak.breakDetalle.duracionOriginalMin,
+            breakConsideradoMin: ajusteBreak.breakDetalle.breakConsideradoMin,
+            excedenteMin: ajusteBreak.breakDetalle.excedenteMin,
+            actual: Boolean(ajusteBreak.breakDetalle.actual),
+          } : null,
         },
         novedadDia: novedadDia
           ? {

@@ -127,6 +127,84 @@ export function intervalosAjustadosPorDescanso(intervalos = [], horario = {}) {
 // horas laborales. Si hay jornada partida, el descanso entre bloques se corta
 // por completo: nunca se suma ni se presenta como bache. En horario libre, al
 // no existir una franja fija, se conservan los intervalos reales entre gestiones.
+// Break flexible por jornada (sin horario fijo):
+// - jornada de 4 h: hasta 20 min continuos
+// - jornada de 6 h: hasta 30 min continuos
+// - horario libre: conserva la referencia operativa de 4 h => 20 min
+// El beneficio se aplica una sola vez por día al corte continuo más largo.
+export function minutosBreakFlexiblePermitido(horario = {}) {
+  if (horario?.horarioLibre) return 20;
+  const esperados = Math.max(0, Math.round(Number(horario?.minutosEsperados || 0)));
+  if (esperados === 240) return 20;
+  if (esperados === 360) return 30;
+  return 0;
+}
+
+export function aplicarBreakFlexible(intervalos = [], horario = {}) {
+  const permitidoMin = minutosBreakFlexiblePermitido(horario);
+  const fuente = (Array.isArray(intervalos) ? intervalos : [])
+    .map((intervalo, index) => {
+      const desdeMin = Number(intervalo?.desdeMin);
+      const hastaMin = Number(intervalo?.hastaMin);
+      const duracionOriginalMin = Number.isFinite(desdeMin) && Number.isFinite(hastaMin)
+        ? Math.max(0, Math.round(hastaMin - desdeMin))
+        : Math.max(0, Math.round(Number(intervalo?.duracionMin || 0)));
+      return {
+        ...intervalo,
+        __breakIndex: index,
+        duracionOriginalMin,
+        breakConsideradoMin: 0,
+        breakPermitidoMin: permitidoMin,
+        duracionMin: duracionOriginalMin,
+      };
+    })
+    .filter((intervalo) => intervalo.duracionOriginalMin > 0);
+
+  if (!permitidoMin || !fuente.length) {
+    return { intervalos: fuente.map(({ __breakIndex, ...rest }) => rest), breakDetalle: null, permitidoMin };
+  }
+
+  // Solo hace falta identificar el break cuando el corte ya alcanza 20 min,
+  // que es el umbral desde el que los reportes empiezan a vigilar continuidad.
+  const candidatos = fuente
+    .filter((intervalo) => intervalo.duracionOriginalMin >= 20)
+    .sort((a, b) => b.duracionOriginalMin - a.duracionOriginalMin || a.desdeMin - b.desdeMin);
+  const elegido = candidatos[0] || null;
+  if (!elegido) {
+    return { intervalos: fuente.map(({ __breakIndex, ...rest }) => rest), breakDetalle: null, permitidoMin };
+  }
+
+  const breakConsideradoMin = Math.min(permitidoMin, elegido.duracionOriginalMin);
+  const excedenteMin = Math.max(0, elegido.duracionOriginalMin - breakConsideradoMin);
+  const intervalosSalida = fuente.map((intervalo) => {
+    const seleccionado = intervalo.__breakIndex === elegido.__breakIndex;
+    const { __breakIndex, ...rest } = intervalo;
+    if (!seleccionado) return rest;
+    return {
+      ...rest,
+      breakConsideradoMin,
+      duracionMin: excedenteMin,
+      breakFlexible: true,
+    };
+  });
+
+  return {
+    intervalos: intervalosSalida,
+    permitidoMin,
+    breakDetalle: {
+      desdeMin: elegido.desdeMin,
+      hastaMin: elegido.hastaMin,
+      duracionOriginalMin: elegido.duracionOriginalMin,
+      breakConsideradoMin,
+      breakPermitidoMin: permitidoMin,
+      excedenteMin,
+      actual: Boolean(elegido.actual),
+      abiertoAlCorte: Boolean(elegido.abiertoAlCorte),
+      corteDatosHora: elegido.corteDatosHora || "",
+    },
+  };
+}
+
 export function intervalosLaboralesSinDescanso(intervalos = [], horario = {}) {
   const fuente = (Array.isArray(intervalos) ? intervalos : [])
     .map((intervalo) => ({

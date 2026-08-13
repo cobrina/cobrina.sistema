@@ -28,6 +28,7 @@ import poderBiaRoutes from "./routes/poderBiaRoutes.js";
 import supervisionRoutes from "./routes/supervisionRoutes.js";
 import dashboardRoutes from "./routes/dashboardRoutes.js";
 import { procesarCierresAutomaticos } from "./controllers/asistenciaController.js";
+import { limpiarRegistrosPersonalesAntiguos } from "./utils/retencionPersonal.js";
 
 dotenv.config();
 
@@ -72,6 +73,7 @@ const corsOptions = {
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Cobrina-Confirm-Delete"],
+  exposedHeaders: ["Content-Disposition", "Content-Length", "X-Cobrina-Export-Rows"],
   optionsSuccessStatus: 204,
 };
 
@@ -247,6 +249,20 @@ async function start() {
       procesarCierresAutomaticos();
     }, 60_000);
     asistenciaTimer.unref?.();
+
+    const ejecutarRetencion = async () => {
+      try {
+        const resultado = await limpiarRegistrosPersonalesAntiguos();
+        if (!resultado?.skipped && (resultado?.tareas || resultado?.agenda)) {
+          console.log(`🧹 Retención personal: ${resultado.tareas || 0} tareas y ${resultado.agenda || 0} actividades de agenda eliminadas.`);
+        }
+      } catch (error) {
+        console.error("⚠️ No se pudo ejecutar la retención automática de tareas/agenda:", error?.message || error);
+      }
+    };
+    await ejecutarRetencion();
+    const retencionTimer = setInterval(ejecutarRetencion, 24 * 60 * 60 * 1000);
+    retencionTimer.unref?.();
   } catch (error) {
     console.error("❌ Error conectando a MongoDB:", error?.message || error);
     process.exit(1);

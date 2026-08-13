@@ -14,6 +14,32 @@ export const USUARIOS_NO_CONTROLADOS = new Set([
   "ksalinas",
 ]);
 
+
+// Usuarios que siguen existiendo en Cobrina/RDC, pero no deben aparecer en
+// los cuadros de control de jornada, tiempos y baches.
+export const USUARIOS_NO_CONTROL_TIEMPOS = new Set([
+  "amerlo",
+  "residual",
+  "svillasboa",
+]);
+
+export function esEmpleadoControlTiempos(empleado = {}) {
+  const username = normalizeUsername(empleado?.username);
+  return esEmpleadoControlado(empleado) && !USUARIOS_NO_CONTROL_TIEMPOS.has(username);
+}
+
+export function filtrarEmpleadosControlTiempos(empleados = []) {
+  return (empleados || []).filter(esEmpleadoControlTiempos);
+}
+
+export function usernamesControlTiempos(empleados = []) {
+  return new Set(
+    filtrarEmpleadosControlTiempos(empleados)
+      .map((empleado) => normalizeUsername(empleado?.username))
+      .filter(Boolean)
+  );
+}
+
 export function esEmpleadoControlado(empleado = {}) {
   const username = normalizeUsername(empleado?.username);
   const rolGuardado = normalizeStoredRole(empleado?.role);

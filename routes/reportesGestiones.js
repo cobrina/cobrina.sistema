@@ -11,6 +11,7 @@ import {
   listar,
   limpiar,
   exportarPDF,
+  exportarGestionesExcel,
   catalogos,
   comparativo,
   // ✅ Analytics
@@ -50,6 +51,7 @@ router.delete("/limpiar", guard, limpiar);
    Export
    ========================= */
 router.get("/export/pdf", guard, exportarPDF);
+router.get("/export/excel", guard, exportarGestionesExcel);
 
 /* =========================
    Comparativo

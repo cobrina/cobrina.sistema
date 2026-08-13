@@ -37,6 +37,7 @@ const StickyNoteSchema = new mongoose.Schema(
 
 StickyNoteSchema.index({ userId: 1, status: 1, order: 1 });
 StickyNoteSchema.index({ userId: 1, month: 1, status: 1 });
+StickyNoteSchema.index({ updatedAt: 1 });
 
 export default mongoose.model("StickyNote", StickyNoteSchema);
 export const STICKY_COLORS = COLORS;

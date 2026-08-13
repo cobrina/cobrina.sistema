@@ -8,13 +8,15 @@ import {
   minutosEsperadosEnRango,
   minutosActividadSegunHorario,
   intervalosLaboralesSinDescanso,
+  aplicarBreakFlexible,
+  minutosBreakFlexiblePermitido,
   minutosHoraHHMM,
   minutoEnDescansoProgramado,
   novedadCubreFecha,
 } from "../utils/calculoAsistencia.js";
 import { toDateOnly } from "../utils/fecha.util.js";
 import { criterioPorId } from "../config/auditorias.js";
-import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
+import { filtrarEmpleadosControlTiempos } from "../utils/controlEquipo.js";
 
 const CACHE_TTL_MS = 120_000;
 const cache = new Map();
@@ -22,9 +24,11 @@ const cache = new Map();
 const CONTINUIDAD_MIN = 20;
 const PAUSA_NORMAL_MAX = 15;
 const PAUSA_BREVE_MAX = 20;
-const PAUSA_CRITICA_MIN = 60;
+const PAUSA_CRITICA_MIN = 30;
 const MIN_BLOQUE_MIN = 5;
 const TOLERANCIA_FIN_MIN = 30;
+const TARDANZA_INICIO_VISIBLE_MIN = 15;
+const ANTICIPO_INICIO_VISIBLE_MIN = 30;
 
 const TIME_ZONE = "America/Argentina/Buenos_Aires";
 
@@ -186,7 +190,16 @@ function isSingleDayRange(desde, hasta) {
   return Boolean(desde && hasta && desde.toISOString().slice(0, 10) === hasta.toISOString().slice(0, 10));
 }
 
-function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()) {
+function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map(), evaluationContext = {}) {
+  const {
+    todayKey = fechaClaveArgentina(),
+    viewNowMin = minutoActualArgentina(),
+    dataCutoffMin = null,
+    sourceFresh = false,
+    sourceUpdatedToday = false,
+    dataCutoffLabel = "",
+  } = evaluationContext || {};
+
   const grouped = new Map();
   for (const row of rows) {
     const username = String(row.usuario || "").trim().toLowerCase();
@@ -241,28 +254,45 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
     const scheduledEnd = minutesOfDay(horarioEfectivo.salida);
     const expectedProgrammed = Number(horarioEfectivo.minutosEsperados || 0);
     const expectedMin = ausenciaJustificada ? 0 : expectedProgrammed;
-    const todayKey = fechaClaveArgentina();
-    const nowMin = minutoActualArgentina();
     const isToday = item.day === todayKey;
-    const dayEnded = item.day < todayKey || (isToday && Number.isFinite(scheduledEnd) && nowMin >= scheduledEnd);
-    const enDescansoProgramado = isToday && minutoEnDescansoProgramado(nowMin, horarioEfectivo.bloquesHorario);
+    const cutoffMin = isToday && sourceUpdatedToday && Number.isFinite(dataCutoffMin)
+      ? Math.min(viewNowMin, Number(dataCutoffMin))
+      : null;
+    const stateNowMin = isToday && Number.isFinite(cutoffMin) ? cutoffMin : viewNowMin;
+    const dayEnded = item.day < todayKey || (isToday && Number.isFinite(scheduledEnd) && stateNowMin >= scheduledEnd);
+    const enDescansoProgramado = isToday && minutoEnDescansoProgramado(stateNowMin, horarioEfectivo.bloquesHorario);
 
-    // Para la vista de hoy se agrega el corte abierto desde la última gestión hasta
-    // la hora actual. intervalosLaboralesSinDescanso lo recorta por los bloques RRHH,
-    // por lo que un descanso programado jamás se suma al bache.
-    const openGaps = isToday && nowMin > last
-      ? intervalosLaboralesSinDescanso([{ desdeMin: last, hastaMin: nowMin }], horarioEfectivo)
-          .map((gap) => ({ ...gap, actual: !dayEnded }))
+    // Para hoy, un corte abierto solo se extiende hasta el último reporte manual
+    // efectivamente cargado. Nunca inventamos una pausa hasta la hora de consulta si
+    // las gestiones están desactualizadas. Si la fuente es reciente, sí se marca como
+    // pausa actual; si no, queda como "abierto al corte de datos".
+    const openGaps = isToday && Number.isFinite(cutoffMin) && cutoffMin > last
+      ? intervalosLaboralesSinDescanso([{ desdeMin: last, hastaMin: cutoffMin }], horarioEfectivo)
+          .map((gap) => ({
+            ...gap,
+            actual: Boolean(sourceFresh && !dayEnded),
+            abiertoAlCorte: Boolean(!sourceFresh && !dayEnded),
+            corteDatosHora: dataCutoffLabel || hhmm(cutoffMin),
+          }))
       : [];
-    const allGaps = [
-      ...gapsLaborales.map((gap) => ({ ...gap, actual: false })),
-      ...openGaps,
+    const allGapsRaw = [
+      ...gapsLaborales.map((gap) => ({ ...gap, actual: false, origen: "cerrado" })),
+      ...openGaps.map((gap) => ({ ...gap, origen: "abierto" })),
     ];
+    const ajusteBreak = aplicarBreakFlexible(allGapsRaw, horarioEfectivo);
+    const allGaps = ajusteBreak.intervalos;
+    const breakDetalle = ajusteBreak.breakDetalle;
+    const breakPermitidoMin = ajusteBreak.permitidoMin || minutosBreakFlexiblePermitido(horarioEfectivo);
     const brief = allGaps.filter((gap) => gap.duracionMin > PAUSA_NORMAL_MAX && gap.duracionMin <= PAUSA_BREVE_MAX);
     const long = allGaps.filter((gap) => gap.duracionMin > PAUSA_BREVE_MAX);
-    const critical = long.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN);
+    const critical = long.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN && !gap.abiertoAlCorte);
     const longTotal = long.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
-    const currentPauseMin = openGaps.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
+    const currentPauseMin = allGaps
+      .filter((gap) => gap.origen === "abierto")
+      .reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
+    const breakActualCubriendoPausa = Boolean(
+      breakDetalle?.actual && Number(breakDetalle?.breakConsideradoMin || 0) > 0 && currentPauseMin <= PAUSA_BREVE_MAX
+    );
     const lateMin = !horarioEfectivo.programado || scheduledStart == null ? 0 : Math.max(0, first - scheduledStart);
     const earlyStartMin = !horarioEfectivo.programado || scheduledStart == null ? 0 : Math.max(0, scheduledStart - first);
     const earlyMin = !horarioEfectivo.programado || scheduledEnd == null ? 0 : Math.max(0, scheduledEnd - last - TOLERANCIA_FIN_MIN);
@@ -277,17 +307,20 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
       estadoHoras = novedadDia.tipo === "falta" ? "falta" : "novedad";
       estadoHorasLabel = etiquetaNovedad(novedadDia);
     } else if (expectedMin > 0) {
-      if (isToday && Number.isFinite(scheduledStart) && nowMin < scheduledStart && !item.events.length) {
+      if (isToday && Number.isFinite(scheduledStart) && stateNowMin < scheduledStart && !item.events.length) {
         estadoHoras = "pendiente";
         estadoHorasLabel = `Todavía no inicia · ${horarioEfectivo.entrada}`;
-      } else if (isToday && Number.isFinite(scheduledStart) && nowMin < scheduledStart && item.events.length) {
+      } else if (isToday && Number.isFinite(scheduledStart) && stateNowMin < scheduledStart && item.events.length) {
         estadoHoras = "en-curso";
-        estadoHorasLabel = earlyStartMin > 0 ? `Actividad antes del horario · inició ${humanMinutes(earlyStartMin)} antes` : "Actividad antes del horario";
+        estadoHorasLabel = earlyStartMin >= ANTICIPO_INICIO_VISIBLE_MIN ? `Actividad antes del horario · inició ${humanMinutes(earlyStartMin)} antes` : "En curso";
       } else if (enDescansoProgramado) {
         estadoHoras = "descanso";
-        estadoHorasLabel = "Descanso programado";
+        estadoHorasLabel = "Entre bloques de horario";
       } else if (dayEnded) {
-        if (diff >= 16) {
+        if (!item.events.length) {
+          estadoHoras = "sin-actividad";
+          estadoHorasLabel = "Ausente · sin gestiones";
+        } else if (diff >= 16) {
           estadoHoras = "extra";
           estadoHorasLabel = `+${humanMinutes(diff)} extra voluntaria`;
         } else if (diff >= -15) {
@@ -297,16 +330,26 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
           estadoHoras = "incompleta";
           estadoHorasLabel = `Faltan ${humanMinutes(Math.abs(diff))}`;
         }
-      } else if (currentPauseMin > PAUSA_CRITICA_MIN) {
+      } else if (!item.events.length) {
+        estadoHoras = "sin-actividad";
+        estadoHorasLabel = "No inició · sin gestiones";
+      } else if (sourceFresh && breakActualCubriendoPausa) {
+        estadoHoras = "descanso";
+        const totalPausa = Number(breakDetalle?.duracionOriginalMin || 0);
+        const considerado = Number(breakDetalle?.breakConsideradoMin || 0);
+        estadoHorasLabel = totalPausa <= considerado
+          ? `Break considerado · ${humanMinutes(totalPausa)} de ${humanMinutes(breakPermitidoMin)}`
+          : `Break considerado · ${humanMinutes(considerado)} + ${humanMinutes(currentPauseMin)} de excedente`;
+      } else if (sourceFresh && currentPauseMin > PAUSA_CRITICA_MIN) {
         estadoHoras = "alerta";
-        estadoHorasLabel = `Pausa actual ${humanMinutes(currentPauseMin)}`;
-      } else if (currentPauseMin > PAUSA_BREVE_MAX) {
+        estadoHorasLabel = `Bache actual ${humanMinutes(currentPauseMin)}`;
+      } else if (sourceFresh && currentPauseMin > PAUSA_BREVE_MAX) {
         estadoHoras = "atencion";
-        estadoHorasLabel = `Pausa actual ${humanMinutes(currentPauseMin)}`;
-      } else if (lateMin > PAUSA_BREVE_MAX) {
+        estadoHorasLabel = `Corte actual ${humanMinutes(currentPauseMin)}`;
+      } else if (lateMin > TARDANZA_INICIO_VISIBLE_MIN) {
         estadoHoras = "atencion";
         estadoHorasLabel = `En curso · inició ${humanMinutes(lateMin)} tarde`;
-      } else if (earlyStartMin > PAUSA_BREVE_MAX) {
+      } else if (earlyStartMin >= ANTICIPO_INICIO_VISIBLE_MIN) {
         estadoHoras = "en-curso";
         estadoHorasLabel = `En curso · inició ${humanMinutes(earlyStartMin)} antes`;
       } else {
@@ -324,7 +367,7 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
       horarioModificado: horarioEfectivo.cambioHorario,
       licenciaMedica: horarioEfectivo.licenciaMedica,
       horarioLibre: horarioEfectivo.horarioLibre,
-      novedadDia: novedadDia ? { tipo: novedadDia.tipo, descripcion: novedadDia.descripcion || "", etiqueta: etiquetaNovedad(novedadDia) } : null,
+      novedadDia: novedadDia ? { tipo: novedadDia.tipo, descripcion: novedadDia.descripcion || "", etiqueta: etiquetaNovedad(novedadDia), justificado: Boolean(novedadDia.justificado || ["falta-justificada", "licencia-medica", "dia-estudio", "permiso"].includes(novedadDia.tipo)) } : null,
       primeraGestion: hhmm(first),
       ultimaGestion: hhmm(last),
       franjaTotalMin: Math.max(0, last - first),
@@ -342,9 +385,29 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
         desde: hhmm(gap.desdeMin),
         hasta: hhmm(gap.hastaMin),
         duracionMin: Math.round(Number(gap.duracionMin || 0)),
+        duracionOriginalMin: Math.round(Number(gap.duracionOriginalMin ?? gap.duracionMin ?? 0)),
+        breakConsideradoMin: Math.round(Number(gap.breakConsideradoMin || 0)),
+        breakPermitidoMin: Math.round(Number(gap.breakPermitidoMin || breakPermitidoMin || 0)),
         actual: Boolean(gap.actual),
+        abiertoAlCorte: Boolean(gap.abiertoAlCorte),
+        corteDatosHora: gap.corteDatosHora || "",
       })),
-      pausaActualMin: Math.round(currentPauseMin),
+      breakPermitidoMin: Math.round(Number(breakPermitidoMin || 0)),
+      breakConsiderado: breakDetalle ? {
+        desde: hhmm(breakDetalle.desdeMin),
+        hasta: hhmm(breakDetalle.hastaMin),
+        duracionOriginalMin: Math.round(Number(breakDetalle.duracionOriginalMin || 0)),
+        breakConsideradoMin: Math.round(Number(breakDetalle.breakConsideradoMin || 0)),
+        breakPermitidoMin: Math.round(Number(breakDetalle.breakPermitidoMin || 0)),
+        excedenteMin: Math.round(Number(breakDetalle.excedenteMin || 0)),
+        actual: Boolean(breakDetalle.actual),
+        abiertoAlCorte: Boolean(breakDetalle.abiertoAlCorte),
+        corteDatosHora: breakDetalle.corteDatosHora || "",
+      } : null,
+      pausaActualMin: sourceFresh ? Math.round(currentPauseMin) : 0,
+      pausaAlCorteMin: sourceFresh ? 0 : Math.round(currentPauseMin),
+      corteDatosHora: isToday ? (dataCutoffLabel || (Number.isFinite(cutoffMin) ? hhmm(cutoffMin) : "")) : "",
+      fuenteActualizada: !isToday || Boolean(sourceFresh),
       bloques: blocks.map((block) => ({
         desde: hhmm(block.start),
         hasta: hhmm(block.end),
@@ -407,7 +470,7 @@ function summarizeDaily(rows, employee, desde, hasta, novedades = []) {
     pausaMaximaMin: max("pausaMaximaMin"),
     diasInicioTardio: rows.filter((row) => row.inicioTardioMin > 0).length,
     diasFinAnticipado: rows.filter((row) => row.finAnticipadoMin > 0).length,
-    diasMenosCuatroHoras: horarioLibre ? 0 : rows.filter((row) => row.horasTrabajadasMin < 240).length,
+    diasMenosCuatroHoras: rows.filter((row) => row.horasTrabajadasMin < 240).length,
     diasActividadConcentrada: rows.filter((row) => row.concentracionDosHorasPct >= 50).length,
   };
 }
@@ -577,12 +640,12 @@ function aggregateAudit(audits) {
 
 function buildActivityRecommendations(summary) {
   const alerts = [];
-  if (!summary.horarioLibre && summary.diasMenosCuatroHoras) alerts.push(`${summary.diasMenosCuatroHoras} día(s) con menos de 4 horas trabajadas según Mango.`);
-  if (summary.pausasCriticas) alerts.push(`${summary.pausasCriticas} pausa(s) crítica(s) superiores a 60 minutos.`);
+  if (summary.diasMenosCuatroHoras) alerts.push(`${summary.diasMenosCuatroHoras} día(s) con menos de 4 horas registradas según Mango.`);
+  if (!summary.horarioLibre && summary.pausasCriticas) alerts.push(`${summary.pausasCriticas} bache(s) urgente(s) de más de 30 minutos.`);
   if (summary.diasInicioTardio) alerts.push(`${summary.diasInicioTardio} día(s) con inicio posterior al horario y tolerancia configurados.`);
   if (summary.diasActividadConcentrada) alerts.push(`${summary.diasActividadConcentrada} día(s) con más del 50 % de las gestiones concentradas en solo dos horas.`);
   if (!alerts.length) alerts.push(summary.horarioLibre
-    ? "Horario libre: se informa actividad real sin calcular tardanzas, faltas horarias ni cumplimiento de una franja fija."
+    ? "Horario libre: la referencia de control es completar 4 horas diarias; los cortes internos se muestran como información y no generan una devolución si se cumple ese total."
     : "No se detectaron alertas principales de actividad con los criterios actuales.");
   return alerts;
 }
@@ -631,7 +694,7 @@ async function resolveEmployees(req) {
     .select("username nombre role horarioLaboral")
     .maxTimeMS(5_000)
     .lean();
-  const controlled = filtrarEmpleadosControlados(allEmployees);
+  const controlled = filtrarEmpleadosControlTiempos(allEmployees);
   const employees = requested.length
     ? controlled.filter((employee) => requested.includes(String(employee.username || "").trim().toLowerCase()))
     : controlled;
@@ -658,6 +721,10 @@ export async function seguimientoOperadores(req, res) {
       return res.json({ ok: true, modo: "general", operadores: [], definiciones: {}, meta: { duracionMs: Date.now() - startedAt } });
     }
 
+    const hoyConsultaClave = fechaClaveArgentina();
+    const rangoIncluyeHoy =
+      desde.toISOString().slice(0, 10) <= hoyConsultaClave &&
+      hasta.toISOString().slice(0, 10) >= hoyConsultaClave;
     const cacheKey = `actividad:${JSON.stringify({
       scope: ownerScope(req),
       desde: desde.toISOString(),
@@ -668,18 +735,29 @@ export async function seguimientoOperadores(req, res) {
       estadoCuenta: req.query.estadoCuenta || "",
       dni: req.query.dni || "",
     })}`;
-    const cached = cache.get(cacheKey);
+    const cached = !rangoIncluyeHoy ? cache.get(cacheKey) : null;
     if (cached && cached.expires > Date.now()) return res.json(cached.data);
 
     const match = buildCommonFilters(req, usernames, desde, hasta);
+    const sourceMatch = {
+      ...ownerScope(req),
+      borrado: { $ne: true },
+      // Para decidir si un corte de HOY es realmente actual, la referencia debe
+      // salir de registros cuyo día de gestión sea hoy. Una importación hecha hoy
+      // que contenga solamente días históricos no debe hacer que proyectemos la
+      // actividad del día actual.
+      fecha: rangoIncluyeHoy
+        ? { $gte: startDay(hoyConsultaClave), $lte: endDay(hoyConsultaClave) }
+        : { $gte: desde, $lte: hasta },
+    };
 
     // Esta consulta contiene solamente los cuatro campos necesarios. El orden se
     // realiza en memoria después de filtrar al operador/rango, evitando un sort
     // costoso sobre toda la colección cuando la consulta administrativa no usa propietario.
     const employeeIds = [...employeeByUsername.values()].map((employee) => employee._id).filter(Boolean);
-    const [rows, novedadesHorario] = await Promise.all([
+    const [rows, novedadesHorario, ultimaFuenteGestiones] = await Promise.all([
       ReporteGestion.find(match)
-        .select("usuario fecha hora dni")
+        .select("usuario fecha hora dni createdAt fuenteArchivo")
         .maxTimeMS(15_000)
         .lean(),
       employeeIds.length
@@ -691,7 +769,44 @@ export async function seguimientoOperadores(req, res) {
             $or: [{ fechaHasta: null }, { fechaHasta: { $gte: desde } }],
           }).lean()
         : Promise.resolve([]),
+      ReporteGestion.findOne(sourceMatch)
+        .sort({ createdAt: -1, _id: -1 })
+        .select("createdAt fecha fuenteArchivo")
+        .lean(),
     ]);
+
+    const consultaAhora = new Date();
+    const consultaClave = fechaClaveArgentina(consultaAhora);
+    const vistaAhoraMin = minutoActualArgentina(consultaAhora);
+    const fuenteActualizadaEn = ultimaFuenteGestiones?.createdAt ? new Date(ultimaFuenteGestiones.createdAt) : null;
+    const fuenteActualizadaHoy = Boolean(
+      fuenteActualizadaEn &&
+      !Number.isNaN(fuenteActualizadaEn.getTime()) &&
+      fechaClaveArgentina(fuenteActualizadaEn) === consultaClave
+    );
+    const fuenteCorteMin = fuenteActualizadaHoy ? minutoActualArgentina(fuenteActualizadaEn) : null;
+    const desfaseFuenteMin = fuenteActualizadaHoy && Number.isFinite(fuenteCorteMin)
+      ? Math.max(0, Math.round(vistaAhoraMin - fuenteCorteMin))
+      : null;
+    // El Reporte de Gestiones se actualiza de forma manual. Para no presentar como
+    // “pausa actual” un tramo que solo está confirmado hasta una carga anterior,
+    // únicamente consideramos la fuente actual si fue cargada en el mismo minuto
+    // de la consulta. En cualquier otro caso se muestra explícitamente “al corte”.
+    const fuenteReciente = fuenteActualizadaHoy && Number(desfaseFuenteMin || 0) === 0;
+    const corteDatosMin = fuenteActualizadaHoy && Number.isFinite(fuenteCorteMin)
+      ? Math.min(vistaAhoraMin, fuenteCorteMin)
+      : null;
+    const corteDatosHora = Number.isFinite(corteDatosMin) ? hhmm(corteDatosMin) : "";
+
+    const evaluationContext = {
+      todayKey: consultaClave,
+      viewNowMin: vistaAhoraMin,
+      dataCutoffMin: corteDatosMin,
+      dataCutoffLabel: corteDatosHora,
+      sourceFresh: fuenteReciente,
+      sourceUpdatedToday: fuenteActualizadaHoy,
+    };
+
     const novedadesByEmployee = new Map();
     for (const novedad of novedadesHorario) {
       const key = String(novedad.empleadoId);
@@ -699,7 +814,7 @@ export async function seguimientoOperadores(req, res) {
       novedadesByEmployee.get(key).push(novedad);
     }
 
-    const daily = groupActivity(rows, employeeByUsername, novedadesByEmployee);
+    const daily = groupActivity(rows, employeeByUsername, novedadesByEmployee, evaluationContext);
     const includeDailyRows = usernames.length === 1 || isSingleDayRange(desde, hasta);
     const operadores = usernames.map((username) => {
       const employee = employeeByUsername.get(username) || { username };
@@ -714,39 +829,63 @@ export async function seguimientoOperadores(req, res) {
         const novedadDia = novedadLaboralDelDia(novedadesEmpleado, fecha);
         const ausenciaJustificada = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
         const esperado = ausenciaJustificada ? 0 : Number(horario.minutosEsperados || 0);
-        const todayKey = fechaClaveArgentina();
+        const todayKey = evaluationContext.todayKey || fechaClaveArgentina();
         const startMin = minutesOfDay(horario.entrada);
         const endMin = minutesOfDay(horario.salida);
-        const nowMin = minutoActualArgentina();
-        const dayEnded = fecha < todayKey || (fecha === todayKey && Number.isFinite(endMin) && nowMin >= endMin);
-        const notStarted = fecha === todayKey && Number.isFinite(startMin) && nowMin < startMin;
-        const enDescanso = fecha === todayKey && minutoEnDescansoProgramado(nowMin, horario.bloquesHorario);
+        const esHoy = fecha === todayKey;
+        const cutoffDisponible = esHoy && evaluationContext.sourceUpdatedToday && Number.isFinite(evaluationContext.dataCutoffMin);
+        const stateNowMin = cutoffDisponible ? Number(evaluationContext.dataCutoffMin) : Number(evaluationContext.viewNowMin ?? minutoActualArgentina());
+        const dayEnded = fecha < todayKey || (esHoy && Number.isFinite(endMin) && stateNowMin >= endMin);
+        const notStarted = esHoy && Number.isFinite(startMin) && stateNowMin < startMin;
+        const enDescanso = esHoy && minutoEnDescansoProgramado(stateNowMin, horario.bloquesHorario);
         const openDesde = Number.isFinite(startMin) ? startMin : null;
-        const openGaps = fecha === todayKey && Number.isFinite(openDesde) && nowMin > openDesde
-          ? intervalosLaboralesSinDescanso([{ desdeMin: openDesde, hastaMin: nowMin }], horario)
+        const openGaps = cutoffDisponible && Number.isFinite(openDesde) && stateNowMin > openDesde
+          ? intervalosLaboralesSinDescanso([{ desdeMin: openDesde, hastaMin: stateNowMin }], horario)
           : [];
-        const pausaActualMin = openGaps.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
+        const pausaAlCorteMin = openGaps.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
+        const pausaActualMin = evaluationContext.sourceFresh ? pausaAlCorteMin : 0;
         const pausasDetalle = openGaps.filter((gap) => Number(gap.duracionMin || 0) > PAUSA_BREVE_MAX).map((gap) => ({
-          desde: hhmm(gap.desdeMin), hasta: hhmm(gap.hastaMin), duracionMin: Math.round(Number(gap.duracionMin || 0)), actual: !dayEnded,
+          desde: hhmm(gap.desdeMin),
+          hasta: hhmm(gap.hastaMin),
+          duracionMin: Math.round(Number(gap.duracionMin || 0)),
+          actual: Boolean(evaluationContext.sourceFresh && !dayEnded),
+          abiertoAlCorte: Boolean(!evaluationContext.sourceFresh && !dayEnded),
+          corteDatosHora: evaluationContext.dataCutoffLabel || hhmm(stateNowMin),
         }));
+        const fuenteSinActualizarHoy = esHoy && !evaluationContext.sourceUpdatedToday;
+        const fuenteDesactualizada = esHoy && evaluationContext.sourceUpdatedToday && !evaluationContext.sourceFresh;
         const estadoSinActividad = novedadDia
           ? (novedadDia.tipo === "falta" ? "falta" : "novedad")
-          : esperado > 0
-            ? (notStarted ? "pendiente" : enDescanso ? "descanso" : dayEnded ? "incompleta" : pausaActualMin > PAUSA_CRITICA_MIN ? "alerta" : "sin-actividad")
-            : "sin-horario";
+          : fuenteSinActualizarHoy
+            ? "pendiente"
+            : esperado > 0
+              ? (notStarted ? "pendiente" : enDescanso ? "descanso" : dayEnded ? "sin-actividad" : evaluationContext.sourceFresh && pausaActualMin > PAUSA_CRITICA_MIN ? "alerta" : fuenteDesactualizada ? "en-curso" : "sin-actividad")
+              : "sin-horario";
         const etiquetaSinActividad = novedadDia
           ? etiquetaNovedad(novedadDia)
-          : esperado > 0
-            ? (notStarted ? `Todavía no inicia · ${horario.entrada}` : enDescanso ? "Descanso programado" : dayEnded ? `Faltan ${humanMinutes(esperado)}` : `Sin gestiones desde ${horario.entrada} · ${humanMinutes(pausaActualMin)}`)
-            : (horario.horarioLibre ? "Horario libre" : "Sin horario esperado");
+          : fuenteSinActualizarHoy
+            ? "Gestiones sin actualización de hoy"
+            : esperado > 0
+              ? (notStarted
+                  ? `Todavía no inicia · ${horario.entrada}`
+                  : enDescanso
+                    ? "Entre bloques de horario"
+                    : dayEnded
+                      ? "Ausente · sin gestiones"
+                      : fuenteDesactualizada
+                        ? `Sin gestiones al corte ${evaluationContext.dataCutoffLabel || hhmm(stateNowMin)}`
+                        : `Sin gestiones desde ${horario.entrada} · ${humanMinutes(pausaActualMin)}`)
+              : (horario.horarioLibre ? "Horario libre" : "Sin horario esperado");
         diasSalida = [{
           username, fecha, horarioAsignado: horario.etiqueta, bloquesHorario: horario.bloquesHorario || [],
           jornadaPartida: horario.jornadaPartida, horarioModificado: horario.cambioHorario,
           licenciaMedica: horario.licenciaMedica, horarioLibre: horario.horarioLibre,
-          novedadDia: novedadDia ? { tipo: novedadDia.tipo, descripcion: novedadDia.descripcion || "", etiqueta: etiquetaNovedad(novedadDia) } : null,
+          novedadDia: novedadDia ? { tipo: novedadDia.tipo, descripcion: novedadDia.descripcion || "", etiqueta: etiquetaNovedad(novedadDia), justificado: Boolean(novedadDia.justificado || ["falta-justificada", "licencia-medica", "dia-estudio", "permiso"].includes(novedadDia.tipo)) } : null,
           primeraGestion: "—", ultimaGestion: "—", franjaTotalMin: 0, horasTrabajadasMin: 0, gestiones: 0, casos: 0,
-          gestionesPorHora: 0, pausasBreves: 0, pausasLargas: pausasDetalle.length, pausasCriticas: pausasDetalle.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN).length, pausaLargaTotalMin: pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0),
-          pausaLargaPromedioMin: pausasDetalle.length ? Math.round(pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0) / pausasDetalle.length) : 0, pausaMaximaMin: pausasDetalle.length ? Math.max(...pausasDetalle.map((gap) => gap.duracionMin)) : 0, pausasDetalle, pausaActualMin: Math.round(pausaActualMin), bloques: [], esperadoProgramadoMin: Number(horario.minutosEsperados || 0),
+          gestionesPorHora: 0, pausasBreves: 0, pausasLargas: pausasDetalle.length, pausasCriticas: pausasDetalle.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN && !gap.abiertoAlCorte).length, pausaLargaTotalMin: pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0),
+          pausaLargaPromedioMin: pausasDetalle.length ? Math.round(pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0) / pausasDetalle.length) : 0, pausaMaximaMin: pausasDetalle.length ? Math.max(...pausasDetalle.map((gap) => gap.duracionMin)) : 0, pausasDetalle,
+          breakPermitidoMin: minutosBreakFlexiblePermitido(horario), breakConsiderado: null,
+          pausaActualMin: Math.round(pausaActualMin), pausaAlCorteMin: evaluationContext.sourceFresh ? 0 : Math.round(pausaAlCorteMin), corteDatosHora: evaluationContext.dataCutoffLabel || "", fuenteActualizada: !esHoy || Boolean(evaluationContext.sourceFresh), bloques: [], esperadoProgramadoMin: Number(horario.minutosEsperados || 0),
           esperadoMin: esperado, diferenciaPrevistaMin: esperado > 0 ? -esperado : null, faltanMin: esperado, extraMin: 0,
           cumplimientoPct: esperado > 0 ? 0 : null,
           estadoHoras: estadoSinActividad,
@@ -777,15 +916,20 @@ export async function seguimientoOperadores(req, res) {
         alertas: alerts,
       };
     });
-    operadores.sort((a, b) => b.resumen.horasTrabajadasMin - a.resumen.horasTrabajadasMin);
+    operadores.sort((a, b) => {
+      const aLicencia = Boolean(a?.dias?.[0]?.novedadDia?.tipo === "licencia-medica" || a?.dias?.[0]?.licenciaMedica);
+      const bLicencia = Boolean(b?.dias?.[0]?.novedadDia?.tipo === "licencia-medica" || b?.dias?.[0]?.licenciaMedica);
+      if (aLicencia !== bLicencia) return aLicencia ? 1 : -1;
+      return b.resumen.horasTrabajadasMin - a.resumen.horasTrabajadasMin;
+    });
 
     const definitions = {
-      horasTrabajadas: "Tiempo entre primera y última gestión de cada día. Si el horario está partido, se descuenta solamente el descanso programado entre bloques; los baches se informan aparte.",
+      horasTrabajadas: "Tiempo de actividad calculado dentro de los bloques laborales efectivos de RRHH. En jornadas partidas, los espacios entre bloques quedan fuera del cálculo.",
       franjaTotal: "Tiempo transcurrido entre la primera y la última gestión del día; puede incluir pausas.",
       pausaNormal: `Hasta ${PAUSA_NORMAL_MAX} minutos entre gestiones se considera continuidad normal.`,
       pausaBreve: `Más de ${PAUSA_NORMAL_MAX} y hasta ${PAUSA_BREVE_MAX} minutos se informa como pausa breve, pero permanece dentro del bloque de actividad.`,
-      pausaLarga: `Más de ${PAUSA_BREVE_MAX} minutos sin gestiones se considera pausa larga y separa bloques de trabajo.`,
-      pausaCritica: `Más de ${PAUSA_CRITICA_MIN} minutos sin gestiones se marca como pausa crítica.`,
+      pausaLarga: `Más de ${PAUSA_BREVE_MAX} minutos sin gestiones se considera corte visible. Para jornadas de 4 h se descuenta un único break continuo de hasta 20 min y para jornadas de 6 h uno de hasta 30 min, tomando el corte continuo más largo del día porque no tiene horario fijo.`,
+      pausaCritica: `Después de aplicar el break permitido, más de ${PAUSA_CRITICA_MIN} minutos efectivos sin gestiones se marca como bache urgente.`,
       gestionesPorHora: "Cantidad de gestiones registradas por cada hora trabajada estimada según Mango.",
       gestionesTotales: "Cantidad de registros de gestión de Mango dentro de los filtros aplicados.",
       casosDistintos: "Cantidad de DNIs únicos trabajados en el período.",
@@ -811,11 +955,23 @@ export async function seguimientoOperadores(req, res) {
       operadores,
       meta: {
         gestionesAnalizadas: rows.length,
-        generadoEn: new Date().toISOString(),
+        generadoEn: consultaAhora.toISOString(),
+        consultadoEn: consultaAhora.toISOString(),
+        gestionesActualizadasEn: fuenteActualizadaEn ? fuenteActualizadaEn.toISOString() : null,
+        fuenteArchivo: ultimaFuenteGestiones?.fuenteArchivo || "",
+        fuenteActualizadaHoy,
+        fuenteReciente,
+        desfaseFuenteMin,
+        corteDatosHora,
+        criterioCorteActual: fuenteReciente
+          ? `Los cortes abiertos se evalúan hasta ${corteDatosHora}; la última carga de gestiones coincide con la hora de esta consulta.`
+          : fuenteActualizadaHoy
+            ? `Los cortes abiertos se evalúan solamente hasta ${corteDatosHora}, último reporte manual disponible${Number(desfaseFuenteMin || 0) > 0 ? ` (${desfaseFuenteMin} min antes de esta consulta)` : ""}.`
+            : "No se proyectan cortes abiertos hasta la hora actual porque no hay una carga de gestiones actualizada hoy.",
         duracionMs: Date.now() - startedAt,
       },
     };
-    cache.set(cacheKey, { expires: Date.now() + CACHE_TTL_MS, data: payload });
+    if (!rangoIncluyeHoy) cache.set(cacheKey, { expires: Date.now() + CACHE_TTL_MS, data: payload });
     return res.json(payload);
   } catch (error) {
     console.error("seguimientoOperadores:", error);

@@ -1,8 +1,14 @@
 // BACKEND/controllers/reportesGestionesController.js probando
 import mongoose from "mongoose";
+import ExcelJS from "exceljs";
+import fs from "fs";
+import fsp from "fs/promises";
+import os from "os";
+import path from "path";
+import crypto from "crypto";
 import ReporteGestion from "../models/ReporteGestion.js";
 import { extraerEmails } from "../utils/email.util.js";
-import { toDateOnly, normalizarHora, fechaClaveArgentina } from "../utils/fecha.util.js";
+import { toDateOnly, normalizarHora, fechaClaveArgentina, claveFechaCalendario } from "../utils/fecha.util.js";
 import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
 import Pago from "../models/Pago.js";
@@ -631,6 +637,372 @@ export async function listar(req, res) {
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
+  }
+}
+
+
+
+function fechaExportacionDMY(value) {
+  const key = claveFechaCalendario(value);
+  if (!key) return "";
+  const [yyyy, mm, dd] = key.split("-");
+  return `${dd}/${mm}/${yyyy}`;
+}
+
+function nombreArchivoGestiones(desde, hasta) {
+  const clean = (value, fallback) => String(value || fallback).replace(/[^0-9A-Za-z_-]+/g, "_");
+  return `Gestiones_${clean(desde, "inicio")}_a_${clean(hasta, "actualidad")}_TODO.xlsx`;
+}
+
+// Excel/XML no admite algunos caracteres de control. Aunque el schema limita
+// tamaños, limpiamos el texto antes de escribirlo para que una observación
+// importada con caracteres invisibles no arruine todo el XLSX.
+function textoSeguroExcel(value, maxLength = 32767) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
+    .slice(0, maxLength);
+}
+
+async function validarZipXlsxBasico(filePath) {
+  const stat = await fsp.stat(filePath);
+  if (!stat.isFile() || stat.size < 200) {
+    throw new Error("El archivo Excel generado quedó vacío o incompleto.");
+  }
+
+  const fh = await fsp.open(filePath, "r");
+  try {
+    const start = Buffer.alloc(4);
+    await fh.read(start, 0, 4, 0);
+    if (start[0] !== 0x50 || start[1] !== 0x4b) {
+      throw new Error("El archivo generado no comienza con una estructura XLSX/ZIP válida.");
+    }
+
+    // Un ZIP válido debe contener el End Of Central Directory (PK\x05\x06)
+    // en los últimos 65.557 bytes. Esto detecta archivos truncados antes de
+    // entregarlos al navegador.
+    const tailLength = Math.min(stat.size, 65557);
+    const tail = Buffer.alloc(tailLength);
+    await fh.read(tail, 0, tailLength, stat.size - tailLength);
+    let eocd = false;
+    for (let i = tail.length - 4; i >= 0; i -= 1) {
+      if (tail[i] === 0x50 && tail[i + 1] === 0x4b && tail[i + 2] === 0x05 && tail[i + 3] === 0x06) {
+        eocd = true;
+        break;
+      }
+    }
+    if (!eocd) {
+      throw new Error("El archivo Excel quedó truncado antes de cerrar su estructura ZIP.");
+    }
+  } finally {
+    await fh.close();
+  }
+  return stat;
+}
+
+/**
+ * GET /api/reportes-gestiones/export/excel
+ * Exportación server-side por streaming. Evita traer cientos de miles de filas
+ * al navegador antes de construir el XLSX y soporta volúmenes grandes (300k+).
+ */
+export async function exportarGestionesExcel(req, res) {
+  let cursor = null;
+  let tempDir = null;
+  let tempFile = null;
+  let etapa = "inicio";
+
+  const cleanup = async () => {
+    try { await cursor?.close?.(); } catch { /* noop */ }
+    cursor = null;
+    if (tempDir) {
+      try { await fsp.rm(tempDir, { recursive: true, force: true }); } catch { /* noop */ }
+      tempDir = null;
+      tempFile = null;
+    }
+  };
+
+  try {
+    attachAbortFlag(req, res);
+
+    const usuarioId = getUsuarioId(req);
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!ensureNoOperador(req, res)) return;
+
+    const {
+      desde,
+      hasta,
+      operador,
+      entidad,
+      tipoContacto,
+      estadoCuenta,
+      dni,
+      sortKey,
+      sortDir,
+      soloActivos = "false",
+    } = req.query || {};
+
+    const q = {
+      ...ownerScope(req),
+      borrado: { $ne: true },
+    };
+
+    // Conservamos los límites también como variables para poder exportar por
+    // segmentos diarios y evitar un sort global de cientos de miles de filas.
+    const exportDesdeUTC = desde ? diaInicioUTC(String(desde).trim()) : null;
+    const exportHastaUTC = hasta ? diaInicioUTC(String(hasta).trim()) : null;
+    if (desde || hasta) {
+      const dDesde = exportDesdeUTC;
+      const dHasta = hasta ? diaFinUTC(String(hasta).trim()) : null;
+      if (dDesde || dHasta) {
+        q.fecha = {};
+        if (dDesde) q.fecha.$gte = dDesde;
+        if (dHasta) q.fecha.$lte = dHasta;
+      }
+    }
+
+    const dniFilter = buildDniFilter(dni);
+    if (dniFilter) q.dni = dniFilter;
+
+    const fUsuario = rxExactMulti(operador, (value) => value.toLowerCase());
+    const fEntidad = rxExactMulti(entidad, (value) => value.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
+
+    if (String(soloActivos).toLowerCase() === "true") q.usuario = await activeUserFilter(operador);
+    else if (fUsuario) q.usuario = fUsuario;
+    if (fEntidad) q.entidad = fEntidad;
+    if (fTipo) q.tipoContacto = fTipo;
+    if (fEstado) q.estadoCuenta = fEstado;
+
+    // En exportaciones grandes priorizamos estabilidad. El archivo se ordena
+    // por día según la dirección elegida en la tabla; evitamos ordenar cientos
+    // de miles de documentos por columnas arbitrarias dentro de MongoDB.
+    const dir = String(sortDir).toLowerCase() === "asc" ? 1 : -1;
+
+    // Excel admite 1.048.576 filas por hoja. Dejamos un margen amplio para
+    // encabezados y metadatos. La meta operativa es soportar hasta 300.000 filas por archivo en este entorno.
+    const MAX_EXPORT_ROWS = 300000;
+    etapa = "contando registros";
+    const total = await ReporteGestion.countDocuments(q);
+    if (!total) return res.status(404).json({ error: "No hay registros para exportar." });
+    if (total > MAX_EXPORT_ROWS) {
+      return res.status(413).json({
+        error: `La selección contiene ${total.toLocaleString("es-AR")} gestiones. Para que la descarga sea estable, exportá como máximo ${MAX_EXPORT_ROWS.toLocaleString("es-AR")} por archivo. Acotá el rango Desde/Hasta y volvé a intentar.`,
+      });
+    }
+
+    // IMPORTANTE: no escribimos el ZIP/XLSX directamente sobre la respuesta HTTP.
+    // Primero se termina y valida el archivo temporal. Recién después se lo envía
+    // al navegador, evitando descargas truncadas que Excel no puede abrir.
+    etapa = "preparando archivo temporal";
+    tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "cobrina-gestiones-"));
+    tempFile = path.join(tempDir, `gestiones-${crypto.randomUUID()}.xlsx`);
+
+    etapa = "inicializando Excel";
+    const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({
+      filename: tempFile,
+      useStyles: false,
+      useSharedStrings: false,
+    });
+
+    const ws = workbook.addWorksheet("Gestiones");
+    ws.columns = [
+      { header: "DNI", key: "dni", width: 14 },
+      { header: "NOMBRE DEUDOR", key: "nombreDeudor", width: 28 },
+      { header: "FECHA", key: "fecha", width: 12 },
+      { header: "HORA", key: "hora", width: 11 },
+      { header: "USUARIO", key: "usuario", width: 22 },
+      { header: "TIPO CONTACTO", key: "tipoContacto", width: 20 },
+      { header: "RESULTADO GESTIÓN", key: "resultadoGestion", width: 24 },
+      { header: "ESTADO DE LA CUENTA", key: "estadoCuenta", width: 24 },
+      { header: "TEL-MAIL MARCADO", key: "telMailMarcado", width: 24 },
+      { header: "OBSERVACIÓN GESTIÓN", key: "observacionGestion", width: 52 },
+      { header: "ENTIDAD", key: "entidad", width: 24 },
+    ];
+
+    // Con el writer streaming priorizamos compatibilidad y estabilidad del archivo.
+    // No agregamos vistas/filtros que no son necesarios para la exportación masiva.
+    ws.getRow(1).commit();
+
+    const projection = {
+      dni: 1,
+      nombreDeudor: 1,
+      fecha: 1,
+      hora: 1,
+      usuario: 1,
+      tipoContacto: 1,
+      resultadoGestion: 1,
+      estadoCuenta: 1,
+      telMailMarcado: 1,
+      observacionGestion: 1,
+      entidad: 1,
+    };
+
+    // Para exportaciones masivas NO hacemos un sort global. En perfiles que
+    // pueden ver varios propietarios, ese sort obliga a MongoDB a ordenar todo
+    // el universo en memoria/disco y en esta instalación falla incluso con
+    // allowDiskUse. En su lugar recorremos el rango día por día. `fecha` tiene
+    // índice propio y cada cursor queda acotado a una sola jornada. El Excel
+    // conserva el orden por día (asc/desc según la vista); dentro del mismo día
+    // el orden es técnico, algo que puede reordenarse luego en Excel si hace falta.
+    let exportados = 0;
+
+    const escribirItem = (item) => {
+      if (exportados >= MAX_EXPORT_ROWS) {
+        const err = new Error(`La exportación superó el máximo de ${MAX_EXPORT_ROWS.toLocaleString("es-AR")} filas durante la generación.`);
+        err.code = "EXPORT_TOO_LARGE";
+        throw err;
+      }
+      ws.addRow({
+        dni: textoSeguroExcel(item?.dni, 64),
+        nombreDeudor: textoSeguroExcel(item?.nombreDeudor, 240),
+        fecha: fechaExportacionDMY(item?.fecha),
+        hora: normalizarHora(item?.hora || ""),
+        usuario: textoSeguroExcel(item?.usuario, 120),
+        tipoContacto: textoSeguroExcel(item?.tipoContacto, 180),
+        resultadoGestion: textoSeguroExcel(item?.resultadoGestion, 240),
+        estadoCuenta: textoSeguroExcel(item?.estadoCuenta, 180),
+        telMailMarcado: textoSeguroExcel(item?.telMailMarcado, 1000),
+        observacionGestion: textoSeguroExcel(item?.observacionGestion, 3000),
+        entidad: textoSeguroExcel(item?.entidad, 120),
+      }).commit();
+      exportados += 1;
+    };
+
+    const consumirCursor = async (query, etiqueta) => {
+      etapa = etiqueta;
+      cursor = ReporteGestion.find(query)
+        .maxTimeMS(10 * 60 * 1000)
+        .select(projection)
+        .lean()
+        .cursor({ batchSize: 2000 });
+      try {
+        for await (const item of cursor) {
+          if (req.aborted || req.__aborted) {
+            const err = new Error("CLIENT_ABORTED");
+            err.code = "CLIENT_ABORTED";
+            throw err;
+          }
+          escribirItem(item);
+        }
+      } finally {
+        await cursor?.close?.();
+        cursor = null;
+      }
+    };
+
+    if (exportDesdeUTC && exportHastaUTC) {
+      const sentido = dir === 1 ? 1 : -1;
+      const desdeMs = exportDesdeUTC.getTime();
+      const hastaMs = exportHastaUTC.getTime();
+      let diaMs = sentido === 1 ? desdeMs : hastaMs;
+      const limiteMs = sentido === 1 ? hastaMs : desdeMs;
+      let numeroDia = 0;
+
+      while (sentido === 1 ? diaMs <= limiteMs : diaMs >= limiteMs) {
+        numeroDia += 1;
+        const inicioDia = new Date(diaMs);
+        const finDia = new Date(diaMs + 86399999);
+        const queryDia = {
+          ...q,
+          fecha: { $gte: inicioDia, $lte: finDia },
+        };
+        const keyDia = inicioDia.toISOString().slice(0, 10);
+        await consumirCursor(queryDia, `leyendo gestiones del ${keyDia} (segmento ${numeroDia})`);
+        diaMs += sentido * 86400000;
+      }
+    } else {
+      // Sin ambos límites no podemos segmentar de forma determinística por día.
+      // Aun así evitamos el sort global para priorizar que el archivo salga.
+      await consumirCursor(q, "leyendo gestiones sin ordenamiento global");
+    }
+
+    etapa = "cerrando consulta MongoDB";
+
+    etapa = "cerrando archivo Excel";
+    ws.commit();
+    await workbook.commit();
+
+    // No exigimos igualdad exacta con el count inicial: entre el count y el
+    // cursor puede terminar una importación concurrente. Lo importante es que
+    // el XLSX se haya cerrado bien y reportar la cantidad REAL exportada.
+    if (!exportados) {
+      throw new Error("No se pudo escribir ninguna gestión en el archivo Excel.");
+    }
+
+    etapa = "validando archivo Excel";
+    const stat = await validarZipXlsxBasico(tempFile);
+
+    const filename = nombreArchivoGestiones(desde, hasta);
+    etapa = "enviando descarga";
+    res.status(200);
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Length", String(stat.size));
+    res.setHeader("Cache-Control", "no-store, no-transform");
+    res.setHeader("X-Cobrina-Export-Rows", String(exportados));
+
+    await new Promise((resolve, reject) => {
+      const input = fs.createReadStream(tempFile);
+      let settled = false;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        if (err) reject(err);
+        else resolve();
+      };
+      input.once("error", done);
+      res.once("error", done);
+      res.once("finish", () => done());
+      res.once("close", () => {
+        if (!res.writableFinished) {
+          const err = new Error("CLIENT_ABORTED");
+          err.code = "CLIENT_ABORTED";
+          try { input.destroy(err); } catch { /* noop */ }
+          done(err);
+        }
+      });
+      input.pipe(res);
+    });
+
+    await cleanup();
+    return;
+  } catch (error) {
+    await cleanup();
+    if (req?.aborted || error?.code === "CLIENT_ABORTED") return;
+
+    console.error("[ReporteGestiones][export/excel]", {
+      etapa,
+      message: error?.message,
+      code: error?.code,
+      codeName: error?.codeName,
+      name: error?.name,
+    });
+
+    if (res.headersSent) {
+      try { res.destroy(error); } catch { /* noop */ }
+      return;
+    }
+
+    const msg = String(error?.message || "");
+    const sortMemory =
+      error?.code === 292 ||
+      /QueryExceededMemoryLimitNoDiskUseAllowed|Sort exceeded memory limit|sort.*memory/i.test(msg);
+    const sinEspacio = error?.code === "ENOSPC" || /no space left/i.test(msg);
+    const demasiadoGrande = error?.code === "EXPORT_TOO_LARGE";
+
+    const publicMessage = sortMemory
+      ? "MongoDB no pudo completar la consulta masiva. Probá acotar el rango de fechas; Cobrina admite hasta 300.000 gestiones por archivo, pero el rendimiento también depende del volumen de cada período."
+      : sinEspacio
+        ? "El servidor no tiene espacio temporal suficiente para generar este Excel."
+        : demasiadoGrande
+          ? msg
+          : (msg || "No se pudo exportar el Excel de gestiones.");
+
+    return res.status(demasiadoGrande ? 413 : 500).json({
+      error: publicMessage,
+      etapa,
+      codigo: error?.code || error?.codeName || error?.name || "EXPORT_ERROR",
+    });
   }
 }
 

@@ -11,11 +11,13 @@ import NovedadRRHH from "../models/NovedadRRHH.js";
 import AcuerdoPago from "../models/AcuerdoPago.js";
 import {
   horarioEfectivoParaFecha,
-  minutosEsperadosHastaHoy,
+  minutosEsperadosEnRango,
   novedadCubreFecha,
   rangoMesLocal,
   minutosActividadSegunHorario,
   intervalosLaboralesSinDescanso,
+  aplicarBreakFlexible,
+  minutosBreakFlexiblePermitido,
   minutosHoraHHMM,
   minutoEnDescansoProgramado,
   descansoProgramadoSolapadoMin,
@@ -33,8 +35,9 @@ import {
 } from "../utils/fecha.util.js";
 
 const BACHE_VISIBLE_MIN = 20;
-const BACHE_CRITICO_MIN = 60;
-const DEMORA_INICIO_VISIBLE_MIN = 20;
+const BACHE_CRITICO_MIN = 30;
+const TARDANZA_INICIO_VISIBLE_MIN = 15;
+const ANTICIPO_INICIO_VISIBLE_MIN = 30;
 
 function mesValido(valor) {
   const match = String(valor || "").match(/^(\d{4})-(\d{2})$/);
@@ -176,22 +179,31 @@ function mapearPagosPorOperador(pagos, empleados) {
 
 export async function resumenSupervision(req, res) {
   try {
-    const hoyReal = new Date(); // instante real, usado solo para métricas de actividad
+    const hoyReal = new Date(); // instante real de consulta
+    const hoyRealClave = fechaClaveArgentina(hoyReal);
     const mesReal = mesClaveArgentina(hoyReal);
+    const fechaPedida = claveFechaCalendario(req.query?.fecha);
+    const fechaConsulta = fechaPedida && fechaPedida <= hoyRealClave ? fechaPedida : hoyRealClave;
+    const esFechaActual = fechaConsulta === hoyRealClave;
     const mesSolicitado = mesValido(req.query?.mes);
-    const mesSeleccionado = mesSolicitado || mesReal;
+    const mesSeleccionado = fechaPedida ? fechaConsulta.slice(0, 7) : (mesSolicitado || mesReal);
     const meses = mesesUltimosTres(fechaBaseMes(mesSeleccionado));
-    const { desde, hasta, desdeClave, hastaClave } = rangoMesLocal(mesSeleccionado);
+    const rangoMes = rangoMesLocal(mesSeleccionado);
+    const { desde, desdeClave, hastaClave } = rangoMes;
+    const hastaPeriodoClave = fechaConsulta < hastaClave ? fechaConsulta : hastaClave;
+    const hasta = finDiaCalendarioUTC(hastaPeriodoClave);
     const desdeTres = meses[0].desde;
-    const hoyClave = fechaClaveArgentina(hoyReal);
+    // Conservamos nombres históricos "hoy*" para no romper consumidores, pero
+    // desde esta versión representan el día seleccionado en Supervisión.
+    const hoyClave = fechaConsulta;
     const hoyDesde = inicioDiaCalendarioUTC(hoyClave);
     const hoyHasta = finDiaCalendarioUTC(hoyClave);
     const selectedDesdeUTC = inicioDiaCalendarioUTC(desdeClave);
-    const selectedHastaUTC = finDiaCalendarioUTC(hastaClave);
+    const selectedHastaUTC = hasta;
     const hoyDesdeUTC = hoyDesde;
     const hoyHastaUTC = hoyHasta;
-    const desdeNovedades = selectedDesdeUTC < hoyDesdeUTC ? selectedDesdeUTC : hoyDesdeUTC;
-    const hastaNovedades = selectedHastaUTC > hoyHastaUTC ? selectedHastaUTC : hoyHastaUTC;
+    const desdeNovedades = selectedDesdeUTC;
+    const hastaNovedades = selectedHastaUTC;
 
     const empleados = await Empleado.find({ isActive: { $ne: false } })
       .select("username nombre role horarioLaboral")
@@ -204,7 +216,7 @@ export async function resumenSupervision(req, res) {
 
     const [pagosTres, objetivos, novedadesRRHH, gestionesActividadPeriodo, gestionesActividadHoy,
       proyeccionesCaidas, proyeccionesManuales, colchonSinGestion, pendientesColchon, pendientesProyecciones, ultimaPago,
-      ultimaGestionAcuerdo, ultimaGestion, gestionesAcuerdoPeriodo, pagosHoyAgg, pagosHoyDetalle, fichadosAhora,
+      ultimaGestionAcuerdo, ultimaGestion, ultimaGestionDia, gestionesAcuerdoPeriodo, pagosHoyAgg, pagosHoyDetalle, fichadosAhora,
       jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad, resumenColchonAgg, ultimaColchon, ultimaNovedadRRHH] = await Promise.all([
       Pago.find({ fechaPago: { $gte: desdeTres, $lte: hasta } })
         .select("monto fechaPago operadorId operadorUsername entidadId subCesionId")
@@ -257,6 +269,11 @@ export async function resumenSupervision(req, res) {
         .select("createdAt fecha hora usuario resultadoGestion fuenteArchivo")
         .lean(),
       ReporteGestion.findOne({ borrado: { $ne: true } }).sort({ createdAt: -1 }).select("createdAt fecha fuenteArchivo").lean(),
+      ReporteGestion.findOne({
+        fecha: { $gte: hoyDesdeUTC, $lte: hoyHastaUTC },
+        borrado: { $ne: true },
+        usuario: { $in: listaUsuariosControlados },
+      }).sort({ createdAt: -1 }).select("createdAt fecha hora fuenteArchivo usuario").lean(),
       ReporteGestion.find({
         fecha: { $gte: selectedDesdeUTC, $lte: selectedHastaUTC },
         borrado: { $ne: true },
@@ -274,29 +291,74 @@ export async function resumenSupervision(req, res) {
         .lean(),
       Asistencia.countDocuments({ empleado: { $in: idsControlados }, fechaClave: hoyClave, estado: "presente" }),
       Asistencia.countDocuments({ empleado: { $in: idsControlados }, fechaClave: { $lt: hoyClave }, estado: "presente" }),
-      AcuerdoPago.findOne({ mes: mesSeleccionado })
+      AcuerdoPago.findOne({ mes: mesSeleccionado, fecha: { $lte: selectedHastaUTC } })
         .sort({ fechaHora: -1, createdAt: -1 })
         .select("fechaHora createdAt fuenteArchivo operador")
         .lean(),
-      AcuerdoPago.countDocuments({ mes: mesSeleccionado }),
+      AcuerdoPago.countDocuments({ mes: mesSeleccionado, fecha: { $lte: selectedHastaUTC } }),
       Colchon.aggregate([
+        { $match: { creado: { $lte: selectedHastaUTC } } },
         {
-          $project: {
-            importeCuota: { $ifNull: ["$importeCuota", 0] },
-            pagos: { $ifNull: ["$pagos", []] },
+          $lookup: {
+            from: "entidads",
+            localField: "entidadId",
+            foreignField: "_id",
+            as: "entidadCatalogo",
+            pipeline: [{ $project: { _id: 1, numero: 1 } }],
+          },
+        },
+        { $unwind: { path: "$entidadCatalogo", preserveNullAndEmptyArrays: true } },
+        {
+          $addFields: {
+            importeCuotaSupervision: { $ifNull: ["$importeCuota", 0] },
+            dniPago: { $toString: "$dni" },
+            entidadNumeroPago: {
+              $convert: {
+                input: { $ifNull: ["$entidadNumero", "$entidadCatalogo.numero"] },
+                to: "int",
+                onError: null,
+                onNull: null,
+              },
+            },
           },
         },
         {
-          $project: {
-            importeCuota: 1,
-            pagado: {
-              $sum: {
-                $map: {
-                  input: "$pagos",
-                  as: "pago",
-                  in: { $ifNull: ["$$pago.monto", 0] },
+          $lookup: {
+            from: Pago.collection.name,
+            let: {
+              dniCuota: "$dniPago",
+              entidadNumero: "$entidadNumeroPago",
+              subCesion: "$subCesionId",
+            },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $and: [
+                      { $eq: ["$dni", "$$dniCuota"] },
+                      { $eq: ["$entidadId", "$$entidadNumero"] },
+                      { $eq: ["$subCesionId", "$$subCesion"] },
+                      { $gte: ["$fechaPago", desde] },
+                      { $lte: ["$fechaPago", hasta] },
+                    ],
+                  },
                 },
               },
+              {
+                $group: {
+                  _id: null,
+                  total: { $sum: { $ifNull: ["$monto", 0] } },
+                  cantidad: { $sum: 1 },
+                },
+              },
+            ],
+            as: "pagosColchonMes",
+          },
+        },
+        {
+          $addFields: {
+            pagadoSupervision: {
+              $ifNull: [{ $arrayElemAt: ["$pagosColchonMes.total", 0] }, 0],
             },
           },
         },
@@ -304,19 +366,17 @@ export async function resumenSupervision(req, res) {
           $group: {
             _id: null,
             totalCuotas: { $sum: 1 },
-            importeTotal: { $sum: "$importeCuota" },
-            pagadoTotal: { $sum: "$pagado" },
-            cuotasConPago: { $sum: { $cond: [{ $gt: ["$pagado", 0] }, 1, 0] } },
+            importeTotal: { $sum: "$importeCuotaSupervision" },
+            pagadoTotal: { $sum: "$pagadoSupervision" },
+            cuotasConPago: { $sum: { $cond: [{ $gt: ["$pagadoSupervision", 0] }, 1, 0] } },
           },
         },
-      ]),
-      Colchon.findOne().sort({ ultimaModificacion: -1, creado: -1 }).select("ultimaModificacion creado").lean(),
+      ]).allowDiskUse(true),
+      Colchon.findOne({ creado: { $lte: selectedHastaUTC } }).sort({ ultimaModificacion: -1, creado: -1 }).select("ultimaModificacion creado").lean(),
       NovedadRRHH.findOne({ estado: { $ne: "anulado" } }).sort({ updatedAt: -1, createdAt: -1 }).select("updatedAt createdAt tipo fechaDesde").lean(),
     ]);
 
-    const diaCorteComparacion = mesSeleccionado === mesReal
-      ? Number(hoyClave.slice(8, 10))
-      : new Date(Date.UTC(Number(mesSeleccionado.slice(0, 4)), Number(mesSeleccionado.slice(5, 7)), 0)).getUTCDate();
+    const diaCorteComparacion = Number(hoyClave.slice(8, 10));
 
     const recaudacionTresMeses = meses.map((m) => {
       const total = pagosTres
@@ -376,7 +436,25 @@ export async function resumenSupervision(req, res) {
       mapearPagosPorOperador(pagosHoyDetalle || [], empleadosControlados)
         .map((item) => [normalizeUsername(item.username), Number(item.total || 0)])
     );
-    const ahoraMinArgentina = minutoActualArgentina();
+    const ahoraMinArgentina = esFechaActual ? minutoActualArgentina() : (24 * 60 - 1);
+    const fuenteGestionesDia = esFechaActual ? ultimaGestion : ultimaGestionDia;
+    const fuenteGestionesEn = fuenteGestionesDia?.createdAt ? new Date(fuenteGestionesDia.createdAt) : null;
+    const fuenteGestionesActualizadaHoy = esFechaActual
+      ? Boolean(
+          fuenteGestionesEn &&
+          !Number.isNaN(fuenteGestionesEn.getTime()) &&
+          fechaClaveArgentina(fuenteGestionesEn) === hoyClave
+        )
+      : Boolean(ultimaGestionDia);
+    const fuenteCorteMin = esFechaActual && fuenteGestionesActualizadaHoy ? minutoActualArgentina(fuenteGestionesEn) : null;
+    const desfaseGestionesMin = esFechaActual && fuenteGestionesActualizadaHoy && Number.isFinite(fuenteCorteMin)
+      ? Math.max(0, Math.round(ahoraMinArgentina - fuenteCorteMin))
+      : null;
+    const fuenteGestionesReciente = Boolean(esFechaActual && fuenteGestionesActualizadaHoy && Number(desfaseGestionesMin || 0) === 0);
+    const corteGestionesMin = esFechaActual && fuenteGestionesActualizadaHoy && Number.isFinite(fuenteCorteMin)
+      ? Math.min(ahoraMinArgentina, fuenteCorteMin)
+      : null;
+    const corteGestionesHora = Number.isFinite(corteGestionesMin) ? horaGestionHHMM(corteGestionesMin) : "";
 
     const operadores = porOperador.map((item) => {
       const empleado = empleadosControlados.find((e) => String(e._id) === String(item.empleadoId));
@@ -392,7 +470,7 @@ export async function resumenSupervision(req, res) {
           horarioDia
         );
       }, 0);
-      const esperados = minutosEsperadosHastaHoy(empleado, mesSeleccionado, novedadesEmpleado);
+      const esperados = minutosEsperadosEnRango(empleado, desdeClave, hoyClave, novedadesEmpleado);
       const horarioHoy = horarioEfectivoParaFecha(empleado, hoyClave, novedadesEmpleado);
       const novedadesDelDia = novedadesEmpleado.filter((novedad) => novedadCubreFecha(novedad, hoyClave));
       const novedadDia = ["licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"]
@@ -409,51 +487,80 @@ export async function resumenSupervision(req, res) {
       const extraHoyMin = minutosExigiblesHoy > 0 ? Math.max(0, minutosTrabajadosHoy - minutosExigiblesHoy) : 0;
       const salidaHoyMin = minutosHoraHHMM(horarioHoy.salida);
       const entradaHoyMin = minutosHoraHHMM(horarioHoy.entrada);
-      const jornadaFinalizadaHoy = horarioHoy.programado && Number.isFinite(salidaHoyMin) && ahoraMinArgentina >= salidaHoyMin;
-      const enDescansoProgramadoHoy = minutoEnDescansoProgramado(ahoraMinArgentina, horarioHoy.bloquesHorario);
+      const estadoAhoraMin = fuenteGestionesActualizadaHoy && Number.isFinite(corteGestionesMin)
+        ? Number(corteGestionesMin)
+        : ahoraMinArgentina;
+      const jornadaFinalizadaHoy = horarioHoy.programado && Number.isFinite(salidaHoyMin) && estadoAhoraMin >= salidaHoyMin;
+      const enDescansoProgramadoHoy = minutoEnDescansoProgramado(estadoAhoraMin, horarioHoy.bloquesHorario);
 
-      // Los baches se calculan solo dentro de los bloques laborales efectivos de RRHH.
-      // Se incluyen tanto los cortes cerrados entre dos gestiones como el corte abierto
-      // desde la última gestión hasta la hora actual (o desde el inicio del turno si aún
-      // no hubo gestiones). Los descansos programados se recortan por completo.
-      const intervalosLaboralesHoy = intervalosLaboralesSinDescanso(actividadDelDia.intervalos || [], horarioHoy);
+      // Misma regla que Reportes > Seguimiento: los cortes cerrados salen de las
+      // gestiones cargadas y el corte abierto llega únicamente hasta la última carga
+      // manual disponible. Solo se llama "actual" si esa carga coincide con el minuto
+      // de la consulta. Los espacios fuera de los bloques laborales quedan excluidos.
+      const intervalosLaboralesHoy = intervalosLaboralesSinDescanso(actividadDelDia.intervalos || [], horarioHoy)
+        .map((intervalo) => ({ ...intervalo, actual: false, abiertoAlCorte: false, origen: "cerrado" }));
       const desdeCorteAbiertoMin = Number.isFinite(ultimaMinHoy)
         ? ultimaMinHoy
         : Number.isFinite(entradaHoyMin)
           ? entradaHoyMin
           : null;
-      const intervalosAbiertosHoy = Number.isFinite(desdeCorteAbiertoMin) && ahoraMinArgentina > desdeCorteAbiertoMin
-        ? intervalosLaboralesSinDescanso([{ desdeMin: desdeCorteAbiertoMin, hastaMin: ahoraMinArgentina }], horarioHoy)
+      const intervalosAbiertosHoy = esFechaActual && fuenteGestionesActualizadaHoy && Number.isFinite(desdeCorteAbiertoMin) && Number.isFinite(corteGestionesMin) && corteGestionesMin > desdeCorteAbiertoMin
+        ? intervalosLaboralesSinDescanso([{ desdeMin: desdeCorteAbiertoMin, hastaMin: corteGestionesMin }], horarioHoy)
+            .map((intervalo) => ({
+              ...intervalo,
+              actual: Boolean(fuenteGestionesReciente && !jornadaFinalizadaHoy),
+              abiertoAlCorte: Boolean(!fuenteGestionesReciente && !jornadaFinalizadaHoy),
+              corteDatosHora: corteGestionesHora,
+              origen: "abierto",
+            }))
         : [];
-      const detallesCerrados = intervalosLaboralesHoy
+      const ajusteBreakHoy = aplicarBreakFlexible([...intervalosLaboralesHoy, ...intervalosAbiertosHoy], horarioHoy);
+      const intervalosConBreakHoy = ajusteBreakHoy.intervalos;
+      const breakPermitidoHoyMin = ajusteBreakHoy.permitidoMin || minutosBreakFlexiblePermitido(horarioHoy);
+      const breakConsideradoHoyRaw = ajusteBreakHoy.breakDetalle;
+      const bachesDetalleHoy = intervalosConBreakHoy
         .filter((intervalo) => Number(intervalo.duracionMin || 0) > BACHE_VISIBLE_MIN)
         .map((intervalo) => ({
           desde: horaGestionHHMM(intervalo.desdeMin),
           hasta: horaGestionHHMM(intervalo.hastaMin),
           duracionMin: Math.round(Number(intervalo.duracionMin || 0)),
-          actual: false,
-        }));
-      const detallesAbiertos = intervalosAbiertosHoy
-        .filter((intervalo) => Number(intervalo.duracionMin || 0) > BACHE_VISIBLE_MIN)
-        .map((intervalo) => ({
-          desde: horaGestionHHMM(intervalo.desdeMin),
-          hasta: horaGestionHHMM(intervalo.hastaMin),
-          duracionMin: Math.round(Number(intervalo.duracionMin || 0)),
-          actual: !jornadaFinalizadaHoy,
-        }));
-      const bachesDetalleHoy = [...detallesCerrados, ...detallesAbiertos]
+          duracionOriginalMin: Math.round(Number(intervalo.duracionOriginalMin ?? intervalo.duracionMin ?? 0)),
+          breakConsideradoMin: Math.round(Number(intervalo.breakConsideradoMin || 0)),
+          breakPermitidoMin: Math.round(Number(intervalo.breakPermitidoMin || breakPermitidoHoyMin || 0)),
+          actual: Boolean(intervalo.actual),
+          abiertoAlCorte: Boolean(intervalo.abiertoAlCorte),
+          corteDatosHora: intervalo.corteDatosHora || "",
+        }))
         .sort((a, b) => minutosHoraHHMM(a.desde) - minutosHoraHHMM(b.desde));
+      const breakConsideradoHoy = breakConsideradoHoyRaw ? {
+        desde: horaGestionHHMM(breakConsideradoHoyRaw.desdeMin),
+        hasta: horaGestionHHMM(breakConsideradoHoyRaw.hastaMin),
+        duracionOriginalMin: Math.round(Number(breakConsideradoHoyRaw.duracionOriginalMin || 0)),
+        breakConsideradoMin: Math.round(Number(breakConsideradoHoyRaw.breakConsideradoMin || 0)),
+        breakPermitidoMin: Math.round(Number(breakConsideradoHoyRaw.breakPermitidoMin || 0)),
+        excedenteMin: Math.round(Number(breakConsideradoHoyRaw.excedenteMin || 0)),
+        actual: Boolean(breakConsideradoHoyRaw.actual),
+        abiertoAlCorte: Boolean(breakConsideradoHoyRaw.abiertoAlCorte),
+        corteDatosHora: breakConsideradoHoyRaw.corteDatosHora || "",
+      } : null;
       const baches20Hoy = bachesDetalleHoy.length;
       // Se conserva el campo histórico +30 para no romper consumidores anteriores.
-      const baches30Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > 30).length;
-      const baches60Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > BACHE_CRITICO_MIN).length;
+      const baches30Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > 30 && !intervalo.abiertoAlCorte).length;
+      const baches60Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > BACHE_CRITICO_MIN && !intervalo.abiertoAlCorte).length;
       const bacheMaximoHoyMin = bachesDetalleHoy.reduce((maximo, intervalo) => Math.max(maximo, Number(intervalo.duracionMin || 0)), 0);
 
-      const minutosSinGestionHoy = intervalosAbiertosHoy.length
-        ? Math.round(intervalosAbiertosHoy.reduce((sum, intervalo) => sum + Number(intervalo.duracionMin || 0), 0))
-        : Number.isFinite(ultimaMinHoy) && ahoraMinArgentina >= ultimaMinHoy
-          ? 0
-          : null;
+      const minutosAbiertosAlCorteHoy = intervalosConBreakHoy.some((intervalo) => intervalo.origen === "abierto")
+        ? Math.round(intervalosConBreakHoy
+            .filter((intervalo) => intervalo.origen === "abierto")
+            .reduce((sum, intervalo) => sum + Number(intervalo.duracionMin || 0), 0))
+        : 0;
+      const breakActualCubriendoPausaHoy = Boolean(
+        breakConsideradoHoy?.actual && Number(breakConsideradoHoy?.breakConsideradoMin || 0) > 0 && minutosAbiertosAlCorteHoy <= BACHE_VISIBLE_MIN
+      );
+      const minutosSinGestionHoy = fuenteGestionesReciente ? minutosAbiertosAlCorteHoy : 0;
+      const minutosSinGestionAlCorteHoy = fuenteGestionesActualizadaHoy && !fuenteGestionesReciente
+        ? minutosAbiertosAlCorteHoy
+        : 0;
       const tardanzaInicioHoyMin = Number.isFinite(primeraMinHoy) && Number.isFinite(entradaHoyMin)
         ? Math.max(0, Math.round(primeraMinHoy - entradaHoyMin))
         : 0;
@@ -463,26 +570,40 @@ export async function resumenSupervision(req, res) {
 
       let estadoJornadaHoy = "sin-jornada";
       let estadoJornadaHoyLabel = horarioHoy.horarioLibre ? "Horario libre" : "Sin jornada hoy";
+      const fuenteSinActualizarHoy = !fuenteGestionesActualizadaHoy;
+      const fuenteDesactualizada = fuenteGestionesActualizadaHoy && !fuenteGestionesReciente;
       if (novedadDia) {
         estadoJornadaHoy = novedadDia.tipo === "falta" ? "falta" : "novedad";
         estadoJornadaHoyLabel = etiquetaNovedadDia(novedadDia);
       } else if (horarioHoy.horarioLibre) {
-        // Un horario libre sin gestiones no debe verse igual que alguien que está
-        // incumpliendo un turno fijo. Se mantiene visible para control, pero neutral.
-        estadoJornadaHoy = Number(actividadDelDia.gestiones || 0) > 0 ? "en-curso" : "sin-jornada";
-        estadoJornadaHoyLabel = Number(actividadDelDia.gestiones || 0) > 0 ? "Horario libre · con actividad" : "Horario libre · sin actividad";
+        if (minutosTrabajadosHoy >= 240) {
+          estadoJornadaHoy = "completa";
+          estadoJornadaHoyLabel = "Horario libre · 4 h cumplidas";
+        } else if (fuenteSinActualizarHoy) {
+          estadoJornadaHoy = "pendiente";
+          estadoJornadaHoyLabel = esFechaActual ? "Horario libre · Gestiones sin actualización de hoy" : "Horario libre · Sin gestiones importadas para la fecha";
+        } else {
+          estadoJornadaHoy = "en-curso";
+          estadoJornadaHoyLabel = `Horario libre · ${Math.floor(minutosTrabajadosHoy / 60)}h ${minutosTrabajadosHoy % 60}m de 4 h`;
+        }
       } else if (horarioHoy.programado) {
-        if (Number.isFinite(entradaHoyMin) && ahoraMinArgentina < entradaHoyMin && !Number(actividadDelDia.gestiones || 0)) {
+        if (fuenteSinActualizarHoy) {
+          estadoJornadaHoy = "pendiente";
+          estadoJornadaHoyLabel = esFechaActual ? "Gestiones sin actualización de hoy" : "Sin gestiones importadas para la fecha";
+        } else if (Number.isFinite(entradaHoyMin) && estadoAhoraMin < entradaHoyMin && !Number(actividadDelDia.gestiones || 0)) {
           estadoJornadaHoy = "pendiente";
           estadoJornadaHoyLabel = "Todavía no inicia";
-        } else if (Number.isFinite(entradaHoyMin) && ahoraMinArgentina < entradaHoyMin && Number(actividadDelDia.gestiones || 0) > 0) {
+        } else if (Number.isFinite(entradaHoyMin) && estadoAhoraMin < entradaHoyMin && Number(actividadDelDia.gestiones || 0) > 0) {
           estadoJornadaHoy = "en-curso";
-          estadoJornadaHoyLabel = inicioAnticipadoHoyMin > 0 ? `Actividad antes del horario · inició ${inicioAnticipadoHoyMin} min antes` : "Actividad antes del horario";
+          estadoJornadaHoyLabel = inicioAnticipadoHoyMin >= ANTICIPO_INICIO_VISIBLE_MIN ? `Actividad antes del horario · inició ${inicioAnticipadoHoyMin} min antes` : "En curso";
         } else if (enDescansoProgramadoHoy) {
           estadoJornadaHoy = "descanso";
-          estadoJornadaHoyLabel = "Descanso programado";
+          estadoJornadaHoyLabel = "Entre bloques de horario";
         } else if (jornadaFinalizadaHoy) {
-          if (faltanHoyMin > 15) {
+          if (!Number(actividadDelDia.gestiones || 0)) {
+            estadoJornadaHoy = "sin-actividad";
+            estadoJornadaHoyLabel = "Ausente · sin gestiones";
+          } else if (faltanHoyMin > 15) {
             estadoJornadaHoy = "incompleta";
             estadoJornadaHoyLabel = `Terminó · faltan ${Math.floor(faltanHoyMin / 60)}h ${faltanHoyMin % 60}m`;
           } else if (extraHoyMin > 15) {
@@ -492,19 +613,29 @@ export async function resumenSupervision(req, res) {
             estadoJornadaHoy = "completa";
             estadoJornadaHoyLabel = "Jornada completa";
           }
+        } else if (fuenteDesactualizada) {
+          estadoJornadaHoy = "en-curso";
+          estadoJornadaHoyLabel = `En curso · datos al corte ${corteGestionesHora || "disponible"}`;
         } else if (!Number(actividadDelDia.gestiones || 0)) {
           estadoJornadaHoy = "sin-actividad";
-          estadoJornadaHoyLabel = "Sin gestiones todavía";
+          estadoJornadaHoyLabel = "No inició · sin gestiones";
+        } else if (fuenteGestionesReciente && breakActualCubriendoPausaHoy) {
+          estadoJornadaHoy = "descanso";
+          const totalPausa = Number(breakConsideradoHoy?.duracionOriginalMin || 0);
+          const considerado = Number(breakConsideradoHoy?.breakConsideradoMin || 0);
+          estadoJornadaHoyLabel = totalPausa <= considerado
+            ? `Break considerado · ${Math.round(totalPausa)} de ${Math.round(breakPermitidoHoyMin)} min`
+            : `Break considerado · ${Math.round(considerado)} min + ${Math.round(minutosSinGestionHoy)} min de excedente`;
         } else if (Number(minutosSinGestionHoy || 0) > BACHE_CRITICO_MIN) {
           estadoJornadaHoy = "alerta";
-          estadoJornadaHoyLabel = `Pausa actual ${Math.round(minutosSinGestionHoy)} min`;
+          estadoJornadaHoyLabel = `Bache actual ${Math.round(minutosSinGestionHoy)} min`;
         } else if (Number(minutosSinGestionHoy || 0) > BACHE_VISIBLE_MIN) {
           estadoJornadaHoy = "atencion";
-          estadoJornadaHoyLabel = `Pausa actual ${Math.round(minutosSinGestionHoy)} min`;
-        } else if (tardanzaInicioHoyMin > DEMORA_INICIO_VISIBLE_MIN) {
+          estadoJornadaHoyLabel = `Corte actual ${Math.round(minutosSinGestionHoy)} min`;
+        } else if (tardanzaInicioHoyMin > TARDANZA_INICIO_VISIBLE_MIN) {
           estadoJornadaHoy = "atencion";
           estadoJornadaHoyLabel = `En curso · inició ${tardanzaInicioHoyMin} min tarde`;
-        } else if (inicioAnticipadoHoyMin > DEMORA_INICIO_VISIBLE_MIN) {
+        } else if (inicioAnticipadoHoyMin >= ANTICIPO_INICIO_VISIBLE_MIN) {
           estadoJornadaHoy = "en-curso";
           estadoJornadaHoyLabel = `En curso · inició ${inicioAnticipadoHoyMin} min antes`;
         } else {
@@ -512,6 +643,7 @@ export async function resumenSupervision(req, res) {
           estadoJornadaHoyLabel = "En curso";
         }
       }
+
 
       return {
         ...item,
@@ -539,15 +671,22 @@ export async function resumenSupervision(req, res) {
         baches60Hoy,
         bacheMaximoHoyMin,
         bachesDetalleHoy,
+        breakPermitidoHoyMin,
+        breakConsideradoHoy,
         tardanzaInicioHoyMin,
         inicioAnticipadoHoyMin,
         minutosSinGestionHoy,
+        minutosSinGestionAlCorteHoy,
+        corteDatosHora: corteGestionesHora,
+        fuenteGestionesActualizadaHoy,
+        fuenteGestionesReciente,
         jornadaFinalizadaHoy,
         enDescansoProgramadoHoy,
         estadoJornadaHoy,
         estadoJornadaHoyLabel,
         novedadHoyTipo: novedadDia?.tipo || "",
         novedadHoyDescripcion: novedadDia?.descripcion || "",
+        novedadHoyJustificado: Boolean(novedadDia && (novedadDia.justificado || ["falta-justificada", "licencia-medica", "dia-estudio", "permiso"].includes(novedadDia.tipo))),
         recaudadoHoy: pagosHoyPorOperador.get(normalizeUsername(item.username)) || 0,
         horarioHoy: horarioHoy.etiqueta,
         bloquesHorarioHoy: horarioHoy.bloquesHorario || [],
@@ -886,7 +1025,16 @@ export async function resumenSupervision(req, res) {
       mesActual: mesSeleccionado,
       mesSeleccionado,
       esMesActual: mesSeleccionado === mesReal,
-      alertasEnTiempoReal: true,
+      fechaConsulta: hoyClave,
+      esFechaActual,
+      periodoHasta: hoyClave,
+      alertasEnTiempoReal: esFechaActual,
+      historico: {
+        solicitado: !esFechaActual,
+        fecha: hoyClave,
+        fuentesConCorteExacto: ["Gestiones Mango", "Pagos", "Acuerdos", "RRHH"],
+        fuentesSinSnapshot: ["Colchón"],
+      },
       evaluadoEn: hoyReal,
       recaudacion: {
         ultimosTresMeses: recaudacionTresMeses,
@@ -975,6 +1123,7 @@ export async function resumenSupervision(req, res) {
           fuente: "Reporte de gestiones",
         },
         gestiones: ultimaGestion,
+        gestionesConsulta: ultimaGestionDia || null,
         colchon: ultimaColchon ? {
           fecha: ultimaColchon.ultimaModificacion || ultimaColchon.creado || null,
         } : null,

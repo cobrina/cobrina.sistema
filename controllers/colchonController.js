@@ -1,4 +1,5 @@
 import Colchon from "../models/Colchon.js";
+import Pago from "../models/Pago.js";
 import Entidad from "../models/Entidad.js";
 import SubCesion from "../models/SubCesion.js";
 import Empleado from "../models/Empleado.js";
@@ -527,6 +528,79 @@ export const eliminarCuotasSeleccionadas = async (req, res) => {
 const toObjId = (v) =>
   mongoose.Types.ObjectId.isValid(v) ? new mongoose.Types.ObjectId(v) : v;
 
+function rangoPagosMesVigente() {
+  const mes = mesClaveArgentina();
+  const [anio, numeroMes] = mes.split("-").map(Number);
+  return {
+    desde: new Date(Date.UTC(anio, numeroMes - 1, 1, 0, 0, 0, 0)),
+    hasta: new Date(Date.UTC(anio, numeroMes, 0, 23, 59, 59, 999)),
+  };
+}
+
+function etapasPagosAplicadosMes(desde, hasta) {
+  return [
+    {
+      $addFields: {
+        entidadNumeroEfectivo: {
+          $convert: {
+            input: { $ifNull: ["$entidadNumero", "$entidad.numero"] },
+            to: "int",
+            onError: null,
+            onNull: null,
+          },
+        },
+        dniTextoPago: { $toString: "$dni" },
+      },
+    },
+    {
+      $lookup: {
+        from: Pago.collection.name,
+        let: {
+          dniCuota: "$dniTextoPago",
+          entidadNumero: "$entidadNumeroEfectivo",
+          subCesion: "$subCesionId",
+        },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [
+                  { $eq: ["$dni", "$$dniCuota"] },
+                  { $eq: ["$entidadId", "$$entidadNumero"] },
+                  { $eq: ["$subCesionId", "$$subCesion"] },
+                  { $gte: ["$fechaPago", desde] },
+                  { $lte: ["$fechaPago", hasta] },
+                ],
+              },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: { $ifNull: ["$monto", 0] } },
+              cantidad: { $sum: 1 },
+            },
+          },
+        ],
+        as: "pagosAplicadosMes",
+      },
+    },
+    {
+      $addFields: {
+        pagadoTotal: {
+          $ifNull: [{ $arrayElemAt: ["$pagosAplicadosMes.total", 0] }, 0],
+        },
+        cantidadPagosAplicados: {
+          $ifNull: [{ $arrayElemAt: ["$pagosAplicadosMes.cantidad", 0] }, 0],
+        },
+        pagoValidadoCobrina: {
+          $gt: [{ $ifNull: [{ $arrayElemAt: ["$pagosAplicadosMes.total", 0] }, 0] }, 0],
+        },
+      },
+    },
+  ];
+}
+
 export const filtrarCuotas = async (req, res) => {
   try {
     const {
@@ -544,6 +618,7 @@ export const filtrarCuotas = async (req, res) => {
       sortDirection = "asc",
       sinGestion,
       conPagosNoVistos,
+      pagoAplicado,
     } = req.query;
 
     if (!tieneAccesoColchon(req)) {
@@ -666,16 +741,28 @@ export const filtrarCuotas = async (req, res) => {
     };
 
     const sortField = sortFieldMap[String(sortBy || "").trim()] || "vencimiento";
+    const filtroPagoAplicado = ["con", "sin"].includes(String(pagoAplicado || "").trim())
+      ? String(pagoAplicado).trim()
+      : "";
+    const necesitaPagosAntes = sortField === "pagadoTotal" || Boolean(filtroPagoAplicado);
     const necesitaLookupAntesDeOrdenar = [
       "empleado.username",
       "entidad.nombre",
       "subcesion.nombre",
-    ].includes(sortField);
+    ].includes(sortField) || necesitaPagosAntes;
+    const { desde: pagosDesde, hasta: pagosHasta } = rangoPagosMesVigente();
+    const paymentStages = necesitaPagosAntes ? etapasPagosAplicadosMes(pagosDesde, pagosHasta) : [];
+    const paymentMatchStages = filtroPagoAplicado
+      ? [{ $match: filtroPagoAplicado === "con" ? { pagadoTotal: { $gt: 0 } } : { pagadoTotal: { $lte: 0 } } }]
+      : [];
     const sortStage = { $sort: { [sortField]: sortDir, _id: 1 } };
 
     const pipelineConteo = [
       { $match: baseMatch },
       ...derivedStages,
+      ...(filtroPagoAplicado ? lookupStages : []),
+      ...(filtroPagoAplicado ? etapasPagosAplicadosMes(pagosDesde, pagosHasta) : []),
+      ...paymentMatchStages,
       { $count: "count" },
     ];
 
@@ -683,6 +770,8 @@ export const filtrarCuotas = async (req, res) => {
       { $match: baseMatch },
       ...derivedStages,
       ...(necesitaLookupAntesDeOrdenar ? lookupStages : []),
+      ...paymentStages,
+      ...paymentMatchStages,
       sortStage,
       { $skip: skip },
       { $limit: pageLimit },
@@ -708,6 +797,8 @@ export const filtrarCuotas = async (req, res) => {
           estadoOriginal: 1,
           estado: "$estadoFinal",
           pagadoTotal: 1,
+          pagoValidadoCobrina: 1,
+          cantidadPagosAplicados: 1,
           observaciones: 1,
           observacionesOperador: 1,
           empleadoId: { _id: "$empleado._id", username: "$empleado.username" },
@@ -2271,6 +2362,7 @@ export const obtenerEstadisticasColchon = async (req, res) => {
       diaDesde,
       diaHasta,
       conPagosNoVistos,
+      pagoAplicado,
     } = req.query;
 
     const filtrosBase = [];
@@ -2315,12 +2407,46 @@ export const obtenerEstadisticasColchon = async (req, res) => {
 
     const baseQuery = filtrosBase.length ? { $and: filtrosBase } : {};
 
-    const cuotasBrutas = await Colchon.find(baseQuery)
+    let cuotasBrutas = await Colchon.find(baseQuery)
       .populate("empleadoId", "username")
       .populate("entidadId", "nombre numero")
       .populate("subCesionId", "nombre")
       .populate("pagosInformados.operadorId", "username")
       .lean();
+
+    // El filtro “Aplicado Cobrina” usa la misma fuente real de Pagos que la tabla.
+    // Esto evita que el panel de estadísticas muestre un universo distinto del
+    // listado cuando se eligen casos con/sin pagos aplicados.
+    const filtroAplicadoStats = ["con", "sin"].includes(String(pagoAplicado || "").trim())
+      ? String(pagoAplicado).trim()
+      : "";
+    if (filtroAplicadoStats && cuotasBrutas.length) {
+      const { desde: pagosDesde, hasta: pagosHasta } = rangoPagosMesVigente();
+      const dnis = [...new Set(cuotasBrutas.map((c) => String(c?.dni || "")).filter(Boolean))];
+      const entidadesNumero = [...new Set(cuotasBrutas.map((c) => Number(c?.entidadId?.numero || c?.entidadNumero || 0)).filter((v) => v > 0))];
+      const subCesiones = [...new Set(cuotasBrutas.map((c) => String(c?.subCesionId?._id || c?.subCesionId || "")).filter(Boolean))]
+        .filter((id) => mongoose.Types.ObjectId.isValid(id))
+        .map((id) => new mongoose.Types.ObjectId(id));
+
+      const pagosAplicados = dnis.length && entidadesNumero.length && subCesiones.length
+        ? await Pago.find({
+            fechaPago: { $gte: pagosDesde, $lte: pagosHasta },
+            dni: { $in: dnis },
+            entidadId: { $in: entidadesNumero },
+            subCesionId: { $in: subCesiones },
+          })
+            .select("dni entidadId subCesionId")
+            .lean()
+        : [];
+      const clavesConPago = new Set(
+        pagosAplicados.map((pago) => `${String(pago.dni)}|${Number(pago.entidadId)}|${String(pago.subCesionId)}`)
+      );
+      cuotasBrutas = cuotasBrutas.filter((cuota) => {
+        const clave = `${String(cuota?.dni || "")}|${Number(cuota?.entidadId?.numero || cuota?.entidadNumero || 0)}|${String(cuota?.subCesionId?._id || cuota?.subCesionId || "")}`;
+        const tienePago = clavesConPago.has(clave);
+        return filtroAplicadoStats === "con" ? tienePago : !tienePago;
+      });
+    }
 
     const partesHoyArgentina = new Intl.DateTimeFormat("en-CA", {
       timeZone: "America/Argentina/Buenos_Aires",
@@ -2350,7 +2476,7 @@ export const obtenerEstadisticasColchon = async (req, res) => {
       const confirmados = Array.isArray(cuota.pagos) ? cuota.pagos : [];
       const importados = confirmados.filter((pago) => pago?.origen === "importado");
       // Compatibilidad: los pagos históricos no tenían origen; se consideran manuales,
-      // que coincide con el uso habitual de RDC (carga de la cuotera desde Colchón).
+      // que coincide con el uso habitual de PROCOb (carga de la cuotera desde Colchón).
       const informadosCuotera = confirmados.filter(
         (pago) => pago?.origen !== "importado"
       );
