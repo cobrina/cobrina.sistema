@@ -27,8 +27,10 @@ import rrhhRoutes from "./routes/rrhhRoutes.js";
 import poderBiaRoutes from "./routes/poderBiaRoutes.js";
 import supervisionRoutes from "./routes/supervisionRoutes.js";
 import dashboardRoutes from "./routes/dashboardRoutes.js";
+import contactadosRoutes from "./routes/contactadosRoutes.js";
 import { procesarCierresAutomaticos } from "./controllers/asistenciaController.js";
 import { limpiarRegistrosPersonalesAntiguos } from "./utils/retencionPersonal.js";
+import { sincronizarContactados, expirarContactadosAhora } from "./services/contactadosService.js";
 
 dotenv.config();
 
@@ -143,6 +145,7 @@ app.get("/api/version", (_req, res) => {
       cambioContrasenas: true,
       acuerdosMango: true,
       misTareas: true,
+      contactados: true,
     },
     rutasCriticas: [
       "/api/pagos",
@@ -154,6 +157,7 @@ app.get("/api/version", (_req, res) => {
       "/api/empleados/password-reset/users",
       "/proyecciones/acuerdos-mango",
       "/api/stickies",
+      "/api/contactados/seguimiento",
     ],
   });
 });
@@ -176,6 +180,7 @@ app.use("/api/reportes-gestiones", reportesGestionesRoutes);
 app.use("/api/auditorias", auditoriasRoutes);
 app.use("/api/asistencia", asistenciaRoutes);
 app.use("/api/agenda", agendaRoutes);
+app.use("/api/contactados", contactadosRoutes);
 app.use("/api/rrhh", rrhhRoutes);
 app.use("/rrhh", rrhhRoutes); // alias de compatibilidad
 app.use("/api/poderes-bia", poderBiaRoutes);
@@ -249,6 +254,14 @@ async function start() {
       procesarCierresAutomaticos();
     }, 60_000);
     asistenciaTimer.unref?.();
+
+    // Contactados se mantiene sincronizado con las gestiones importadas.
+    sincronizarContactados().catch(() => {});
+    const contactadosTimer = setInterval(() => {
+      sincronizarContactados().catch(() => {});
+      expirarContactadosAhora().catch(() => {});
+    }, 5 * 60_000);
+    contactadosTimer.unref?.();
 
     const ejecutarRetencion = async () => {
       try {

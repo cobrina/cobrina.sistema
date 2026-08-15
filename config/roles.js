@@ -146,6 +146,7 @@ const MODULE_ACCESS = Object.freeze({
     ROLES.SUPER_ADMIN,
   ]),
   colchon: new Set(ALL_EFFECTIVE_ROLES),
+  contactados: new Set(ALL_EFFECTIVE_ROLES),
   notas: new Set(ALL_EFFECTIVE_ROLES),
   agenda: new Set(ALL_EFFECTIVE_ROLES),
   presentismo: new Set([

@@ -123,6 +123,12 @@ ReporteGestionSchema.index({ propietario: 1, tipoContacto: 1, fecha: -1 });
 ReporteGestionSchema.index({ propietario: 1, estadoCuenta: 1, fecha: -1 });
 ReporteGestionSchema.index({ propietario: 1, resultadoGestion: 1, fecha: -1 });
 
+// Contactados sincroniza incrementalmente por createdAt y luego acota por fecha.
+ReporteGestionSchema.index(
+  { createdAt: 1, fecha: 1 },
+  { name: "idx_createdAt_fecha_contactados" }
+);
+
 // Para búsquedas por DNI dentro del scope del propietario
 ReporteGestionSchema.index({ propietario: 1, dni: 1, fecha: -1 }); // consultas por DNI + rango
 ReporteGestionSchema.index({ propietario: 1, dni: 1 }); // fallback si no hay rango

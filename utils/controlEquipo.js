@@ -23,6 +23,37 @@ export const USUARIOS_NO_CONTROL_TIEMPOS = new Set([
   "svillasboa",
 ]);
 
+// Visibilidad individual usada por Contactados. La actividad de estas cuentas
+// sigue contando en métricas globales, pero no se identifica en tablas de control.
+// Se mantiene separada de las listas históricas de RDC para no alterar otros módulos.
+export const USUARIOS_OCULTOS_REPORTES_CONTROL = new Set([
+  "ceballos1988",
+  "prougier",
+  "paular",
+  "probando",
+  "probando-admin",
+  "residual",
+  "paredez.patricia",
+  "pparedez",
+  "lucas",
+  "amerlo",
+  "svillasboa",
+  "merlo.alejandra",
+  "ksalinas",
+]);
+
+export function esUsuarioVisibleEnReportesControl(value) {
+  const username = normalizeUsername(value);
+  return Boolean(username) && !USUARIOS_OCULTOS_REPORTES_CONTROL.has(username);
+}
+
+export function filtrarFilasReportesControl(
+  rows = [],
+  getUsername = (row) => row?.usuario ?? row?.username ?? row?.operador ?? row?.operadorUsername
+) {
+  return (rows || []).filter((row) => esUsuarioVisibleEnReportesControl(getUsername(row)));
+}
+
 export function esEmpleadoControlTiempos(empleado = {}) {
   const username = normalizeUsername(empleado?.username);
   return esEmpleadoControlado(empleado) && !USUARIOS_NO_CONTROL_TIEMPOS.has(username);

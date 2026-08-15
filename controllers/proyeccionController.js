@@ -272,6 +272,17 @@ const mapearGestionAacuerdoMango = (gestion = {}, numeroPorNombre = new Map()) =
   };
 };
 
+const claveVencimientoAcuerdoMango = (acuerdo = {}) => {
+  const raw = acuerdo.anticipoVto || acuerdo.primerVto || null;
+  const texto = String(raw || "").trim();
+  if (!texto) return "";
+  const ymd = texto.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (ymd) return `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+  const dmy = texto.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})/);
+  if (dmy) return `${dmy[3]}-${String(dmy[2]).padStart(2, "0")}-${String(dmy[1]).padStart(2, "0")}`;
+  return claveFechaCalendario(raw);
+};
+
 const condicionesMangoPorProyecciones = (proyecciones = []) => {
   const condiciones = [];
   const vistas = new Set();
@@ -1756,6 +1767,7 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
           acuerdo.montoPagosValidos || acuerdo.montoPagosPosteriores || 0
         );
         const fechaAcuerdo = acuerdo.fecha || acuerdo.fechaHora || null;
+        const fechaVencimiento = claveVencimientoAcuerdoMango(acuerdo) || fechaAcuerdo;
         const estado = importePagado > 0
           ? (importe > 0 && importePagado >= importe ? "Pagado" : "Pagado parcial")
           : acuerdo.requiereRevisionPagos
@@ -1769,7 +1781,7 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
           importePagado,
           estado,
           concepto: acuerdo.tipoAcuerdo || acuerdo.resultado || "Acuerdo",
-          fechaPromesa: fechaAcuerdo,
+          fechaPromesa: fechaVencimiento,
           creado: fechaAcuerdo,
           empleadoId: { username: acuerdo.operadorPago || acuerdo.operador || acuerdo.operadorGestion || "Sin usuario" },
           entidadId: {
@@ -1831,12 +1843,10 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
       if (cumplida) resumen.pagadas += 1;
 
       const fechaPromesa = normalizarFechaResumen(registro.fechaPromesa);
-      if (
-        estadoRegistro === "Promesa caída" &&
-        pagado === 0 &&
-        fechaPromesa &&
-        fechaPromesa < hoyClaveResumen
-      ) {
+      // Una promesa está vencida por su vencimiento real y por no tener pago
+      // válido, no por la etiqueta persistida del estado. Esto también cubre
+      // acuerdos de Mango cuyo estado visible sigue siendo "Acuerdo Mango".
+      if (pagado <= 0 && fechaPromesa && fechaPromesa < hoyClaveResumen) {
         resumen.vencidasSinPago += 1;
       }
 
