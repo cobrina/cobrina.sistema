@@ -133,6 +133,8 @@ ColchonSchema.index({ entidadNumero: 1, subCesionId: 1, dni: 1 });
 ColchonSchema.index({ empleadoId: 1, vencimiento: 1 });
 ColchonSchema.index({ empleadoId: 1, estado: 1 });
 ColchonSchema.index({ entidadId: 1, subCesionId: 1, estado: 1 });
+ColchonSchema.index({ creado: 1 }, { name: "idx_supervision_creado" });
+ColchonSchema.index({ ultimaGestion: 1 }, { name: "idx_supervision_ultima_gestion" });
 
 // Para “pagos informados no vistos”
 ColchonSchema.index({ "pagosInformados.visto": 1 }); // multikey

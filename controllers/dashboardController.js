@@ -7,10 +7,11 @@ import ObjetivoMensual from "../models/ObjetivoMensual.js";
 import AgendaItem from "../models/AgendaItem.js";
 import StickyNote from "../models/StickyNote.js";
 import Empleado from "../models/Empleado.js";
+import Entidad from "../models/Entidad.js";
 import Asistencia from "../models/Asistencia.js";
 import mongoose from "mongoose";
 import { ROLES, normalizeStoredRole } from "../config/roles.js";
-import { transformarGestionEnAcuerdo } from "../services/acuerdosGestionesService.js";
+import { transformarGestionEnAcuerdo, resolverEpisodiosAcuerdos, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
 import { actividadDeUsuarioEnFecha, resumirActividadMensual } from "../utils/actividadGestiones.js";
 import { novedadSolapaRango } from "../utils/calculoAsistencia.js";
 
@@ -81,6 +82,36 @@ function fechaHoraAcuerdo(acuerdo) {
   return Number.isNaN(value.getTime()) ? null : value;
 }
 
+async function resolverEpisodiosDashboard(acuerdos = [], fechaHasta = new Date()) {
+  if (!Array.isArray(acuerdos) || !acuerdos.length) return [];
+  try {
+    const dnis = [...new Set(acuerdos.map((item) => String(item?.dni || "").replace(/\D/g, "")).filter(Boolean))];
+    const fechas = acuerdos.map(fechaHoraAcuerdo).filter(Boolean);
+    const earliest = fechas.length ? new Date(Math.min(...fechas.map((d) => d.getTime()))) : null;
+    const desde = earliest ? new Date(earliest.getTime() - 90 * 86400000) : null;
+    const hasta = fechaHasta instanceof Date ? fechaHasta : new Date(fechaHasta);
+    const query = { dni: { $in: dnis } };
+    if (desde && !Number.isNaN(hasta.getTime())) query.fechaPago = { $gte: desde, $lte: hasta };
+    const pagos = dnis.length
+      ? await Pago.find(query)
+          .select("idPago dni entidadId subCesionId fechaPago monto conceptoCodigo estado operadorUsername")
+          .sort({ fechaPago: 1, _id: 1 })
+          .lean()
+      : [];
+    const numeros = [...new Set(pagos.map((pago) => Number(pago?.entidadId || 0)).filter(Boolean))];
+    const entidades = numeros.length
+      ? await Entidad.find({ numero: { $in: numeros } }).select("numero nombre").lean()
+      : [];
+    const vinculados = vincularPagosPosteriores(acuerdos, pagos, entidades, { disponible: true });
+    return resolverEpisodiosAcuerdos(vinculados).rows;
+  } catch (error) {
+    console.warn("Dashboard: no se pudo resolver episodios de acuerdos con Pagos:", error?.message || error);
+    return resolverEpisodiosAcuerdos(
+      vincularPagosPosteriores(acuerdos, [], [], { disponible: false, motivo: "ERROR_CRUCE_PAGOS" })
+    ).rows;
+  }
+}
+
 async function contarAcuerdosVencidosSinPago({ acuerdos, ownOnly, userObjectId, username, now }) {
   const candidatos = acuerdos.filter((acuerdo) => acuerdo.estadoVencimiento === "VENCIDO");
   if (!candidatos.length) return 0;
@@ -144,18 +175,21 @@ export async function resumenDashboard(req, res) {
         borrado: { $ne: true },
         usuario: username,
       };
-      const pagoHoyQuery = {
-        fechaPago: { $gte: inicioHoy, $lte: finHoy },
+      // La recaudación del operador se muestra acumulada en el mes.
+      // Los pagos pueden imputarse varios días después, por eso no representa
+      // correctamente la gestión si se limita a "hoy".
+      const pagoMesQuery = {
+        fechaPago: { $gte: desdeMes, $lt: hastaMes },
         $or: [{ operadorId: userObjectId }, { operadorUsername: username }],
       };
 
-      const [gestionesHoyRows, pagosHoyAgg, asistenciaHoy, empleadoActual] = await Promise.all([
+      const [gestionesHoyRows, pagosMesAgg, asistenciaHoy, empleadoActual] = await Promise.all([
         ReporteGestion.find(gestionHoyQuery)
           .select("dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero createdAt updatedAt")
           .sort({ hora: 1, _id: 1 })
           .lean(),
         Pago.aggregate([
-          { $match: pagoHoyQuery },
+          { $match: pagoMesQuery },
           { $group: { _id: null, cantidad: { $sum: 1 }, monto: { $sum: "$monto" } } },
         ]),
         Asistencia.findOne({ empleado: userId, fechaClave: hoy }).select("estado marcas fechaClave").lean(),
@@ -163,9 +197,10 @@ export async function resumenDashboard(req, res) {
       ]);
 
       const actividadHoy = actividadDeUsuarioEnFecha(gestionesHoyRows, hoy).get(username) || {};
-      const acuerdosHoy = gestionesHoyRows.map(transformarGestionEnAcuerdo).filter(Boolean);
-      const pagosHoyCantidad = Number(pagosHoyAgg[0]?.cantidad || 0);
-      const pagosHoyMonto = Number(pagosHoyAgg[0]?.monto || 0);
+      const acuerdosHoyBase = gestionesHoyRows.map(transformarGestionEnAcuerdo).filter(Boolean);
+      const acuerdosHoy = await resolverEpisodiosDashboard(acuerdosHoyBase, finHoy);
+      const pagosMesCantidad = Number(pagosMesAgg[0]?.cantidad || 0);
+      const pagosMesMonto = Number(pagosMesAgg[0]?.monto || 0);
       const fichaje = resumenFichaje(asistenciaHoy);
       const actualizaciones = gestionesHoyRows
         .map((row) => row?.updatedAt || row?.createdAt)
@@ -188,8 +223,9 @@ export async function resumenDashboard(req, res) {
           bacheMaximoMin: Number(actividadHoy.bacheMaximoMin || 0),
         },
         resultadosHoy: {
-          recaudacion: pagosHoyMonto,
-          pagosCantidad: pagosHoyCantidad,
+          recaudacion: pagosMesMonto,
+          pagosCantidad: pagosMesCantidad,
+          periodoRecaudacion: mes,
           acuerdos: acuerdosHoy.length,
         },
         asistencia: {
@@ -257,29 +293,27 @@ export async function resumenDashboard(req, res) {
         .lean(),
       StickyNote.find({
         userId,
-        status: { $ne: "finalizada" },
-        dueDate: { $gte: inicioHoy, $lte: finHoy },
+        status: "pendiente",
+        month: mes,
       })
-        .select("title text status priority dueDate")
-        .sort({ priority: -1, dueDate: 1 })
-        .limit(8)
+        .select("title text status priority dueDate month")
+        .sort({ dueDate: 1, priority: -1, updatedAt: -1 })
+        .limit(100)
         .lean(),
       ObjetivoMensual.countDocuments({ mes, activo: true }),
     ]);
 
-    const acuerdos = gestionesAcuerdo.map(transformarGestionEnAcuerdo).filter(Boolean);
+    const acuerdosBase = gestionesAcuerdo.map(transformarGestionEnAcuerdo).filter(Boolean);
+    const acuerdos = await resolverEpisodiosDashboard(acuerdosBase, now);
     const desdeMesClave = `${mes}-01`;
     const hastaMesClave = new Date(hastaMes.getTime() - 1).toISOString().slice(0, 10);
     const novedadesPeriodo = novedades.filter((item) => novedadSolapaRango(item, desdeMesClave, hastaMesClave));
     const pagosCantidad = Number(pagosAgg[0]?.cantidad || 0);
     const pagosMonto = Number(pagosAgg[0]?.monto || 0);
-    const vencidosSinPago = await contarAcuerdosVencidosSinPago({
-      acuerdos,
-      ownOnly,
-      userObjectId,
-      username,
-      now,
-    });
+    const estadosPagoValido = new Set(["CON PAGO POSTERIOR", "CON PAGO VÁLIDO", "PAGO MISMO DÍA", "PAGO MISMO DÍA VÁLIDO"]);
+    const vencidosSinPago = acuerdos.filter((acuerdo) =>
+      acuerdo.estadoVencimiento === "VENCIDO" && !estadosPagoValido.has(String(acuerdo.estadoPagoAcuerdo || ""))
+    ).length;
     const faltas = novedadesPeriodo.filter((item) => ["falta", "falta-justificada"].includes(item.tipo)).length;
     const tardes = novedadesPeriodo.filter((item) => item.tipo === "llegada-tarde").length;
     const apercibimientos = novedadesPeriodo.filter((item) => ["apercibimiento", "error-grave-gestion"].includes(item.tipo)).length;
@@ -302,7 +336,7 @@ export async function resumenDashboard(req, res) {
       ),
       card(
         "trello-hoy",
-        "Tareas para hoy",
+        "Tareas pendientes",
         trelloHoy.length,
         trelloHoy.length === 1 ? "1 tarjeta pendiente" : `${trelloHoy.length} tarjetas pendientes`,
         "/controles/notas"

@@ -5,42 +5,43 @@ import {
   normalizeUsername,
 } from "../config/roles.js";
 
-// Personas que pueden tener gestiones/acuerdos válidos, pero no forman parte
-// del control visual de presentismo, horas ni rendimiento individual.
+/**
+ * Usuarios que siguen siendo válidos para cálculos globales (gestiones,
+ * acuerdos, recuperos, etc.), pero no deben aparecer identificados en tablas,
+ * rankings ni controles individuales de Reportes / Supervisión / RRHH.
+ *
+ * IMPORTANTE: esta lista NO borra ni descarta su actividad. Solo gobierna la
+ * visibilidad individual en módulos de control.
+ */
 export const USUARIOS_NO_CONTROLADOS = new Set([
-  "probando",
-  "probando-admin",
-  "merlo.alejandra",
-  "ksalinas",
-]);
-
-
-// Usuarios que siguen existiendo en Cobrina/RDC, pero no deben aparecer en
-// los cuadros de control de jornada, tiempos y baches.
-export const USUARIOS_NO_CONTROL_TIEMPOS = new Set([
-  "amerlo",
-  "residual",
-  "svillasboa",
-]);
-
-// Visibilidad individual usada por Contactados. La actividad de estas cuentas
-// sigue contando en métricas globales, pero no se identifica en tablas de control.
-// Se mantiene separada de las listas históricas de RDC para no alterar otros módulos.
-export const USUARIOS_OCULTOS_REPORTES_CONTROL = new Set([
+  // Usuarios técnicos / históricamente excluidos
   "ceballos1988",
   "prougier",
   "paular",
   "probando",
   "probando-admin",
   "residual",
+
+  // Exclusiones históricas del control de asistencia
   "paredez.patricia",
   "pparedez",
   "lucas",
+
+  // Exclusiones operativas solicitadas
   "amerlo",
   "svillasboa",
   "merlo.alejandra",
   "ksalinas",
 ]);
+
+// Alias semántico para consumidores que trabajan directamente con filas de
+// reportes y no con documentos Empleado.
+export const USUARIOS_OCULTOS_REPORTES_CONTROL = USUARIOS_NO_CONTROLADOS;
+
+// Se conserva por compatibilidad con imports anteriores. Las exclusiones de
+// jornada ahora forman parte de la lista general para que no reaparezcan en
+// otro cuadro de control por tener una regla distinta.
+export const USUARIOS_NO_CONTROL_TIEMPOS = USUARIOS_OCULTOS_REPORTES_CONTROL;
 
 export function esUsuarioVisibleEnReportesControl(value) {
   const username = normalizeUsername(value);

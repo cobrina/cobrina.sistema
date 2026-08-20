@@ -50,6 +50,30 @@ function empleadoSeguro(empleado) {
   return raw;
 }
 
+
+function limpiarHorarioLaboral(raw = {}) {
+  const modalidad = String(raw?.modalidad || "fijo").toLowerCase() === "libre" ? "libre" : "fijo";
+  if (modalidad === "libre") {
+    return { modalidad: "libre", dias: [], entrada: "", salida: "", toleranciaMinutos: 0 };
+  }
+  const dias = Array.isArray(raw?.dias)
+    ? [...new Set(raw.dias.map(Number).filter((dia) => Number.isInteger(dia) && dia >= 0 && dia <= 6))]
+    : [1, 2, 3, 4, 5];
+  const entrada = String(raw?.entrada || "").trim();
+  const salida = String(raw?.salida || "").trim();
+  const hhmm = /^([01]\d|2[0-3]):[0-5]\d$/;
+  if ((entrada && !hhmm.test(entrada)) || (salida && !hhmm.test(salida))) {
+    throw new Error("Horario laboral inválido");
+  }
+  return {
+    modalidad: "fijo",
+    dias: dias.length ? dias : [1, 2, 3, 4, 5],
+    entrada,
+    salida,
+    toleranciaMinutos: Math.max(0, Math.min(180, Number(raw?.toleranciaMinutos ?? 10))),
+  };
+}
+
 function rolSolicitadoParaActor(req, rawRole) {
   const role = normalizeAssignableRole(rawRole || ROLES.OPERADOR);
   if (!role) throw new Error("Rol inválido");
@@ -95,9 +119,13 @@ router.post(
 
       const nuevo = await Empleado.create({
         username,
+        nombre: String(req.body.nombre || "").trim(),
+        celular: String(req.body.celular || "").trim(),
         password: await bcrypt.hash(String(req.body.password), 10),
         email,
         role,
+        isActive: req.body.isActive !== false,
+        horarioLaboral: limpiarHorarioLaboral(req.body.horarioLaboral || {}),
       });
 
       return res.status(201).json({
@@ -189,8 +217,10 @@ router.get("/paginated", ...gestoresUsuarios, async (req, res) => {
     if (req.query.busqueda) {
       const q = String(req.query.busqueda).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       filtro.$or = [
+        { nombre: { $regex: q, $options: "i" } },
         { username: { $regex: q, $options: "i" } },
         { email: { $regex: q, $options: "i" } },
+        { celular: { $regex: q, $options: "i" } },
       ];
     }
 
@@ -285,6 +315,11 @@ router.put(
         if (dupEmail) return res.status(409).json({ error: "Ese correo ya existe" });
         update.email = email;
       }
+
+      if (req.body.nombre !== undefined) update.nombre = String(req.body.nombre || "").trim();
+      if (req.body.celular !== undefined) update.celular = String(req.body.celular || "").trim();
+      if (req.body.isActive !== undefined) update.isActive = Boolean(req.body.isActive);
+      if (req.body.horarioLaboral !== undefined) update.horarioLaboral = limpiarHorarioLaboral(req.body.horarioLaboral || {});
 
       if (req.body.role !== undefined) {
         update.role = rolSolicitadoParaActor(req, req.body.role);

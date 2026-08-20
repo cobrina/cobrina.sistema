@@ -9,6 +9,7 @@ import Colchon from "../models/Colchon.js";
 import ReporteGestion from "../models/ReporteGestion.js";
 import NovedadRRHH from "../models/NovedadRRHH.js";
 import AcuerdoPago from "../models/AcuerdoPago.js";
+import ContactadoVentana from "../models/ContactadoVentana.js";
 import {
   horarioEfectivoParaFecha,
   minutosEsperadosEnRango,
@@ -25,7 +26,7 @@ import {
 import { actividadDeUsuarioEnFecha, horaGestionHHMM, resumirActividadMensual } from "../utils/actividadGestiones.js";
 import { filtrarEmpleadosControlados, usernamesControlados } from "../utils/controlEquipo.js";
 import { normalizeUsername } from "../config/roles.js";
-import { transformarGestionEnAcuerdo, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
+import { transformarGestionEnAcuerdo, resolverEpisodiosAcuerdos, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
 import {
   claveFechaCalendario,
   fechaClaveArgentina,
@@ -38,6 +39,33 @@ const BACHE_VISIBLE_MIN = 20;
 const BACHE_CRITICO_MIN = 30;
 const TARDANZA_INICIO_VISIBLE_MIN = 15;
 const ANTICIPO_INICIO_VISIBLE_MIN = 30;
+
+// Mango usa un conjunto acotado de resultados para acuerdos reales. Antes
+// Supervisión consultaba /acuerdo/i sobre seis meses de gestiones: esa regex no
+// aprovecha bien los índices y, con mucho volumen, podía escanear una parte enorme
+// de ReporteGestion. La lista exacta excluye además "Bajo acuerdo/Baja acuerdo".
+const RESULTADOS_ACUERDO_MANGO = [
+  "Acuerdo libre", "ACUERDO LIBRE", "acuerdo libre",
+  "Acuerdo parcial", "ACUERDO PARCIAL", "acuerdo parcial",
+  "Acuerdo anticipo mas cuotas", "ACUERDO ANTICIPO MAS CUOTAS", "acuerdo anticipo mas cuotas",
+  "Acuerdo en cuota/s", "ACUERDO EN CUOTA/S", "acuerdo en cuota/s",
+  "Acuerdo en cuota", "ACUERDO EN CUOTA", "acuerdo en cuota",
+  "Acuerdo en cuotas", "ACUERDO EN CUOTAS", "acuerdo en cuotas",
+];
+
+const SUPERVISION_QUERY_MS = 7000;
+const SUPERVISION_CRUCE_PAGOS_MS = 6000;
+
+async function consultaOpcional(nombre, query, fallback, errores) {
+  try {
+    return await query;
+  } catch (error) {
+    const mensaje = String(error?.message || error || "Error desconocido");
+    console.warn(`[Supervisión] ${nombre} no disponible:`, mensaje);
+    errores.push({ fuente: nombre, mensaje });
+    return fallback;
+  }
+}
 
 function mesValido(valor) {
   const match = String(valor || "").match(/^(\d{4})-(\d{2})$/);
@@ -106,6 +134,7 @@ function minutoActualArgentina(fecha = new Date()) {
 function etiquetaNovedadDia(novedad) {
   const tipo = String(novedad?.tipo || "");
   if (tipo === "licencia-medica") return "Licencia médica";
+  if (tipo === "vacaciones") return "Vacaciones";
   if (tipo === "falta-justificada") return "Falta justificada";
   if (tipo === "falta") return "Falta sin justificar";
   if (tipo === "dia-estudio") return "Día de estudio";
@@ -178,6 +207,8 @@ function mapearPagosPorOperador(pagos, empleados) {
 }
 
 export async function resumenSupervision(req, res) {
+  const iniciadoEnMs = Date.now();
+  const erroresFuentes = [];
   try {
     const hoyReal = new Date(); // instante real de consulta
     const hoyRealClave = fechaClaveArgentina(hoyReal);
@@ -200,6 +231,10 @@ export async function resumenSupervision(req, res) {
     const hoyHasta = finDiaCalendarioUTC(hoyClave);
     const selectedDesdeUTC = inicioDiaCalendarioUTC(desdeClave);
     const selectedHastaUTC = hasta;
+    const finMesSeleccionadoUTC = finDiaCalendarioUTC(hastaClave);
+    // Para proyectar lo que efectivamente debe entrar en el mes necesitamos
+    // también acuerdos generados antes cuyo primer pago vence en este mes.
+    const acuerdosProyeccionDesdeUTC = new Date(selectedDesdeUTC.getTime() - 185 * 86400000);
     const hoyDesdeUTC = hoyDesde;
     const hoyHastaUTC = hoyHasta;
     const desdeNovedades = selectedDesdeUTC;
@@ -214,20 +249,21 @@ export async function resumenSupervision(req, res) {
     const usuariosControlados = usernamesControlados(empleados);
     const listaUsuariosControlados = [...usuariosControlados];
 
-    const [pagosTres, objetivos, novedadesRRHH, gestionesActividadPeriodo, gestionesActividadHoy,
+    const [pagosTres, objetivos, novedadesRRHH, gestionesActividadPeriodo,
       proyeccionesCaidas, proyeccionesManuales, colchonSinGestion, pendientesColchon, pendientesProyecciones, ultimaPago,
-      ultimaGestionAcuerdo, ultimaGestion, ultimaGestionDia, gestionesAcuerdoPeriodo, pagosHoyAgg, pagosHoyDetalle, fichadosAhora,
-      jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad, resumenColchonAgg, ultimaColchon, ultimaNovedadRRHH] = await Promise.all([
+      ultimaGestionAcuerdo, ultimaGestion, ultimaGestionDia, fichadosAhora,
+      jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad, colchonResumenRows, ultimaColchon, ultimaNovedadRRHH, entidadesCatalogo, gestionesAcuerdoProyeccion] = await Promise.all([
       Pago.find({ fechaPago: { $gte: desdeTres, $lte: hasta } })
-        .select("monto fechaPago operadorId operadorUsername entidadId subCesionId")
-        .lean(),
+        .select("dni monto fechaPago operadorId operadorUsername entidadId subCesionId")
+        .lean()
+        .maxTimeMS(SUPERVISION_QUERY_MS),
       ObjetivoMensual.find({ mes: mesSeleccionado, activo: true })
         .populate("empleadoId", "username nombre")
         .populate("subCesionId", "nombre")
         .lean(),
       NovedadRRHH.find({
         empleadoId: { $in: idsControlados },
-        tipo: { $in: ["cambio-horario", "licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"] },
+        tipo: { $in: ["cambio-horario", "licencia-medica", "vacaciones", "falta", "falta-justificada", "dia-estudio", "permiso"] },
         estado: { $ne: "anulado" },
         fechaDesde: { $lte: hastaNovedades },
         $or: [{ fechaHasta: null }, { fechaHasta: { $gte: desdeNovedades } }],
@@ -236,12 +272,7 @@ export async function resumenSupervision(req, res) {
         fecha: { $gte: selectedDesdeUTC, $lte: selectedHastaUTC },
         borrado: { $ne: true },
         usuario: { $in: listaUsuariosControlados },
-      }).select("fecha hora usuario").lean(),
-      ReporteGestion.find({
-        fecha: { $gte: hoyDesdeUTC, $lte: hoyHastaUTC },
-        borrado: { $ne: true },
-        usuario: { $in: listaUsuariosControlados },
-      }).select("fecha hora usuario").lean(),
+      }).select("fecha hora usuario").lean().maxTimeMS(SUPERVISION_QUERY_MS),
       Proyeccion.countDocuments({
         fechaPromesa: { $gte: desde, $lte: hasta },
         $or: [
@@ -264,31 +295,21 @@ export async function resumenSupervision(req, res) {
         pagosInformados: { $elemMatch: { erroneo: { $ne: true }, estadoAplicacion: { $in: [null, "pendiente"] } } },
       }),
       Pago.findOne().sort({ createdAt: -1 }).select("createdAt fechaPago").lean(),
-      ReporteGestion.findOne({ borrado: { $ne: true }, resultadoGestion: /acuerdo/i })
+      ReporteGestion.findOne({
+        borrado: { $ne: true },
+        resultadoGestion: { $in: RESULTADOS_ACUERDO_MANGO },
+        usuario: { $in: listaUsuariosControlados },
+      })
         .sort({ createdAt: -1 })
         .select("createdAt fecha hora usuario resultadoGestion fuenteArchivo")
-        .lean(),
+        .lean()
+        .maxTimeMS(SUPERVISION_QUERY_MS),
       ReporteGestion.findOne({ borrado: { $ne: true } }).sort({ createdAt: -1 }).select("createdAt fecha fuenteArchivo").lean(),
       ReporteGestion.findOne({
         fecha: { $gte: hoyDesdeUTC, $lte: hoyHastaUTC },
         borrado: { $ne: true },
         usuario: { $in: listaUsuariosControlados },
       }).sort({ createdAt: -1 }).select("createdAt fecha hora fuenteArchivo usuario").lean(),
-      ReporteGestion.find({
-        fecha: { $gte: selectedDesdeUTC, $lte: selectedHastaUTC },
-        borrado: { $ne: true },
-        resultadoGestion: /acuerdo/i,
-      })
-        .select("dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero")
-        .sort({ fecha: -1, hora: -1, _id: -1 })
-        .lean(),
-      Pago.aggregate([
-        { $match: { fechaPago: { $gte: hoyDesde, $lte: hoyHasta } } },
-        { $group: { _id: null, total: { $sum: "$monto" }, cantidad: { $sum: 1 } } },
-      ]),
-      Pago.find({ fechaPago: { $gte: hoyDesde, $lte: hoyHasta } })
-        .select("monto operadorId operadorUsername")
-        .lean(),
       Asistencia.countDocuments({ empleado: { $in: idsControlados }, fechaClave: hoyClave, estado: "presente" }),
       Asistencia.countDocuments({ empleado: { $in: idsControlados }, fechaClave: { $lt: hoyClave }, estado: "presente" }),
       AcuerdoPago.findOne({ mes: mesSeleccionado, fecha: { $lte: selectedHastaUTC } })
@@ -296,84 +317,55 @@ export async function resumenSupervision(req, res) {
         .select("fechaHora createdAt fuenteArchivo operador")
         .lean(),
       AcuerdoPago.countDocuments({ mes: mesSeleccionado, fecha: { $lte: selectedHastaUTC } }),
-      Colchon.aggregate([
-        { $match: { creado: { $lte: selectedHastaUTC } } },
-        {
-          $lookup: {
-            from: "entidads",
-            localField: "entidadId",
-            foreignField: "_id",
-            as: "entidadCatalogo",
-            pipeline: [{ $project: { _id: 1, numero: 1 } }],
-          },
-        },
-        { $unwind: { path: "$entidadCatalogo", preserveNullAndEmptyArrays: true } },
-        {
-          $addFields: {
-            importeCuotaSupervision: { $ifNull: ["$importeCuota", 0] },
-            dniPago: { $toString: "$dni" },
-            entidadNumeroPago: {
-              $convert: {
-                input: { $ifNull: ["$entidadNumero", "$entidadCatalogo.numero"] },
-                to: "int",
-                onError: null,
-                onNull: null,
+      consultaOpcional(
+        "Colchón resumen",
+        Colchon.aggregate([
+          { $match: { creado: { $lte: selectedHastaUTC } } },
+          {
+            $group: {
+              _id: {
+                dni: "$dni",
+                entidadId: "$entidadId",
+                entidadNumero: "$entidadNumero",
+                subCesionId: "$subCesionId",
               },
+              importeCuota: { $sum: { $ifNull: ["$importeCuota", 0] } },
+              cuotas: { $sum: 1 },
             },
           },
-        },
-        {
-          $lookup: {
-            from: Pago.collection.name,
-            let: {
-              dniCuota: "$dniPago",
-              entidadNumero: "$entidadNumeroPago",
-              subCesion: "$subCesionId",
-            },
-            pipeline: [
-              {
-                $match: {
-                  $expr: {
-                    $and: [
-                      { $eq: ["$dni", "$$dniCuota"] },
-                      { $eq: ["$entidadId", "$$entidadNumero"] },
-                      { $eq: ["$subCesionId", "$$subCesion"] },
-                      { $gte: ["$fechaPago", desde] },
-                      { $lte: ["$fechaPago", hasta] },
-                    ],
-                  },
-                },
-              },
-              {
-                $group: {
-                  _id: null,
-                  total: { $sum: { $ifNull: ["$monto", 0] } },
-                  cantidad: { $sum: 1 },
-                },
-              },
-            ],
-            as: "pagosColchonMes",
-          },
-        },
-        {
-          $addFields: {
-            pagadoSupervision: {
-              $ifNull: [{ $arrayElemAt: ["$pagosColchonMes.total", 0] }, 0],
+          {
+            $project: {
+              _id: 0,
+              dni: "$_id.dni",
+              entidadId: "$_id.entidadId",
+              entidadNumero: "$_id.entidadNumero",
+              subCesionId: "$_id.subCesionId",
+              importeCuota: 1,
+              cuotas: 1,
             },
           },
-        },
-        {
-          $group: {
-            _id: null,
-            totalCuotas: { $sum: 1 },
-            importeTotal: { $sum: "$importeCuotaSupervision" },
-            pagadoTotal: { $sum: "$pagadoSupervision" },
-            cuotasConPago: { $sum: { $cond: [{ $gt: ["$pagadoSupervision", 0] }, 1, 0] } },
-          },
-        },
-      ]).allowDiskUse(true),
+        ]).option({ maxTimeMS: SUPERVISION_QUERY_MS }).allowDiskUse(true),
+        [],
+        erroresFuentes
+      ),
       Colchon.findOne({ creado: { $lte: selectedHastaUTC } }).sort({ ultimaModificacion: -1, creado: -1 }).select("ultimaModificacion creado").lean(),
       NovedadRRHH.findOne({ estado: { $ne: "anulado" } }).sort({ updatedAt: -1, createdAt: -1 }).select("updatedAt createdAt tipo fechaDesde").lean(),
+      Entidad.find({}).select("_id numero nombre").lean(),
+      consultaOpcional(
+        "Acuerdos Mango",
+        ReporteGestion.find({
+          fecha: { $gte: acuerdosProyeccionDesdeUTC, $lte: finMesSeleccionadoUTC },
+          borrado: { $ne: true },
+          usuario: { $in: listaUsuariosControlados },
+          resultadoGestion: { $in: RESULTADOS_ACUERDO_MANGO },
+        })
+          .select("dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero")
+          .sort({ fecha: -1, hora: -1, _id: -1 })
+          .lean()
+          .maxTimeMS(SUPERVISION_QUERY_MS),
+        [],
+        erroresFuentes
+      ),
     ]);
 
     const diaCorteComparacion = Number(hoyClave.slice(8, 10));
@@ -397,12 +389,45 @@ export async function resumenSupervision(req, res) {
     });
 
     const pagosActuales = pagosTres.filter((p) => p.fechaPago >= desde && p.fechaPago <= hasta);
+    const pagosDiaSeleccionado = pagosTres.filter((p) => p.fechaPago >= hoyDesde && p.fechaPago <= hoyHasta);
+    const pagosDiaSeleccionadoTotal = pagosDiaSeleccionado.reduce((sum, p) => sum + Number(p.monto || 0), 0);
     const totalActual = pagosActuales.reduce((sum, p) => sum + Number(p.monto || 0), 0);
-    const colchonBase = resumenColchonAgg?.[0] || {};
-    const colchonTotalCuotas = Number(colchonBase.totalCuotas || 0);
-    const colchonImporteTotal = Number(colchonBase.importeTotal || 0);
-    const colchonPagadoTotal = Number(colchonBase.pagadoTotal || 0);
-    const colchonCuotasConPago = Number(colchonBase.cuotasConPago || 0);
+    // Antes esta métrica hacía un $lookup a Pagos POR CADA fila de Colchón.
+    // Conservamos exactamente la misma regla de cruce (DNI + entidad + subcesión),
+    // pero usando los pagos del mes ya cargados y mapas en memoria.
+    const entidadNumeroPorId = new Map(
+      (entidadesCatalogo || []).map((entidad) => [String(entidad._id), Number(entidad.numero || 0)])
+    );
+    const pagosMesPorCaso = new Map();
+    for (const pago of pagosActuales) {
+      const dni = String(pago?.dni || "").replace(/\D/g, "");
+      const entidadNumero = Number(pago?.entidadId || 0);
+      const subCesionId = String(pago?.subCesionId || "");
+      if (!dni || !entidadNumero || !subCesionId) continue;
+      const key = `${dni}|${entidadNumero}|${subCesionId}`;
+      pagosMesPorCaso.set(key, Number(pagosMesPorCaso.get(key) || 0) + Number(pago?.monto || 0));
+    }
+
+    let colchonTotalCuotas = 0;
+    let colchonImporteTotal = 0;
+    let colchonPagadoTotal = 0;
+    let colchonCuotasConPago = 0;
+    for (const cuota of colchonResumenRows || []) {
+      const dni = String(cuota?.dni || "").replace(/\D/g, "");
+      const entidadNumero = Number(cuota?.entidadNumero || entidadNumeroPorId.get(String(cuota?.entidadId || "")) || 0);
+      const subCesionId = String(cuota?.subCesionId || "");
+      const key = `${dni}|${entidadNumero}|${subCesionId}`;
+      const pagado = Number(pagosMesPorCaso.get(key) || 0);
+      const cuotas = Math.max(1, Number(cuota?.cuotas || 1));
+      colchonTotalCuotas += cuotas;
+      colchonImporteTotal += Number(cuota?.importeCuota || 0);
+      // El pago se suma una sola vez por DNI+entidad+subcesión. La versión
+      // anterior podía repetir el mismo pago si el Colchón tenía varias cuotas
+      // del mismo caso.
+      colchonPagadoTotal += pagado;
+      if (pagado > 0) colchonCuotasConPago += cuotas;
+    }
+
     const resumenColchon = {
       totalCuotas: colchonTotalCuotas,
       importeTotal: colchonImporteTotal,
@@ -422,8 +447,14 @@ export async function resumenSupervision(req, res) {
     const objetivosOperador = new Map(
       objetivos.filter((o) => o.alcance === "operador").map((o) => [String(o.empleadoId?._id || o.empleadoId), Number(o.montoObjetivo || 0)])
     );
+    const objetivosPorUsername = new Map(
+      empleadosControlados.map((empleado) => [
+        normalizeUsername(empleado.username),
+        objetivosOperador.get(String(empleado._id)) || 0,
+      ])
+    );
     const actividadMensual = resumirActividadMensual(gestionesActividadPeriodo);
-    const actividadHoy = actividadDeUsuarioEnFecha(gestionesActividadHoy, hoyClave);
+    const actividadHoy = actividadDeUsuarioEnFecha(gestionesActividadPeriodo, hoyClave);
 
     const novedadesPorEmpleado = new Map();
     for (const novedad of novedadesRRHH) {
@@ -433,7 +464,7 @@ export async function resumenSupervision(req, res) {
     }
 
     const pagosHoyPorOperador = new Map(
-      mapearPagosPorOperador(pagosHoyDetalle || [], empleadosControlados)
+      mapearPagosPorOperador(pagosDiaSeleccionado, empleadosControlados)
         .map((item) => [normalizeUsername(item.username), Number(item.total || 0)])
     );
     const ahoraMinArgentina = esFechaActual ? minutoActualArgentina() : (24 * 60 - 1);
@@ -473,10 +504,10 @@ export async function resumenSupervision(req, res) {
       const esperados = minutosEsperadosEnRango(empleado, desdeClave, hoyClave, novedadesEmpleado);
       const horarioHoy = horarioEfectivoParaFecha(empleado, hoyClave, novedadesEmpleado);
       const novedadesDelDia = novedadesEmpleado.filter((novedad) => novedadCubreFecha(novedad, hoyClave));
-      const novedadDia = ["licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"]
+      const novedadDia = ["licencia-medica", "vacaciones", "falta", "falta-justificada", "dia-estudio", "permiso"]
         .map((tipo) => novedadesDelDia.find((novedad) => novedad.tipo === tipo))
         .find(Boolean) || null;
-      const ausenciaJustificadaHoy = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
+      const ausenciaJustificadaHoy = ["licencia-medica", "vacaciones", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
       const primeraMinHoy = minutosHoraHHMM(actividadDelDia.primeraGestion);
       const ultimaMinHoy = minutosHoraHHMM(actividadDelDia.ultimaGestion);
       const minutosTrabajadosHoy = minutosActividadSegunHorario(primeraMinHoy, ultimaMinHoy, horarioHoy);
@@ -698,7 +729,7 @@ export async function resumenSupervision(req, res) {
       };
     });
 
-    const entidades = await Entidad.find({}).select("numero nombre").lean();
+    const entidades = entidadesCatalogo || [];
     const entidadMap = new Map(entidades.map((e) => [Number(e.numero), e.nombre]));
     const porEntidadMap = new Map();
     for (const pago of pagosActuales) {
@@ -752,59 +783,119 @@ export async function resumenSupervision(req, res) {
       })
       .sort((a, b) => b.total - a.total);
 
-    // La fuente de acuerdos es exactamente la misma que Reportes > Acuerdos:
-    // gestiones con resultado "acuerdo" que además superan la validación del parser.
-    // El total de acuerdos no depende de que existan pagos importados.
+    // La fuente de acuerdos es exactamente la misma que Reportes > Acuerdos.
+    // Desde esta versión NO deduplicamos antes de mirar Pagos: primero se
+    // construyen ventanas por DNI + entidad y luego se resuelven episodios.
+    // Así un acuerdo pagado seguido de un nuevo acuerdo cuenta como 2 episodios,
+    // mientras que una renegociación que reemplazó un acuerdo sin pago cuenta 1.
     const usuariosActivos = new Set(
       empleados
         .map((empleado) => String(empleado.username || "").trim().toLowerCase())
         .filter(Boolean)
     );
-    const acuerdosValidos = gestionesAcuerdoPeriodo
+
+    // La consulta de proyección ya contiene al período seleccionado. Transformamos
+    // una sola vez y derivamos el subconjunto mensual en memoria; antes se hacía
+    // una segunda consulta + un segundo parseo de las mismas gestiones.
+    const acuerdosProyeccionBase = (gestionesAcuerdoProyeccion || [])
       .map((gestion) => transformarGestionEnAcuerdo(gestion))
       .filter(Boolean)
-      // El filtro se hace en JS para que nombres con mayúsculas/minúsculas distintas
-      // no oculten acuerdos que sí aparecen en Reporte de gestiones.
       .filter((acuerdo) => usuariosActivos.has(String(acuerdo.usuario || "").trim().toLowerCase()));
 
-    // Para Supervisión no alcanza con saber que un acuerdo "venció" por fecha: si ya
-    // tiene un pago válido cruzado por DNI + entidad, no debe aparecer como vencido
-    // pendiente. Reutilizamos exactamente el criterio del Reporte de Acuerdos.
-    let acuerdosConPagos = acuerdosValidos;
+    const acuerdosPeriodoBase = acuerdosProyeccionBase.filter((acuerdo) => {
+      const fecha = String(acuerdo?.fecha || "").slice(0, 10);
+      return fecha >= desdeClave && fecha <= hastaPeriodoClave;
+    });
+
     let crucePagosDisponible = false;
     let crucePagosHasta = "";
     let pagosCruceCantidad = 0;
-    if (ultimaPago && acuerdosValidos.length) {
+    let pagosCruce = [];
+
+    // acuerdosPeriodoBase ya es subconjunto de acuerdosProyeccionBase. Evitamos
+    // duplicar objetos antes de preparar el cruce de pagos.
+    const acuerdosParaCruce = acuerdosProyeccionBase;
+    if (ultimaPago && acuerdosParaCruce.length) {
       try {
         const dnisAcuerdos = [...new Set(
-          acuerdosValidos
+          acuerdosParaCruce
             .map((row) => String(row?.dni || "").replace(/\D/g, ""))
             .filter(Boolean)
         )];
-        const fechasAcuerdos = acuerdosValidos
+        const entidadesAcuerdos = [...new Set(
+          acuerdosParaCruce
+            .map((row) => Number(row?.entidadNumero || 0))
+            .filter((value) => Number.isFinite(value) && value > 0)
+        )];
+        const fechasAcuerdos = acuerdosParaCruce
           .map((row) => String(row?.fecha || "").slice(0, 10))
           .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))
           .sort();
         const primeraFecha = fechasAcuerdos[0] ? inicioDiaCalendarioUTC(fechasAcuerdos[0]) : null;
-        const pagoDesde = primeraFecha ? new Date(primeraFecha.getTime() - 90 * 86400000) : selectedDesdeUTC;
+        const pagoDesde = primeraFecha ? new Date(primeraFecha.getTime() - 90 * 86400000) : acuerdosProyeccionDesdeUTC;
         const pagoHasta = selectedHastaUTC < hoyReal ? selectedHastaUTC : hoyReal;
-        const pagosCruce = dnisAcuerdos.length
+        pagosCruce = dnisAcuerdos.length
           ? await Pago.find({
               dni: { $in: dnisAcuerdos },
+              ...(entidadesAcuerdos.length ? { entidadId: { $in: entidadesAcuerdos } } : {}),
               fechaPago: { $gte: pagoDesde, $lte: pagoHasta },
             })
               .select("idPago dni entidadId subCesionId fechaPago monto conceptoCodigo estado operadorUsername")
               .sort({ fechaPago: 1, _id: 1 })
               .lean()
-              .maxTimeMS(15000)
+              .maxTimeMS(SUPERVISION_CRUCE_PAGOS_MS)
           : [];
-        acuerdosConPagos = vincularPagosPosteriores(acuerdosValidos, pagosCruce, entidades, { disponible: true });
         crucePagosDisponible = true;
         crucePagosHasta = fechaClaveArgentina(pagoHasta);
         pagosCruceCantidad = pagosCruce.length;
       } catch (error) {
         console.warn("Cruce opcional acuerdos/pagos en Supervisión no disponible:", error?.message || error);
       }
+    }
+
+    const periodoVinculado = vincularPagosPosteriores(
+      acuerdosPeriodoBase,
+      pagosCruce,
+      entidades,
+      { disponible: crucePagosDisponible, motivo: crucePagosDisponible ? "" : "SIN_CRUCE_PAGOS" }
+    );
+    const episodiosPeriodo = resolverEpisodiosAcuerdos(periodoVinculado);
+    const acuerdosValidos = episodiosPeriodo.rows;
+    const acuerdosConPagos = acuerdosValidos;
+
+    const proyeccionVinculada = vincularPagosPosteriores(
+      acuerdosProyeccionBase,
+      pagosCruce,
+      entidades,
+      { disponible: crucePagosDisponible, motivo: crucePagosDisponible ? "" : "SIN_CRUCE_PAGOS" }
+    );
+    const episodiosProyeccion = resolverEpisodiosAcuerdos(proyeccionVinculada);
+
+    // PROYECCIÓN DEL MES = suma del PRIMER PAGO esperado cuyo vencimiento cae
+    // en el mes seleccionado, pero solo de episodios efectivos.
+    const acuerdosProyectablesMes = episodiosProyeccion.rows.filter(
+      (acuerdo) => String(acuerdo.fechaPrimerPago || acuerdo.primerVencimiento || "").slice(0, 7) === mesSeleccionado
+    );
+
+    const proyeccionPorOperadorMap = new Map();
+    let proyeccionPrimerPagoMes = 0;
+    for (const acuerdo of acuerdosProyectablesMes) {
+      const usuario = String(acuerdo.usuario || "Sin operador").trim() || "Sin operador";
+      if (!usuariosControlados.has(normalizeUsername(usuario))) continue;
+      const importe = Number(acuerdo.primerPago || 0);
+      const cobradoPrimerPago = Number(acuerdo.montoPrimerPagoCobrado || 0);
+      proyeccionPrimerPagoMes += importe;
+      const actual = proyeccionPorOperadorMap.get(normalizeUsername(usuario)) || {
+        cantidad: 0,
+        importe: 0,
+        primerPagoCobrado: 0,
+        primerosPagosCubiertos: 0,
+      };
+      actual.cantidad += 1;
+      actual.importe += importe;
+      actual.primerPagoCobrado += cobradoPrimerPago;
+      if (acuerdo.primerPagoCubierto) actual.primerosPagosCubiertos += 1;
+      proyeccionPorOperadorMap.set(normalizeUsername(usuario), actual);
     }
 
     const estadosConPagoValido = new Set([
@@ -842,6 +933,10 @@ export async function resumenSupervision(req, res) {
       const usuarioControlado = usuariosControlados.has(normalizeUsername(usuario));
       const conPago = tienePagoValido(acuerdo);
       const montoPagado = conPago ? Number(acuerdo.montoPagosValidos || acuerdo.montoPagosPosteriores || 0) : 0;
+      // Para cumplimiento contra la proyección usamos solo el importe aplicado
+      // al PRIMER PAGO. El total de pagos válidos puede incluir cuotas posteriores
+      // y no debe inflar el porcentaje de cumplimiento del primer vencimiento.
+      const montoPrimerPagoCobrado = conPago ? Number(acuerdo.montoPrimerPagoCobrado || 0) : 0;
       const tipo = acuerdo.tipoAcuerdo || "Sin clasificar";
 
       if (usuarioControlado) {
@@ -850,6 +945,9 @@ export async function resumenSupervision(req, res) {
           total: 0,
           montoTotal: 0,
           primerPagoTotal: 0,
+          primerPagoCobradoTotal: 0,
+          primerosPagosCubiertos: 0,
+          reacuerdosEfectivos: 0,
           conPago: 0,
           montoPagado: 0,
           sinPago: 0,
@@ -867,6 +965,9 @@ export async function resumenSupervision(req, res) {
         actual.total += 1;
         actual.montoTotal += Number(acuerdo.montoTotalAcuerdo || 0);
         actual.primerPagoTotal += Number(acuerdo.primerPago || 0);
+        actual.primerPagoCobradoTotal += Number(acuerdo.montoPrimerPagoCobrado || 0);
+        if (acuerdo.primerPagoCubierto) actual.primerosPagosCubiertos += 1;
+        if (acuerdo.esReacuerdoEfectivo) actual.reacuerdosEfectivos += 1;
         if (conPago) {
           actual.conPago += 1;
           actual.montoPagado += montoPagado;
@@ -886,7 +987,7 @@ export async function resumenSupervision(req, res) {
           actual.primerPagoExigibleTotal += Number(acuerdo.primerPago || 0);
           if (conPago) {
             actual.exigiblesConPago += 1;
-            actual.montoPagadoExigibles += montoPagado;
+            actual.montoPagadoExigibles += montoPrimerPagoCobrado;
           }
         }
         acuerdosPorOperadorMap.set(usuario, actual);
@@ -911,28 +1012,94 @@ export async function resumenSupervision(req, res) {
         primerPagoExigibleTotal += Number(acuerdo.primerPago || 0);
         if (conPago) {
           acuerdosExigiblesConPago += 1;
-          montoPagadoExigibles += montoPagado;
+          montoPagadoExigibles += montoPrimerPagoCobrado;
+        }
+      }
+    }
+
+    const recaudacionPorUsername = new Map(
+      operadores.map((item) => [normalizeUsername(item.username), Number(item.total || 0)])
+    );
+
+    // Separación de la recaudación real del mes:
+    // 1) pagos vinculados a acuerdos generados en el período seleccionado;
+    // 2) resto de la recaudación (cuotas / pagos de acuerdos anteriores).
+    // El dinero se atribuye al operador informado en Pagos, mientras que la
+    // productividad del acuerdo permanece en quien generó el acuerdo.
+    const recaudadoAcuerdosPeriodoPorOperador = new Map();
+    const pagosVinculadosPeriodoIds = new Set();
+    let recaudadoAcuerdosPeriodoEquipo = 0;
+    for (const acuerdo of acuerdosConPagos) {
+      for (const pago of acuerdo.pagosValidos || []) {
+        const paymentId = String(
+          pago?.clavePago ||
+          pago?.idPago ||
+          `${pago?.fecha || ""}|${pago?.monto || 0}|${pago?.subCesionId || ""}|${pago?.operadorUsername || ""}`
+        );
+        if (pagosVinculadosPeriodoIds.has(paymentId)) continue;
+        const owner = normalizeUsername(pago?.operadorUsername || "");
+        // Para el TOTAL EQUIPO conservamos el mismo universo que la recaudación
+        // mensual global. Para el detalle por operador sí limitamos a usuarios de
+        // control, porque esa tabla no muestra perfiles administrativos/ocultos.
+        pagosVinculadosPeriodoIds.add(paymentId);
+        const monto = Number(pago?.monto || 0);
+        recaudadoAcuerdosPeriodoEquipo += monto;
+        if (owner && usuariosControlados.has(owner)) {
+          recaudadoAcuerdosPeriodoPorOperador.set(
+            owner,
+            Number(recaudadoAcuerdosPeriodoPorOperador.get(owner) || 0) + monto
+          );
         }
       }
     }
 
     const acuerdosPorOperador = [...acuerdosPorOperadorMap.values()]
-      .map(({ tiposMap, ...item }) => ({
-        ...item,
-        porcentajeCumplimiento: item.exigibles > 0
-          ? Math.round((item.exigiblesConPago / item.exigibles) * 1000) / 10
-          : null,
-        porcentajeCumplimientoMonto: item.primerPagoExigibleTotal > 0
-          ? Math.round((item.montoPagadoExigibles / item.primerPagoExigibleTotal) * 1000) / 10
-          : null,
-        tipos: [...tiposMap.entries()]
-          .map(([tipo, total]) => ({ tipo, total }))
-          .sort((a, b) => b.total - a.total || String(a.tipo).localeCompare(String(b.tipo), "es")),
-      }))
-      .sort((a, b) => b.total - a.total || b.montoTotal - a.montoTotal);
+      .map(({ tiposMap, ...item }) => {
+        const usernameKey = normalizeUsername(item.usuario);
+        const proyeccion = proyeccionPorOperadorMap.get(usernameKey) || {
+          cantidad: 0,
+          importe: 0,
+          primerPagoCobrado: 0,
+          primerosPagosCubiertos: 0,
+        };
+        const objetivo = Number(objetivosPorUsername.get(usernameKey) || 0);
+        const recaudadoMes = Number(recaudacionPorUsername.get(usernameKey) || 0);
+        const recaudadoAcuerdosPeriodo = Number(recaudadoAcuerdosPeriodoPorOperador.get(usernameKey) || 0);
+        const recaudadoCarteraAnterior = Math.max(0, recaudadoMes - recaudadoAcuerdosPeriodo);
+        return {
+          ...item,
+          proyeccionPrimerPagoMes: Number(proyeccion.importe || 0),
+          proyeccionCantidad: Number(proyeccion.cantidad || 0),
+          primerPagoCobradoMes: Number(proyeccion.primerPagoCobrado || 0),
+          primerosPagosCubiertosMes: Number(proyeccion.primerosPagosCubiertos || 0),
+          recaudadoAcuerdosPeriodo,
+          recaudadoCarteraAnterior,
+          objetivo,
+          recaudadoMes,
+          faltanteObjetivo: objetivo > 0 ? Math.max(0, objetivo - recaudadoMes) : null,
+          porcentajeObjetivo: objetivo > 0 ? Math.round((recaudadoMes / objetivo) * 1000) / 10 : null,
+          porcentajeProyeccionObjetivo: objetivo > 0 ? Math.round((Number(proyeccion.importe || 0) / objetivo) * 1000) / 10 : null,
+          porcentajeCumplimiento: item.exigibles > 0
+            ? Math.round((item.exigiblesConPago / item.exigibles) * 1000) / 10
+            : null,
+          porcentajeCumplimientoMonto: item.primerPagoExigibleTotal > 0
+            ? Math.round((item.montoPagadoExigibles / item.primerPagoExigibleTotal) * 1000) / 10
+            : null,
+          tipos: [...tiposMap.entries()]
+            .map(([tipo, total]) => ({ tipo, total }))
+            .sort((a, b) => b.total - a.total || String(a.tipo).localeCompare(String(b.tipo), "es")),
+        };
+      })
+      .sort((a, b) => b.total - a.total || b.proyeccionPrimerPagoMes - a.proyeccionPrimerPagoMes);
     const acuerdosPorTipo = [...acuerdosPorTipoMap.entries()]
       .map(([tipo, total]) => ({ tipo, total }))
       .sort((a, b) => b.total - a.total);
+
+    const primerPagoCobradoMesEquipo = [...proyeccionPorOperadorMap.values()]
+      .reduce((sum, item) => sum + Number(item.primerPagoCobrado || 0), 0);
+    const primerosPagosCubiertosMesEquipo = [...proyeccionPorOperadorMap.values()]
+      .reduce((sum, item) => sum + Number(item.primerosPagosCubiertos || 0), 0);
+    const recaudadoCarteraAnteriorEquipo = Math.max(0, Number(totalActual || 0) - recaudadoAcuerdosPeriodoEquipo);
 
     const horasParaRevisar = operadores
       .filter((o) => !o.horarioLibre && o.minutosEsperados > 0 && o.deficitMinutos >= 60 && o.porcentajeHoras < 90)
@@ -1021,6 +1188,17 @@ export async function resumenSupervision(req, res) {
       });
     const conGestionesHoy = actividadHoy.size;
 
+    const duracionMs = Date.now() - iniciadoEnMs;
+    if (duracionMs > 3000) {
+      console.warn(`[Supervisión] resumen ${hoyClave} preparado en ${duracionMs} ms`, {
+        gestionesActividad: gestionesActividadPeriodo?.length || 0,
+        acuerdosMango: gestionesAcuerdoProyeccion?.length || 0,
+        pagosTresMeses: pagosTres?.length || 0,
+        fuentesConError: erroresFuentes.map((item) => item.fuente),
+      });
+    }
+    res.set("Server-Timing", `supervision;dur=${duracionMs}`);
+
     return res.json({
       mesActual: mesSeleccionado,
       mesSeleccionado,
@@ -1047,8 +1225,8 @@ export async function resumenSupervision(req, res) {
         porCartera,
       },
       hoy: {
-        pagosCantidad: Number(pagosHoyAgg?.[0]?.cantidad || 0),
-        pagosTotal: Number(pagosHoyAgg?.[0]?.total || 0),
+        pagosCantidad: pagosDiaSeleccionado.length,
+        pagosTotal: pagosDiaSeleccionadoTotal,
         presentesAhora: conGestionesHoy,
         conGestionesHoy,
         fichadosAhora,
@@ -1074,9 +1252,26 @@ export async function resumenSupervision(req, res) {
         historialRRHH,
       },
       acuerdos: {
+        disponible: !erroresFuentes.some((item) => item.fuente === "Acuerdos Mango"),
         total: acuerdosValidos.length,
+        // Valor contractual completo de los acuerdos generados en el período.
+        // Se conserva como referencia, pero NO se usa como proyección mensual.
         montoTotal: montoTotalAcuerdos,
         primerPagoTotal,
+        proyeccionPrimerPagoMes,
+        proyeccionCantidad: acuerdosProyectablesMes.filter((acuerdo) => usuariosControlados.has(normalizeUsername(acuerdo.usuario))).length,
+        primerPagoCobradoMes: primerPagoCobradoMesEquipo,
+        primerosPagosCubiertosMes: primerosPagosCubiertosMesEquipo,
+        recaudadoAcuerdosPeriodo: recaudadoAcuerdosPeriodoEquipo,
+        recaudadoCarteraAnterior: recaudadoCarteraAnteriorEquipo,
+        reacuerdosEfectivos: acuerdosValidos.filter((acuerdo) => acuerdo.esReacuerdoEfectivo).length,
+        acuerdosCrudos: episodiosPeriodo.meta.acuerdosCrudos,
+        acuerdosReemplazadosSinPago: episodiosPeriodo.meta.acuerdosReemplazadosSinPago,
+        casosConMasDeUnEpisodio: episodiosPeriodo.meta.casosConMasDeUnEpisodio,
+        objetivoEquipo: montoObjetivoEquipo,
+        porcentajeProyeccionObjetivoEquipo: montoObjetivoEquipo > 0
+          ? Math.round((proyeccionPrimerPagoMes / montoObjetivoEquipo) * 1000) / 10
+          : null,
         conPago: acuerdosConPago,
         sinPago: Math.max(0, acuerdosValidos.length - acuerdosConPago),
         montoPagado: montoPagadoAcuerdos,
@@ -1103,6 +1298,10 @@ export async function resumenSupervision(req, res) {
           disponible: crucePagosDisponible,
           pagosConsultados: pagosCruceCantidad,
           periodoHasta: crucePagosHasta,
+          acuerdosCrudos: episodiosPeriodo.meta.acuerdosCrudos,
+          acuerdosEfectivos: episodiosPeriodo.meta.acuerdosEfectivos,
+          reemplazadosSinPago: episodiosPeriodo.meta.acuerdosReemplazadosSinPago,
+          casosConMasDeUnEpisodio: episodiosPeriodo.meta.casosConMasDeUnEpisodio,
         },
         fuente: "reporte-gestiones",
       },
@@ -1133,9 +1332,121 @@ export async function resumenSupervision(req, res) {
         } : null,
       },
       objetivos,
+      meta: {
+        duracionMs: Date.now() - iniciadoEnMs,
+        degradado: erroresFuentes.length > 0,
+        erroresFuentes,
+      },
     });
   } catch (error) {
     console.error("Panel supervisión:", error);
-    return res.status(500).json({ error: "No se pudo preparar el panel de supervisión" });
+    const payload = { error: "No se pudo preparar el panel de supervisión" };
+    if (process.env.NODE_ENV !== "production") payload.detalle = String(error?.message || error || "Error desconocido");
+    return res.status(500).json(payload);
+  }
+}
+
+
+/**
+ * Resumen liviano de Contactados para el Panel de Supervisión.
+ * No dispara sincronizaciones ni reconstrucciones: usa el material ya generado
+ * por el módulo Contactados. Así la apertura de Supervisión no compite con el
+ * endpoint completo /contactados/estadisticas.
+ */
+export async function resumenContactadosSupervision(req, res) {
+  const iniciadoEnMs = Date.now();
+  try {
+    const mes = mesValido(req.query?.mes) || mesClaveArgentina();
+    const empleados = await Empleado.find({ isActive: { $ne: false } })
+      .select("username nombre role")
+      .lean()
+      .maxTimeMS(SUPERVISION_QUERY_MS);
+    const usuarios = [...usernamesControlados(empleados)];
+    const now = new Date();
+
+    const rows = await ContactadoVentana.find({
+      mesOrigen: mes,
+      operador: { $in: usuarios },
+      estado: { $in: ["abierta", "cumplida", "vencida"] },
+    })
+      .select("operador estado alertaAt criticoAt venceAt clickRealizadoAt esOrigenContactado calificacionResolucion")
+      .lean()
+      .maxTimeMS(SUPERVISION_QUERY_MS);
+
+    const cerradas = rows.filter((row) => ["cumplida", "vencida"].includes(row.estado));
+    const cumplidas = cerradas.filter((row) => row.estado === "cumplida");
+    const vencidas = cerradas.filter((row) => row.estado === "vencida");
+    const abiertas = rows.filter((row) => row.estado === "abierta" && new Date(row.venceAt) > now);
+    const pendientes = abiertas.filter((row) => new Date(row.alertaAt) <= now);
+
+    let vigente = 0;
+    let porVencer = 0;
+    let critico = 0;
+    for (const row of abiertas) {
+      if (now < new Date(row.alertaAt)) vigente += 1;
+      else if (now < new Date(row.criticoAt)) porVencer += 1;
+      else critico += 1;
+    }
+
+    const porOperador = new Map();
+    for (const row of [...cerradas, ...pendientes]) {
+      const operador = String(row.operador || "sin-operador");
+      const item = porOperador.get(operador) || {
+        operador,
+        cumplidos: 0,
+        vencidos: 0,
+        pendientes: 0,
+        totalCerrados: 0,
+        cumplimientoPct: 0,
+      };
+      if (row.estado === "cumplida") {
+        item.cumplidos += 1;
+        item.totalCerrados += 1;
+      } else if (row.estado === "vencida") {
+        item.vencidos += 1;
+        item.totalCerrados += 1;
+      } else {
+        item.pendientes += 1;
+      }
+      porOperador.set(operador, item);
+    }
+
+    const rendimiento = [...porOperador.values()]
+      .map((item) => ({
+        ...item,
+        cumplimientoPct: item.totalCerrados
+          ? Math.round((item.cumplidos * 1000) / item.totalCerrados) / 10
+          : 0,
+      }))
+      .sort((a, b) => b.cumplimientoPct - a.cumplimientoPct || b.totalCerrados - a.totalCerrados);
+
+    const cumplimientoPct = cerradas.length
+      ? Math.round((cumplidas.length * 1000) / cerradas.length) / 10
+      : 0;
+
+    const payload = {
+      ok: true,
+      mes,
+      canViewAll: true,
+      resumen: {
+        contactadosGenerados: rows.filter((row) => row.esOrigenContactado).length,
+        cumplidos: cumplidas.length,
+        vencidos: vencidas.length,
+        pendientes: pendientes.length,
+        cumplimientoPct,
+        vigente,
+        porVencer,
+        critico,
+      },
+      rendimiento,
+      meta: { duracionMs: Date.now() - iniciadoEnMs, fuente: "contactados-materializados" },
+    };
+    res.set("Server-Timing", `supervision-contactados;dur=${payload.meta.duracionMs}`);
+    return res.json(payload);
+  } catch (error) {
+    console.error("Contactados liviano de Supervisión:", error);
+    const payload = { error: "No se pudo preparar el resumen liviano de Contactados" };
+    if (process.env.NODE_ENV !== "production") payload.detalle = String(error?.message || error || "Error desconocido");
+    return res.status(500).json(payload);
   }
 }

@@ -122,8 +122,15 @@ ReporteGestionSchema.index({ propietario: 1, dni: 1, entidadNumero: 1, fecha: -1
 ReporteGestionSchema.index({ propietario: 1, tipoContacto: 1, fecha: -1 });
 ReporteGestionSchema.index({ propietario: 1, estadoCuenta: 1, fecha: -1 });
 ReporteGestionSchema.index({ propietario: 1, resultadoGestion: 1, fecha: -1 });
+// Supervisión consulta el universo visible del estudio por fecha (sin filtrar
+// propietario) para actividad y acuerdos. Estos índices evitan escanear toda
+// la colección, especialmente en la ventana histórica usada para proyección.
+ReporteGestionSchema.index({ fecha: -1, usuario: 1 }, { name: "idx_supervision_fecha_usuario" });
+ReporteGestionSchema.index({ fecha: -1, resultadoGestion: 1 }, { name: "idx_supervision_fecha_resultado" });
+ReporteGestionSchema.index({ resultadoGestion: 1, fecha: -1, usuario: 1 }, { name: "idx_supervision_resultado_fecha_usuario" });
 
 // Contactados sincroniza incrementalmente por createdAt y luego acota por fecha.
+// Este índice evita escanear toda reportegestions en cada refresco de alertas.
 ReporteGestionSchema.index(
   { createdAt: 1, fecha: 1 },
   { name: "idx_createdAt_fecha_contactados" }

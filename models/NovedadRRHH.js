@@ -16,6 +16,7 @@ const NovedadRRHHSchema = new mongoose.Schema(
         "llegada-tarde",
         "cambio-horario",
         "licencia-medica",
+        "vacaciones",
         "dia-estudio",
         "permiso",
         "apercibimiento",
@@ -41,6 +42,19 @@ const NovedadRRHHSchema = new mongoose.Schema(
     },
     fechaDesde: { type: Date, required: true, index: true },
     fechaHasta: { type: Date, default: null },
+    // Vacío = aplica a todos los días del rango. Si tiene valores, aplica solo
+    // a esos días de la semana (0 domingo ... 6 sábado). Permite, por ejemplo,
+    // "todos los martes desde ahora" sin duplicar novedades.
+    diasSemanaAplicables: {
+      type: [Number],
+      default: [],
+      validate: {
+        validator(values) {
+          return Array.isArray(values) && values.every((dia) => Number.isInteger(dia) && dia >= 0 && dia <= 6);
+        },
+        message: "Los días semanales deben estar entre 0 y 6",
+      },
+    },
     horarioAnterior: { type: String, default: "", trim: true },
     horarioNuevo: { type: String, default: "", trim: true },
     horaEntradaNueva: {

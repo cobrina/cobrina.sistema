@@ -85,6 +85,11 @@ function normalizarPayload(body = {}, { parcial = false } = {}) {
     payload.tipo = TIPOS.has(tipo) ? tipo : "tarea";
   }
 
+  if (body.avisarMinutosAntes !== undefined) {
+    const minutos = Math.max(0, Math.min(1440, Math.round(Number(body.avisarMinutosAntes) || 0)));
+    payload.avisarMinutosAntes = minutos;
+  }
+
   if (body.completada !== undefined) payload.completada = Boolean(body.completada);
 
   return payload;

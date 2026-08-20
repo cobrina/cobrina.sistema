@@ -52,13 +52,14 @@ function minutoActualArgentina(fecha = new Date()) {
 }
 
 function novedadLaboralDelDia(novedades = [], fechaClave = "") {
-  return ["licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"]
+  return ["licencia-medica", "vacaciones", "falta", "falta-justificada", "dia-estudio", "permiso"]
     .map((tipo) => (novedades || []).find((novedad) => novedad.tipo === tipo && novedadCubreFecha(novedad, fechaClave)))
     .find(Boolean) || null;
 }
 
 function etiquetaNovedad(novedad) {
   if (novedad?.tipo === "licencia-medica") return "Licencia médica";
+  if (novedad?.tipo === "vacaciones") return "Vacaciones";
   if (novedad?.tipo === "falta-justificada") return "Falta justificada";
   if (novedad?.tipo === "falta") return "Falta sin justificar";
   if (novedad?.tipo === "dia-estudio") return "Día de estudio";
@@ -220,7 +221,7 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
     const novedadesEmpleado = novedadesByEmployee.get(String(employee?._id || "")) || [];
     const horarioEfectivo = horarioEfectivoParaFecha(employee, item.day, novedadesEmpleado);
     const novedadDia = novedadLaboralDelDia(novedadesEmpleado, item.day);
-    const ausenciaJustificada = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
+    const ausenciaJustificada = ["licencia-medica", "vacaciones", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
 
     const rawIntervals = [];
     const blocks = [];
@@ -442,7 +443,7 @@ function summarizeDaily(rows, employee, desde, hasta, novedades = []) {
     : clavesRango.map((day) => {
         const horario = horarioEfectivoParaFecha(employee, day, novedades);
         const novedadDia = novedadLaboralDelDia(novedades, day);
-        const ausenciaJustificada = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
+        const ausenciaJustificada = ["licencia-medica", "vacaciones", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
         return { day, minutos: ausenciaJustificada ? 0 : Number(horario.minutosEsperados || 0) };
       });
   const expectedDays = esperadoPorDia.filter((item) => item.minutos > 0).length;
@@ -763,7 +764,7 @@ export async function seguimientoOperadores(req, res) {
       employeeIds.length
         ? NovedadRRHH.find({
             empleadoId: { $in: employeeIds },
-            tipo: { $in: ["cambio-horario", "licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"] },
+            tipo: { $in: ["cambio-horario", "licencia-medica", "vacaciones", "falta", "falta-justificada", "dia-estudio", "permiso"] },
             estado: { $ne: "anulado" },
             fechaDesde: { $lte: hasta },
             $or: [{ fechaHasta: null }, { fechaHasta: { $gte: desde } }],
@@ -827,7 +828,7 @@ export async function seguimientoOperadores(req, res) {
         const fecha = desde.toISOString().slice(0, 10);
         const horario = horarioEfectivoParaFecha(employee, fecha, novedadesEmpleado);
         const novedadDia = novedadLaboralDelDia(novedadesEmpleado, fecha);
-        const ausenciaJustificada = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
+        const ausenciaJustificada = ["licencia-medica", "vacaciones", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
         const esperado = ausenciaJustificada ? 0 : Number(horario.minutosEsperados || 0);
         const todayKey = evaluationContext.todayKey || fechaClaveArgentina();
         const startMin = minutesOfDay(horario.entrada);
@@ -917,8 +918,8 @@ export async function seguimientoOperadores(req, res) {
       };
     });
     operadores.sort((a, b) => {
-      const aLicencia = Boolean(a?.dias?.[0]?.novedadDia?.tipo === "licencia-medica" || a?.dias?.[0]?.licenciaMedica);
-      const bLicencia = Boolean(b?.dias?.[0]?.novedadDia?.tipo === "licencia-medica" || b?.dias?.[0]?.licenciaMedica);
+      const aLicencia = Boolean(["licencia-medica", "vacaciones"].includes(a?.dias?.[0]?.novedadDia?.tipo) || a?.dias?.[0]?.licenciaMedica);
+      const bLicencia = Boolean(["licencia-medica", "vacaciones"].includes(b?.dias?.[0]?.novedadDia?.tipo) || b?.dias?.[0]?.licenciaMedica);
       if (aLicencia !== bLicencia) return aLicencia ? 1 : -1;
       return b.resumen.horasTrabajadasMin - a.resumen.horasTrabajadasMin;
     });

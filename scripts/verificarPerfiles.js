@@ -20,6 +20,7 @@ const M = {
   recibos: "recibos",
   proy: "proyecciones",
   colchon: "colchon",
+  contactados: "contactados",
   notas: "notas",
   agenda: "agenda",
   presentismo: "presentismo",
@@ -34,12 +35,12 @@ const M = {
 };
 
 const expectedModules = {
-  [ROLES.OPERADOR]: [M.proy, M.colchon, M.notas, M.agenda],
-  [ROLES.OPERADOR_VIP]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.poderesBia],
-  [ROLES.CUOTERO]: [M.cert, M.recibos, M.colchon, M.notas, M.agenda, M.pagos, M.contrasenas, M.poderesBia],
-  [ROLES.CAPACITADORA]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.presentismo, M.reportes, M.contrasenas, M.rrhh, M.poderesBia],
-  [ROLES.ADMINISTRACION]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.presentismo, M.reportes, M.admin, M.pagos, M.contrasenas, M.usuarios, M.rrhh, M.poderesBia],
-  [ROLES.SUPERVISOR]: [M.cert, M.recibos, M.proy, M.colchon, M.notas, M.agenda, M.presentismo, M.reportes, M.admin, M.pagos, M.contrasenas, M.usuarios, M.rrhh, M.supervision, M.poderesBia],
+  [ROLES.OPERADOR]: [M.proy, M.colchon, M.contactados, M.notas, M.agenda],
+  [ROLES.OPERADOR_VIP]: [M.cert, M.recibos, M.proy, M.colchon, M.contactados, M.notas, M.agenda, M.poderesBia],
+  [ROLES.CUOTERO]: [M.cert, M.recibos, M.colchon, M.contactados, M.notas, M.agenda, M.pagos, M.contrasenas, M.poderesBia],
+  [ROLES.CAPACITADORA]: [M.cert, M.recibos, M.proy, M.colchon, M.contactados, M.notas, M.agenda, M.presentismo, M.reportes, M.contrasenas, M.rrhh, M.poderesBia],
+  [ROLES.ADMINISTRACION]: [M.cert, M.recibos, M.proy, M.colchon, M.contactados, M.notas, M.agenda, M.presentismo, M.reportes, M.admin, M.pagos, M.contrasenas, M.usuarios, M.rrhh, M.poderesBia],
+  [ROLES.SUPERVISOR]: [M.cert, M.recibos, M.proy, M.colchon, M.contactados, M.notas, M.agenda, M.presentismo, M.reportes, M.admin, M.pagos, M.contrasenas, M.usuarios, M.rrhh, M.supervision, M.poderesBia],
   [ROLES.SUPER_ADMIN]: Object.values(M),
 };
 

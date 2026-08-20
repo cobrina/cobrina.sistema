@@ -16,7 +16,7 @@ import { PAGOS_FUENTE_UNICA_ACTIVA } from "../config/features.js";
 import ReporteGestion from "../models/ReporteGestion.js";
 import Pago from "../models/Pago.js";
 import PagoInformadoMango from "../models/PagoInformadoMango.js";
-import { transformarGestionEnAcuerdo, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
+import { transformarGestionEnAcuerdo, resolverEpisodiosAcuerdos, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
 import {
   claveFechaCalendario,
   fechaClaveArgentina,
@@ -189,7 +189,7 @@ const acuerdoPerteneceAOperador = (acuerdo = {}, variantes = null) => {
   if (variantes === null) return true;
   if (!variantes.length) return false;
   const propietario = String(
-    acuerdo.operadorPago || acuerdo.operador || acuerdo.operadorGestion || acuerdo.usuario || ""
+    acuerdo.operador || acuerdo.usuario || acuerdo.operadorGestion || acuerdo.operadorPago || ""
   ).trim().toLowerCase();
   const propietarioComoNombre = propietario.replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim();
   return variantes.includes(propietario) || variantes.includes(propietarioComoNombre);
@@ -1249,9 +1249,9 @@ export const obtenerProyeccionesFiltradas = async (req, res) => {
             : null,
         },
         empleadoUsernameOriginal: p?.empleadoId?.username || "-",
-        empleadoUsername:
-          p?.pagosRealesResumen?.operadorPago || p?.empleadoId?.username || "-",
-        propietarioSegunPago: Boolean(p?.pagosRealesResumen?.operadorPago),
+        empleadoUsername: p?.empleadoId?.username || "-",
+        operadorPagoUsername: p?.pagosRealesResumen?.operadorPago || "",
+        propietarioSegunPago: false,
         entidadNombre: p?.entidadId?.nombre || "-",
         entidadNumero,
         subCesionNombre: p?.subCesionId?.nombre || "-",
@@ -1699,7 +1699,9 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
     );
 
     const variantesObjetivo = await variantesOperadorObjetivo(req, usuarioId);
-    const acuerdosMangoVinculados = (await vincularAcuerdosMangoConPagos(acuerdosMango))
+    const acuerdosMangoVinculadosTodos = await vincularAcuerdosMangoConPagos(acuerdosMango);
+    const acuerdosMangoEpisodios = resolverEpisodiosAcuerdos(acuerdosMangoVinculadosTodos).rows;
+    const acuerdosMangoVinculados = acuerdosMangoEpisodios
       .filter((acuerdo) => acuerdoPerteneceAOperador(acuerdo, variantesObjetivo));
 
     const clavesMango = new Set();
@@ -1745,9 +1747,11 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
           estado: estadoReal,
           empleadoId: {
             ...(proyeccion.empleadoId || {}),
+            // La proyección pertenece a quien la generó. El operador que luego
+            // imputó un pago no cambia la autoría/productividad de la promesa.
             username:
-              proyeccion?.pagosRealesResumen?.operadorPago ||
               proyeccion?.empleadoId?.username ||
+              proyeccion?.pagosRealesResumen?.operadorPago ||
               "Sin usuario",
           },
           pagosEstadistica: proyeccion?.pagosRealesResumen?.pagosValidos || [],
@@ -1783,7 +1787,7 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
           concepto: acuerdo.tipoAcuerdo || acuerdo.resultado || "Acuerdo",
           fechaPromesa: fechaVencimiento,
           creado: fechaAcuerdo,
-          empleadoId: { username: acuerdo.operadorPago || acuerdo.operador || acuerdo.operadorGestion || "Sin usuario" },
+          empleadoId: { username: acuerdo.operador || acuerdo.usuario || acuerdo.operadorGestion || acuerdo.operadorPago || "Sin usuario" },
           entidadId: {
             nombre:
               nombrePorNumero.get(Number(acuerdo.entidadNumero || 0)) ||
@@ -3879,15 +3883,13 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
 
   const query = condiciones.length === 1 ? condiciones[0] : { $and: condiciones };
   const subCesionId = String(req.query?.subCesionId || "").trim();
-  const puedePaginarEnMongo = Boolean(
-    paginar &&
-      esAmbitoGlobal(req) &&
-      !usuarioId &&
-      !subCesionId &&
-      !estadoFiltro
-  );
-  const skip = Math.max(0, (Math.max(1, Number(page) || 1) - 1) * Math.max(1, Number(limit) || 20));
 
+  // IMPORTANTE: la paginación se aplica DESPUÉS de resolver episodios efectivos.
+  // Paginar las gestiones crudas en Mongo podía separar dos acuerdos del mismo
+  // DNI/entidad en páginas distintas y hacer que una renegociación sin pago se
+  // contara como acuerdo adicional. La cantidad de gestiones con acuerdo es muy
+  // inferior al total de gestiones, por lo que resolver el conjunto filtrado y
+  // recién luego paginar mantiene exactitud sin cargar el universo completo.
   const consultaGestiones = ReporteGestion.find(query)
     .sort({ fecha: -1, hora: -1, _id: -1 })
     .select(
@@ -3896,14 +3898,9 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
     .lean()
     .maxTimeMS(30000);
 
-  if (puedePaginarEnMongo) consultaGestiones.skip(skip).limit(limit);
-
-  const [mapas, gestiones, totalCrudo] = await Promise.all([
+  const [mapas, gestiones] = await Promise.all([
     construirMapasEntidades(),
     consultaGestiones,
-    puedePaginarEnMongo
-      ? ReporteGestion.countDocuments(query).maxTimeMS(30000)
-      : Promise.resolve(null),
   ]);
 
   let acuerdos = gestiones
@@ -3913,13 +3910,13 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
   if (!acuerdos.length) {
     return {
       acuerdos: [],
-      total: puedePaginarEnMongo ? Number(totalCrudo || 0) : 0,
-      paginadoEnMongo: puedePaginarEnMongo,
+      total: 0,
+      paginadoEnMongo: false,
       filtrosNoCompatibles: [],
     };
   }
 
-  acuerdos = await vincularAcuerdosMangoConPagos(acuerdos);
+  acuerdos = resolverEpisodiosAcuerdos(await vincularAcuerdosMangoConPagos(acuerdos)).rows;
 
   const variantesObjetivo = await variantesOperadorObjetivo(req, usuarioId);
   acuerdos = acuerdos.filter((acuerdo) => acuerdoPerteneceAOperador(acuerdo, variantesObjetivo));
@@ -3941,8 +3938,8 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
 
   return {
     acuerdos,
-    total: puedePaginarEnMongo ? Number(totalCrudo || 0) : acuerdos.length,
-    paginadoEnMongo: puedePaginarEnMongo,
+    total: acuerdos.length,
+    paginadoEnMongo: false,
     filtrosNoCompatibles: [],
   };
 };

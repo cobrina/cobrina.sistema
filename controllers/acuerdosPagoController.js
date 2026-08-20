@@ -7,6 +7,7 @@ import { parseRowToAcuerdoPago } from "../utils/acuerdosPagoParser.js";
 import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
 import { fechaClaveArgentina } from "../utils/fecha.util.js";
+import { esUsuarioVisibleEnReportesControl, USUARIOS_OCULTOS_REPORTES_CONTROL } from "../utils/controlEquipo.js";
 
 /** Helpers token (igual estilo Reportes Gestiones) */
 function getUsuarioId(req) {
@@ -31,6 +32,13 @@ function ensureNoOperador(req, res) {
     return false;
   }
   return true;
+}
+
+function queryUsuariosVisiblesControl(query = {}, campo = "operador") {
+  const ocultos = [...USUARIOS_OCULTOS_REPORTES_CONTROL].map((username) => ({
+    [campo]: new RegExp(`^${String(username).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
+  }));
+  return ocultos.length ? { $and: [query, { $nor: ocultos }] } : query;
 }
 
 /** Scope:
@@ -271,7 +279,9 @@ export async function preview(req, res) {
 
     for (const a of finalDocs) {
       byTipo[a.tipoAcuerdo] = (byTipo[a.tipoAcuerdo] || 0) + 1;
-      byOperador[a.operador] = (byOperador[a.operador] || 0) + 1;
+      if (esUsuarioVisibleEnReportesControl(a.operador)) {
+        byOperador[a.operador] = (byOperador[a.operador] || 0) + 1;
+      }
       byMes[a.mes] = (byMes[a.mes] || 0) + 1;
     }
 
@@ -300,7 +310,7 @@ export async function preview(req, res) {
       porOperador: byOperador,
       invalidas: invalidas.slice(0, 50),
       warningsCount: conWarnings,
-      muestra: finalDocs.slice(0, 60),
+      muestra: finalDocs.filter((row) => esUsuarioVisibleEnReportesControl(row?.operador)).slice(0, 60),
     });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
@@ -514,7 +524,7 @@ export async function listar(req, res) {
     const { page = 1, limit = 200, sortKey, sortDir, fields = "min" } =
       req.query || {};
 
-    const q = buildQueryFromReq(req);
+    const q = queryUsuariosVisiblesControl(buildQueryFromReq(req));
 
     const pageNum = Math.max(1, Number(page) || 1);
     const limitNum = Math.min(1000, Math.max(1, Number(limit) || 200));
@@ -720,7 +730,7 @@ export async function catalogos(req, res) {
     const operadores = ordenar([
       ...empleados.map((x) => x.toLowerCase()),
       ...opsData.map((x) => String(x || "")),
-    ]);
+    ]).filter(esUsuarioVisibleEnReportesControl);
 
     return res.json({
       ok: true,
@@ -745,7 +755,7 @@ export async function exportarXlsx(req, res) {
       return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
-    const q = buildQueryFromReq(req);
+    const q = queryUsuariosVisiblesControl(buildQueryFromReq(req));
 
     const items = await AcuerdoPago.find(q)
       .sort({ fecha: -1, hora: -1 })
@@ -959,7 +969,7 @@ export async function analyticsResumen(req, res) {
       porTipo,
       porEntidad, // ✅ NUEVO
       porEstadoCuenta: porEstado,
-      topOperadores,
+      topOperadores: topOperadores.filter((row) => esUsuarioVisibleEnReportesControl(row?._id)),
     });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
@@ -1014,7 +1024,7 @@ export async function resumenOperador(req, res) {
       { $sort: { acuerdosTotales: -1 } },
     ]);
 
-    return res.json({ ok: true, rows });
+    return res.json({ ok: true, rows: rows.filter((row) => esUsuarioVisibleEnReportesControl(row?._id)) });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });
@@ -1057,12 +1067,13 @@ export async function acuerdosPorDia(req, res) {
       const acuerdos = Number(r?.acuerdos || 0);
       if (!operador || dia <= 0) continue;
 
+      totalsByDay[String(dia)] = (totalsByDay[String(dia)] || 0) + acuerdos;
+      if (!esUsuarioVisibleEnReportesControl(operador)) continue;
+
       if (!map.has(operador)) map.set(operador, { operador, total: 0, dias: {} });
       const it = map.get(operador);
       it.total += acuerdos;
       it.dias[String(dia)] = (it.dias[String(dia)] || 0) + acuerdos;
-
-      totalsByDay[String(dia)] = (totalsByDay[String(dia)] || 0) + acuerdos;
     }
 
     // opcional: incluir todos los operadores activos para que aparezcan con “-”
@@ -1071,7 +1082,7 @@ export async function acuerdosPorDia(req, res) {
       .lean()).map((e) => String(e.username || "").trim().toLowerCase());
 
     for (const op of empleados) {
-      if (!op) continue;
+      if (!op || !esUsuarioVisibleEnReportesControl(op)) continue;
       if (!map.has(op)) map.set(op, { operador: op, total: 0, dias: {} });
     }
 
@@ -1082,7 +1093,7 @@ export async function acuerdosPorDia(req, res) {
     return res.json({
       ok: true,
       mes,
-      rows,         // ✅ compat
+      rows: rows.filter((row) => esUsuarioVisibleEnReportesControl(row?._id?.operador)), // ✅ compat, sin usuarios ocultos
       daysInMonth: range.daysInMonth,
       totalsByDay,  // ✅ para la fila de totales (arriba del heatmap)
       users,        // ✅ para armar la grilla usuarios × días

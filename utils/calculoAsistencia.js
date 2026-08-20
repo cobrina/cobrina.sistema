@@ -292,15 +292,22 @@ export function clavesEntre(desdeClave, hastaClave) {
 export function novedadCubreFecha(novedad, fechaClave) {
   if (!novedad || novedad.estado === "anulado") return false;
   const desde = fechaClaveDesdeValor(novedad.fechaDesde);
-  const hasta = fechaClaveDesdeValor(novedad.fechaHasta) || desde;
-  return Boolean(desde && fechaClave >= desde && fechaClave <= hasta);
+  const hasta = fechaClaveDesdeValor(novedad.fechaHasta);
+  if (!desde || fechaClave < desde || (hasta && fechaClave > hasta)) return false;
+
+  const dias = Array.isArray(novedad.diasSemanaAplicables)
+    ? novedad.diasSemanaAplicables.map(Number).filter((dia) => Number.isInteger(dia) && dia >= 0 && dia <= 6)
+    : [];
+  if (!dias.length) return true;
+  const fecha = fechaClaveADateUTC(fechaClave);
+  return Boolean(fecha && dias.includes(fecha.getUTCDay()));
 }
 
 export function novedadSolapaRango(novedad, desdeClave, hastaClave) {
   if (!novedad || novedad.estado === "anulado") return false;
   const desde = fechaClaveDesdeValor(novedad.fechaDesde);
-  const hasta = fechaClaveDesdeValor(novedad.fechaHasta) || desde;
-  return Boolean(desde && desdeClave && hastaClave && desde <= hastaClave && hasta >= desdeClave);
+  const hasta = fechaClaveDesdeValor(novedad.fechaHasta);
+  return Boolean(desde && desdeClave && hastaClave && desde <= hastaClave && (!hasta || hasta >= desdeClave));
 }
 
 function ultimaNovedad(novedades, tipo, fechaClave) {
@@ -322,7 +329,8 @@ export function horarioEfectivoParaFecha(empleado, fechaClave, novedades = []) {
   const date = fechaClaveADateUTC(fechaClave);
   const weekday = date?.getUTCDay();
   const modalidad = String(base.modalidad || "fijo").trim().toLowerCase() === "libre" ? "libre" : "fijo";
-  const licencia = ultimaNovedad(novedades, "licencia-medica", fechaClave);
+  const licencia = ultimaNovedad(novedades, "licencia-medica", fechaClave)
+    || ultimaNovedad(novedades, "vacaciones", fechaClave);
   if (licencia) {
     return {
       programado: false,
@@ -336,7 +344,7 @@ export function horarioEfectivoParaFecha(empleado, fechaClave, novedades = []) {
       toleranciaMinutos: 0,
       minutosEsperados: 0,
       novedad: licencia,
-      etiqueta: "Licencia médica",
+      etiqueta: licencia?.tipo === "vacaciones" ? "Vacaciones" : "Licencia médica",
     };
   }
 

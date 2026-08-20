@@ -425,7 +425,7 @@ export async function panel(req, res) {
       ids.length
         ? NovedadRRHH.find({
             empleadoId: { $in: ids },
-            tipo: { $in: ["cambio-horario", "licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"] },
+            tipo: { $in: ["cambio-horario", "licencia-medica", "vacaciones", "falta", "falta-justificada", "dia-estudio", "permiso"] },
             estado: { $ne: "anulado" },
             fechaDesde: { $lte: fechaConsultaHasta },
             $or: [{ fechaHasta: null }, { fechaHasta: { $gte: fechaConsulta } }],
@@ -442,7 +442,7 @@ export async function panel(req, res) {
 
     const porEmpleado = new Map(asistencias.map((item) => [String(item.empleado), item]));
     const actividadPorUsuario = actividadDeUsuarioEnFecha(gestiones, fechaClave);
-    const prioridadNovedad = ["licencia-medica", "falta", "falta-justificada", "dia-estudio", "permiso"];
+    const prioridadNovedad = ["licencia-medica", "vacaciones", "falta", "falta-justificada", "dia-estudio", "permiso"];
 
     const items = empleados.map((empleado) => {
       const asistencia = porEmpleado.get(String(empleado._id));
@@ -460,7 +460,7 @@ export async function panel(req, res) {
       const minutosTrabajadosHoy = minutosActividadSegunHorario(primeraMin, ultimaMin, horarioEfectivo);
       const intervalosLaborales = intervalosLaboralesSinDescanso(actividad?.intervalos || [], horarioEfectivo)
         .map((intervalo) => ({ ...intervalo, origen: "cerrado" }));
-      const ausenciaJustificada = ["licencia-medica", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
+      const ausenciaJustificada = ["licencia-medica", "vacaciones", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
       const minutosProgramadosHoy = Number(horarioEfectivo.minutosEsperados || 0);
       const minutosExigiblesHoy = ausenciaJustificada ? 0 : minutosProgramadosHoy;
       const diferenciaHoyMin = minutosExigiblesHoy > 0 ? minutosTrabajadosHoy - minutosExigiblesHoy : null;
@@ -539,7 +539,7 @@ export async function panel(req, res) {
           ? {
               tipo: novedadDia.tipo,
               descripcion: novedadDia.descripcion || "",
-              justificado: Boolean(novedadDia.justificado || novedadDia.tipo === "falta-justificada" || novedadDia.tipo === "licencia-medica"),
+              justificado: Boolean(novedadDia.justificado || novedadDia.tipo === "falta-justificada" || ["licencia-medica", "vacaciones"].includes(novedadDia.tipo)),
             }
           : null,
         fichaje: {
@@ -551,6 +551,13 @@ export async function panel(req, res) {
           marcas,
         },
       };
+    });
+
+    items.sort((a, b) => {
+      const aLicencia = Boolean(["licencia-medica", "vacaciones"].includes(a?.novedadDia?.tipo) || a?.horarioEfectivo?.licenciaMedica);
+      const bLicencia = Boolean(["licencia-medica", "vacaciones"].includes(b?.novedadDia?.tipo) || b?.horarioEfectivo?.licenciaMedica);
+      if (aLicencia !== bLicencia) return aLicencia ? 1 : -1;
+      return String(a?.username || "").localeCompare(String(b?.username || ""), "es", { sensitivity: "base" });
     });
 
     return res.json({

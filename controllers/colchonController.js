@@ -700,6 +700,7 @@ export const filtrarCuotas = async (req, res) => {
       },
     ];
 
+
     const lookupStages = [
       {
         $lookup: {
@@ -1375,7 +1376,8 @@ export const exportarExcel = async (req, res) => {
     ].filter(Boolean);
 
     info.addRow(["Exportación del Colchón de Cuotas"]);
-    info.addRow(["Fecha", fechaVisible]);
+    info.addRow(["Fecha", new Date()]);
+    info.getCell("B2").numFmt = "dd/mm/yyyy";
     info.addRow(["Registros exportados", cuotas.length]);
     info.addRow(["Filtros", filtrosAplicados.length ? filtrosAplicados.join(" · ") : "Sin filtros"]);
     info.getColumn(1).width = 24;
@@ -1410,7 +1412,7 @@ export const exportarExcel = async (req, res) => {
           ? `${cuota.entidadId.numero ?? ""} - ${cuota.entidadId.nombre ?? ""}`.replace(/^ - | - $/g, "")
           : "—",
         subCesion: cuota.subCesionId?.nombre || "—",
-        dni: cuota.dni,
+        dni: Number(cuota.dni || 0) || null,
         nombre: cuota.nombre,
         operador: cuota.empleadoId?.username || "—",
         turno: abreviarTurno(cuota.turno),
@@ -1434,6 +1436,7 @@ export const exportarExcel = async (req, res) => {
     header.height = 24;
     worksheet.views = [{ state: "frozen", ySplit: 1 }];
     worksheet.autoFilter = { from: "A1", to: "Q1" };
+    worksheet.getColumn("D").numFmt = "0";
     ["J", "K", "L", "M", "N"].forEach((columna) => {
       worksheet.getColumn(columna).numFmt = '$#,##0.00;[Red]-$#,##0.00';
     });
@@ -2293,8 +2296,8 @@ export const exportarPagos = async (req, res) => {
     const pagosExportar = [];
 
     cuotas.forEach((cuota) => {
-      const dni = cuota.dni || "";
-      const entidad = cuota.entidadId?.numero || "—";
+      const dni = Number(cuota.dni || 0) || null;
+      const entidad = Number(cuota.entidadId?.numero || 0) || null;
       const subcesion = cuota.subCesionId?.nombre || "—"; // ⬅️ subcesión
 
       cuota.pagos.forEach((pago) => {
@@ -2302,8 +2305,8 @@ export const exportarPagos = async (req, res) => {
           dni,
           entidad,
           subcesion,
-          monto: pago.monto,
-          fecha: pago.fecha ? formatearFecha(pago.fecha) : "",
+          monto: Number(pago.monto || 0),
+          fecha: pago.fecha ? new Date(pago.fecha) : null,
         });
       });
     });
@@ -2323,6 +2326,10 @@ export const exportarPagos = async (req, res) => {
     ];
 
     pagosExportar.forEach((fila) => worksheet.addRow(fila));
+    worksheet.getColumn("dni").numFmt = "0";
+    worksheet.getColumn("entidad").numFmt = "0";
+    worksheet.getColumn("monto").numFmt = '$#,##0.00;[Red]-$#,##0.00';
+    worksheet.getColumn("fecha").numFmt = "dd/mm/yyyy";
 
     res.setHeader(
       "Content-Type",

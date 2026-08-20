@@ -52,6 +52,23 @@ const AgendaItemSchema = new mongoose.Schema(
       default: "tarea",
       index: true,
     },
+    avisarMinutosAntes: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 1440,
+    },
+    origenSistema: {
+      type: String,
+      enum: ["", "capacitacion"],
+      default: "",
+      index: true,
+    },
+    referenciaId: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null,
+      index: true,
+    },
     completada: {
       type: Boolean,
       default: false,

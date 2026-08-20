@@ -186,7 +186,9 @@ export async function crearNovedad(req, res) {
       return res.status(400).json({ error: "Completá empleado, tipo, fecha y descripción" });
     }
 
-    if (["cambio-horario", "licencia-medica"].includes(tipo) && !fechaHasta) {
+    // Las novedades pueden abarcar uno o varios días. En cambios de horario
+    // se admite además fechaHasta=null para reglas recurrentes "desde ahora".
+    if (tipo === "licencia-medica" && !fechaHasta) {
       fechaHasta = fechaDesde;
     }
     const errorDatos = validarDatosNovedad(tipo, req.body, fechaDesde, fechaHasta);
@@ -214,6 +216,11 @@ export async function crearNovedad(req, res) {
         tipo === "apercibimiento" ? req.body.motivoApercibimiento || "otro" : "",
       fechaDesde,
       fechaHasta,
+      diasSemanaAplicables: tipo === "cambio-horario"
+        ? (Array.isArray(req.body.diasSemanaAplicables)
+            ? [...new Set(req.body.diasSemanaAplicables.map(Number).filter((dia) => Number.isInteger(dia) && dia >= 0 && dia <= 6))]
+            : [])
+        : [],
       horarioAnterior,
       horarioNuevo,
       horaEntradaNueva: entradaNueva,
@@ -225,7 +232,7 @@ export async function crearNovedad(req, res) {
         ? Math.max(0, Math.min(180, Number(req.body.toleranciaMinutosNueva ?? empleado.horarioLaboral?.toleranciaMinutos ?? 10)))
         : 10,
       minutosTarde: Number(req.body.minutosTarde || 0),
-      justificado: Boolean(req.body.justificado || ["falta-justificada", "licencia-medica"].includes(tipo)),
+      justificado: Boolean(req.body.justificado || ["falta-justificada", "licencia-medica", "vacaciones"].includes(tipo)),
       descripcion,
       accionTomada: String(req.body.accionTomada || "").trim(),
       estado: req.body.estado || "vigente",
@@ -264,17 +271,20 @@ export async function actualizarNovedad(req, res) {
     const tipo = String(update.tipo || actual.tipo || "");
     const fechaDesde = update.fechaDesde || actual.fechaDesde;
     let fechaHasta = update.fechaHasta !== undefined ? update.fechaHasta : actual.fechaHasta;
-    if (["cambio-horario", "licencia-medica"].includes(tipo) && !fechaHasta) fechaHasta = fechaDesde;
+    if (tipo === "licencia-medica" && !fechaHasta) fechaHasta = fechaDesde;
     update.fechaHasta = fechaHasta;
     const datosCombinados = { ...actual, ...update };
     const errorDatos = validarDatosNovedad(tipo, datosCombinados, fechaDesde, fechaHasta);
     if (errorDatos) return res.status(400).json({ error: errorDatos });
 
-    if (tipo === "licencia-medica") update.justificado = true;
+    if (["licencia-medica", "vacaciones"].includes(tipo)) update.justificado = true;
     update.motivoApercibimiento = tipo === "apercibimiento"
       ? String(datosCombinados.motivoApercibimiento || "otro")
       : "";
     if (tipo === "cambio-horario") {
+      update.diasSemanaAplicables = Array.isArray(datosCombinados.diasSemanaAplicables)
+        ? [...new Set(datosCombinados.diasSemanaAplicables.map(Number).filter((dia) => Number.isInteger(dia) && dia >= 0 && dia <= 6))]
+        : [];
       const partida = Boolean(datosCombinados.jornadaPartidaNueva);
       update.jornadaPartidaNueva = partida;
       update.horaEntradaSegundaNueva = partida ? String(datosCombinados.horaEntradaSegundaNueva || "").trim() : "";
@@ -873,6 +883,7 @@ export async function resumenEmpleados(req, res) {
         llegadasTarde: novedadesEmp.filter((n) => n.tipo === "llegada-tarde").length,
         apercibimientos: novedadesEmp.filter((n) => ["apercibimiento", "error-grave-gestion"].includes(n.tipo)).length,
         licenciasMedicas: novedadesEmp.filter((n) => n.tipo === "licencia-medica").length,
+        vacaciones: novedadesEmp.filter((n) => n.tipo === "vacaciones").length,
         cambiosHorario: novedadesEmp.filter((n) => n.tipo === "cambio-horario").length,
         adelantosCantidad: puedeVerAdelantos ? adelantosEmp.length : null,
         adelantosMonto: puedeVerAdelantos ? montoAdelantos : null,

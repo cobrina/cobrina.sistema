@@ -179,6 +179,7 @@ PagoSchema.index(
 );
 PagoSchema.index({ nroRemesa: 1, _id: -1 }, { name: "idx_por_remesa" });
 PagoSchema.index({ dni: 1, fechaPago: -1, _id: -1 }, { name: "idx_por_dni_fecha" });
+PagoSchema.index({ dni: 1, entidadId: 1, fechaPago: 1 }, { name: "idx_supervision_dni_entidad_fecha" });
 
 /* Índice único explícito del idPago (ya marcado arriba en el campo) */
 PagoSchema.index({ idPago: 1 }, { unique: true, name: "uk_idPago" });

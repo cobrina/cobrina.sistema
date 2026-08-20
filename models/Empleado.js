@@ -23,6 +23,12 @@ const EmpleadoSchema = new mongoose.Schema(
       required: [true, "La contraseña es obligatoria"],
       select: false,
     },
+    celular: {
+      type: String,
+      trim: true,
+      default: "",
+      maxlength: 40,
+    },
     email: {
       type: String,
       required: [true, "El correo es obligatorio"],

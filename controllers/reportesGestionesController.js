@@ -14,9 +14,15 @@ import Entidad from "../models/Entidad.js";
 import Pago from "../models/Pago.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
 import { invalidateCalidadCache } from "./calidadGestionesController.js";
-import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
+import { sincronizarContactados } from "../services/contactadosService.js";
+import {
+  filtrarEmpleadosControlados,
+  filtrarFilasReportesControl,
+  USUARIOS_OCULTOS_REPORTES_CONTROL,
+} from "../utils/controlEquipo.js";
 import {
   transformarGestionEnAcuerdo,
+  resolverEpisodiosAcuerdos,
   resumirAcuerdos,
   crearExcelAcuerdos,
   vincularPagosPosteriores,
@@ -112,6 +118,14 @@ function throwIfAborted(req) {
 
 const escapeRegex = (s = "") =>
   String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function filtroMongoUsuariosVisiblesControl(campo = "usuario") {
+  return {
+    $nor: [...USUARIOS_OCULTOS_REPORTES_CONTROL].map((username) => ({
+      [campo]: new RegExp(`^${escapeRegex(username)}$`, "i"),
+    })),
+  };
+}
+
 
 // ✅ NUEVO: soporta filtros múltiples (CSV) o array
 const splitCSV = (raw) => {
@@ -485,6 +499,9 @@ export async function cargar(req, res) {
       invalidateReportesAnalyticsCache();
       invalidateSeguimientoCache();
       invalidateCalidadCache();
+      // No bloquea la importación: Contactados se actualiza inmediatamente
+      // y además tiene sincronización periódica como respaldo.
+      sincronizarContactados().catch(() => {});
     }
 
     return res.status(200).json({
@@ -530,6 +547,7 @@ export async function listar(req, res) {
     // ✅ Scope: admin/super ve todo; otros => solo su propietario
     const q = {
       ...ownerScope(req),
+      ...filtroMongoUsuariosVisiblesControl("usuario"),
       borrado: { $ne: true },
     };
 
@@ -742,6 +760,7 @@ export async function exportarGestionesExcel(req, res) {
 
     const q = {
       ...ownerScope(req),
+      ...filtroMongoUsuariosVisiblesControl("usuario"),
       borrado: { $ne: true },
     };
 
@@ -2204,11 +2223,12 @@ export async function resumenDia(req, res) {
       }
     }
 
-    const rows = (rowsRaw || []).map((r) => ({
+    const rowsTodos = (rowsRaw || []).map((r) => ({
       ...r,
       casosNuevos: casosNuevosPorUsuario.get(String(r.usuario || "")) || 0,
       minDias: MIN_DIAS,
     }));
+    const rows = filtrarFilasReportesControl(rowsTodos, (row) => row?.usuario);
 
     return res.json({ ok: true, fecha, rows });
   } catch (e) {
@@ -2400,15 +2420,18 @@ export async function calendarioMesMatriz(req, res) {
       if (!mapa.has(r.usuario)) mapa.set(r.usuario, { usuario: r.usuario, dias: {} });
       mapa.get(r.usuario).dias[r.d] = r.cuentas;
     }
-    const usuariosMatriz = Array.from(mapa.values());
+    const usuariosMatrizTodos = Array.from(mapa.values());
 
+    // Los totales diarios conservan TODA la actividad, incluso la de usuarios
+    // ocultos del control. Solo se ocultan sus filas identificadas.
     const totalesPorDia = new Map();
-    for (const u of usuariosMatriz) {
+    for (const u of usuariosMatrizTodos) {
       for (const d of Object.keys(u.dias)) {
         totalesPorDia.set(d, (totalesPorDia.get(d) || 0) + u.dias[d]);
       }
     }
     const dias = diasCabecera.map((d) => ({ dia: d, cuentas: totalesPorDia.get(d) || 0 }));
+    const usuariosMatriz = filtrarFilasReportesControl(usuariosMatrizTodos, (row) => row?.usuario);
 
     return res.json({ ok: true, dias, usuariosMatriz, diasCabecera });
   } catch (e) {
@@ -2671,7 +2694,7 @@ export async function casosNuevos(req, res) {
       if (!recientesSet.has(dnin)) acc.casosNuevos += 1;
     }
 
-    const totalCasosOperador = Array.from(porOperador.entries())
+    const totalCasosOperadorTodos = Array.from(porOperador.entries())
       .map(([operadorName, vals]) => ({
         operador: operadorName,
         casosDistintos: vals.casosDistintos,
@@ -2680,7 +2703,7 @@ export async function casosNuevos(req, res) {
       }))
       .sort((a, b) => a.operador.localeCompare(b.operador, "es", { sensitivity: "base" }));
 
-    const totales = totalCasosOperador.reduce(
+    const totales = totalCasosOperadorTodos.reduce(
       (a, x) => ({
         casosNuevos: a.casosNuevos + (x.casosNuevos || 0),
         casosDistintos: a.casosDistintos + (x.casosDistintos || 0),
@@ -2688,6 +2711,10 @@ export async function casosNuevos(req, res) {
       { casosNuevos: 0, casosDistintos: 0 }
     );
     totales.pctNuevos = totales.casosDistintos ? (totales.casosNuevos * 100) / totales.casosDistintos : 0;
+    const totalCasosOperador = filtrarFilasReportesControl(
+      totalCasosOperadorTodos,
+      (row) => row?.operador
+    );
 
     const payload = {
       ok: true,
@@ -2784,8 +2811,8 @@ export async function ultimaActualizacion(req, res) {
    ============================================================ */
 
 const ACUERDOS_SORT_KEYS = new Set([
-  "estadoVencimiento", "primerVencimiento", "dias", "tipoAcuerdo", "primerPago",
-  "montoTotalAcuerdo", "fechaAnticipo", "montoAnticipo", "cuotas", "montoCuota",
+  "estadoVencimiento", "fechaPrimerPago", "primerVencimiento", "dias", "episodioNumero", "tipoAcuerdo", "primerPago",
+  "montoPrimerPagoCobrado", "montoTotalAcuerdo", "fechaAnticipo", "montoAnticipo", "cuotas", "montoCuota",
   "deudaMaxima", "dni", "telefonoGestion", "nombreDeudor", "fecha", "hora", "usuario", "entidad",
   "tipoContacto", "resultadoGestion", "estadoCuenta", "telMailMarcado", "observacionGestion",
   "estadoPagoAcuerdo", "cantidadPagosPosteriores", "montoPagosPosteriores", "ultimoPagoPosterior",
@@ -2794,7 +2821,7 @@ const ACUERDOS_SORT_KEYS = new Set([
 ]);
 
 const ACUERDOS_NUMERIC_SORT_KEYS = new Set([
-  "dias", "primerPago", "montoTotalAcuerdo", "montoAnticipo", "cuotas", "montoCuota", "deudaMaxima",
+  "dias", "episodioNumero", "primerPago", "montoPrimerPagoCobrado", "montoTotalAcuerdo", "montoAnticipo", "cuotas", "montoCuota", "deudaMaxima",
   "cantidadPagosPosteriores", "montoPagosPosteriores", "montoUltimoPagoAnterior", "diasPagoAnterior",
 ]);
 
@@ -2843,7 +2870,7 @@ async function vincularPagosConAcuerdosSinRomper(acuerdos = [], { fechaHasta = "
     if (paymentStart) paymentMatch.fechaPago = { $gte: paymentStart, $lte: paymentEnd };
 
     const payments = await Pago.find(paymentMatch)
-      .select("idPago dni entidadId subCesionId fechaPago monto conceptoCodigo estado")
+      .select("idPago dni entidadId subCesionId fechaPago monto conceptoCodigo estado operadorUsername")
       .sort({ fechaPago: 1, _id: 1 })
       .lean()
       .maxTimeMS(15000);
@@ -2875,6 +2902,154 @@ async function vincularPagosConAcuerdosSinRomper(acuerdos = [], { fechaHasta = "
   }
 }
 
+
+function clavePagoReporte(pago = {}) {
+  return String(
+    pago?._id ||
+    pago?.clavePago ||
+    pago?.idPago ||
+    `${pago?.fecha || pago?.fechaPago || ""}|${Number(pago?.monto || 0)}|${pago?.entidadId || ""}|${pago?.operadorUsername || ""}`
+  );
+}
+
+function claveOperadorCobro(value = "") {
+  return String(value || "").trim().toLocaleLowerCase("es");
+}
+
+/**
+ * Desglosa la recaudación REAL del período para el cuadro "Rendimiento por operador".
+ *
+ * La clasificación se hace contra los episodios efectivos del período ANTES de
+ * aplicar filtros de tipo/estado del acuerdo:
+ * - recaudadoAcuerdosPeriodo: pagos que quedaron vinculados a un episodio efectivo
+ *   generado dentro del rango consultado;
+ * - recaudadoCarteraAnterior: el resto de los pagos del mismo rango (cuotas/pagos
+ *   de acuerdos anteriores).
+ *
+ * El dinero pertenece al operador informado en Pago. El acuerdo sigue perteneciendo
+ * a quien lo generó, evitando volver a mezclar productividad con imputación de cobro.
+ */
+async function calcularDesgloseRecaudacionAcuerdos({
+  acuerdosPeriodo = [],
+  desdeDate = null,
+  hastaDate = null,
+  operadorFilter = null,
+  entidadFilter = null,
+  dniFilter = null,
+} = {}) {
+  const fallback = (motivo = "SIN_RANGO") => ({
+    disponible: false,
+    motivo,
+    porOperador: [],
+    total: 0,
+    recaudadoAcuerdosPeriodo: 0,
+    recaudadoCarteraAnterior: 0,
+    cantidadPagos: 0,
+    cantidadPagosAcuerdosPeriodo: 0,
+    cantidadPagosCarteraAnterior: 0,
+  });
+
+  if (!desdeDate || !hastaDate) return fallback("SIN_RANGO_COMPLETO");
+
+  try {
+    const moduleHasData = await Pago.exists({});
+    if (!moduleHasData) return fallback("SIN_PAGOS_CARGADOS");
+
+    const paymentMatch = {
+      fechaPago: { $gte: desdeDate, $lte: hastaDate },
+      ...filtroMongoUsuariosVisiblesControl("operadorUsername"),
+    };
+    if (operadorFilter) paymentMatch.operadorUsername = operadorFilter;
+    if (dniFilter) paymentMatch.dni = dniFilter;
+
+    if (entidadFilter) {
+      const numerosDesdeAcuerdos = [...new Set(
+        acuerdosPeriodo.map((row) => Number(row?.entidadNumero || 0)).filter(Boolean)
+      )];
+      const entidadesCatalogo = await Entidad.find({ nombre: entidadFilter })
+        .select("numero")
+        .lean()
+        .maxTimeMS(5000);
+      const numeros = [...new Set([
+        ...numerosDesdeAcuerdos,
+        ...entidadesCatalogo.map((row) => Number(row?.numero || 0)).filter(Boolean),
+      ])];
+      // Si el filtro de entidad existe y no logramos resolver ningún número, no
+      // debemos mezclar pagos de otras entidades dentro del desglose.
+      paymentMatch.entidadId = numeros.length ? { $in: numeros } : { $in: [-999999999] };
+    }
+
+    const linkedCurrentIds = new Set();
+    for (const acuerdo of acuerdosPeriodo) {
+      for (const pago of acuerdo?.pagosValidos || []) {
+        const key = clavePagoReporte(pago);
+        if (key) linkedCurrentIds.add(key);
+      }
+    }
+
+    const pagos = await Pago.find(paymentMatch)
+      .select("idPago fechaPago monto operadorUsername entidadId dni")
+      .sort({ fechaPago: 1, _id: 1 })
+      .lean()
+      .maxTimeMS(20000);
+
+    const operatorMap = new Map();
+    const ensureOperator = (username) => {
+      const key = claveOperadorCobro(username) || "sin-operador";
+      if (!operatorMap.has(key)) {
+        operatorMap.set(key, {
+          operador: String(username || "Sin operador").trim() || "Sin operador",
+          recaudadoMes: 0,
+          recaudadoAcuerdosPeriodo: 0,
+          recaudadoCarteraAnterior: 0,
+          cantidadPagosMes: 0,
+          cantidadPagosAcuerdosPeriodo: 0,
+          cantidadPagosCarteraAnterior: 0,
+        });
+      }
+      return operatorMap.get(key);
+    };
+
+    let total = 0;
+    let totalPeriodo = 0;
+    let cantidadPeriodo = 0;
+    for (const pago of pagos) {
+      const monto = Math.max(0, Number(pago?.monto || 0));
+      const item = ensureOperator(pago?.operadorUsername);
+      const esDelPeriodo = linkedCurrentIds.has(clavePagoReporte(pago));
+      item.recaudadoMes += monto;
+      item.cantidadPagosMes += 1;
+      total += monto;
+      if (esDelPeriodo) {
+        item.recaudadoAcuerdosPeriodo += monto;
+        item.cantidadPagosAcuerdosPeriodo += 1;
+        totalPeriodo += monto;
+        cantidadPeriodo += 1;
+      } else {
+        item.recaudadoCarteraAnterior += monto;
+        item.cantidadPagosCarteraAnterior += 1;
+      }
+    }
+
+    return {
+      disponible: true,
+      motivo: "",
+      porOperador: [...operatorMap.values()],
+      total,
+      recaudadoAcuerdosPeriodo: totalPeriodo,
+      recaudadoCarteraAnterior: Math.max(0, total - totalPeriodo),
+      cantidadPagos: pagos.length,
+      cantidadPagosAcuerdosPeriodo: cantidadPeriodo,
+      cantidadPagosCarteraAnterior: Math.max(0, pagos.length - cantidadPeriodo),
+      periodoDesde: desdeDate.toISOString().slice(0, 10),
+      periodoHasta: hastaDate.toISOString().slice(0, 10),
+    };
+  } catch (error) {
+    console.warn("Desglose de recaudación en Reporte de Acuerdos no disponible:", error?.message || error);
+    return fallback("ERROR_DESGLOSE_RECAUDACION");
+  }
+}
+
 function desplazarISOUnMesAtras(value) {
   const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!match) return "";
@@ -2898,6 +3073,8 @@ function resumenComparacionAcuerdos(summary, desde, hasta) {
     tasaAcuerdo: Number(summary.tasaAcuerdo || 0),
     dnisConAcuerdo: Number(summary.dnisConAcuerdo || 0),
     totalPrimerPago: Number(summary.totalPrimerPago || 0),
+    totalPrimerPagoCobrado: Number(summary.totalPrimerPagoCobrado || 0),
+    reacuerdosEfectivos: Number(summary.reacuerdosEfectivos || 0),
     montoTotalAcuerdos: Number(summary.montoTotalAcuerdos || 0),
     vencidos: Number(summary.vencidos || 0),
     montoVencido: Number(summary.montoVencido || 0),
@@ -3100,9 +3277,35 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
 
   throwIfAborted(req);
 
-  let acuerdos = rawRows
+  // IMPORTANTE: no deduplicamos antes del cruce con Pagos. Primero conservamos
+  // todos los acuerdos válidos, construimos sus ventanas de pago y recién después
+  // resolvemos episodios efectivos por DNI + entidad. De ese modo, si un acuerdo
+  // tuvo pago y luego hubo un nuevo acuerdo, ambos cuentan; si fue reemplazado sin
+  // pago, solo queda el más reciente.
+  let acuerdosBase = rawRows
     .map((row) => transformarGestionEnAcuerdo(row))
     .filter(Boolean);
+
+  acuerdosBase = await vincularUltimaGestionMango(acuerdosBase, req);
+
+  const paymentLink = await vincularPagosConAcuerdosSinRomper(acuerdosBase, { fechaHasta: hasta });
+  const episodios = resolverEpisodiosAcuerdos(paymentLink.rows);
+  const acuerdosPeriodoEfectivos = episodios.rows;
+  const recaudacionPeriodo = await calcularDesgloseRecaudacionAcuerdos({
+    acuerdosPeriodo: acuerdosPeriodoEfectivos,
+    desdeDate: d1,
+    hastaDate: d2,
+    operadorFilter: match.usuario,
+    entidadFilter: fEntidad,
+    dniFilter: fDni,
+  });
+  const paymentMeta = {
+    ...paymentLink.meta,
+    ...episodios.meta,
+    episodios: episodios.meta,
+    recaudacionPeriodo,
+  };
+  let acuerdos = acuerdosPeriodoEfectivos;
 
   const tiposSolicitados = splitCSV(tipoAcuerdo).map((value) => value.toLocaleLowerCase("es"));
   if (tiposSolicitados.length) {
@@ -3119,13 +3322,9 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     acuerdos = acuerdos.filter((row) => row.estadoVencimiento === "VENCIDO");
   }
 
-  acuerdos = await vincularUltimaGestionMango(acuerdos, req);
-
-  const paymentLink = await vincularPagosConAcuerdosSinRomper(acuerdos, { fechaHasta: hasta });
-  acuerdos = paymentLink.rows;
-
   const appliedSort = ordenarAcuerdos(acuerdos, sortKey, sortDir);
-  const summary = resumirAcuerdos(acuerdos, totalGestiones, gestionesPorOperador, paymentLink.meta);
+  const summary = resumirAcuerdos(acuerdos, totalGestiones, gestionesPorOperador, paymentMeta);
+  const acuerdosVisibles = filtrarFilasReportesControl(acuerdos, (row) => row?.usuario);
 
   if (paginate && desde && hasta) {
     const anteriorDesde = desplazarISOUnMesAtras(desde);
@@ -3162,9 +3361,12 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
           .maxTimeMS(30000),
       ]);
 
-      let previousAgreements = previousRawRows
+      let previousAgreementsBase = previousRawRows
         .map((row) => transformarGestionEnAcuerdo(row))
         .filter(Boolean);
+      const previousPaymentLink = await vincularPagosConAcuerdosSinRomper(previousAgreementsBase, { fechaHasta: anteriorHasta });
+      const previousEpisodes = resolverEpisodiosAcuerdos(previousPaymentLink.rows);
+      let previousAgreements = previousEpisodes.rows;
 
       if (tiposSolicitados.length) {
         const tiposSet = new Set(tiposSolicitados);
@@ -3182,7 +3384,8 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
       const previousSummary = resumirAcuerdos(
         previousAgreements,
         previousTotalGestiones,
-        previousGestionesPorOperador
+        previousGestionesPorOperador,
+        { ...previousPaymentLink.meta, ...previousEpisodes.meta, episodios: previousEpisodes.meta }
       );
       summary.comparacionAnterior = resumenComparacionAcuerdos(
         previousSummary,
@@ -3192,38 +3395,39 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     }
   }
 
-  const dueRows = acuerdos
-    .filter((row) => row.primerVencimiento)
+  const dueRows = acuerdosVisibles
+    .filter((row) => row.fechaPrimerPago || row.primerVencimiento)
     .slice()
     .sort((a, b) =>
-      (a.primerVencimiento || "9999-12-31").localeCompare(b.primerVencimiento || "9999-12-31") ||
+      (a.fechaPrimerPago || a.primerVencimiento || "9999-12-31").localeCompare(b.fechaPrimerPago || b.primerVencimiento || "9999-12-31") ||
       String(a.usuario || "").localeCompare(String(b.usuario || ""), "es")
     );
 
   const safePage = Math.max(1, Number(page) || 1);
   const safeLimit = Math.max(10, Math.min(500, Number(limit) || 100));
-  const total = acuerdos.length;
+  const total = acuerdosVisibles.length;
   const pages = Math.max(1, Math.ceil(total / safeLimit));
   const currentPage = Math.min(safePage, pages);
   const items = paginate
-    ? acuerdos.slice((currentPage - 1) * safeLimit, currentPage * safeLimit)
-    : acuerdos;
+    ? acuerdosVisibles.slice((currentPage - 1) * safeLimit, currentPage * safeLimit)
+    : acuerdosVisibles;
 
   return {
-    acuerdos,
+    acuerdos: acuerdosVisibles,
     items,
     vencimientos: paginate ? dueRows.slice(0, 250) : dueRows,
     summary,
     total,
+    totalIncluyendoOcultos: acuerdos.length,
     page: currentPage,
     pages,
     limit: safeLimit,
     catalogos: {
       tiposAcuerdo: TIPOS_ACUERDO,
       estadosVencimiento: ["VENCIDO", "VENCE HOY", "PRÓXIMO 3 DÍAS", "PENDIENTE"],
-      estadosPagoAcuerdo: ["CON PAGO POSTERIOR", "PAGO MISMO DÍA", "SIN PAGO POSTERIOR"],
+      estadosPagoAcuerdo: ["CON PAGO VÁLIDO", "PAGO MISMO DÍA VÁLIDO", "SIN PAGO VÁLIDO", "REQUIERE REVISIÓN"],
     },
-    integracionPagos: paymentLink.meta,
+    integracionPagos: paymentMeta,
     params: {
       desde: desde || null,
       hasta: hasta || null,
