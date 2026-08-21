@@ -1321,6 +1321,23 @@ function excelDate(iso) {
   return date || null;
 }
 
+function excelTime(value) {
+  const text = String(value || "").trim();
+  const match = /^(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(text);
+  if (!match) return null;
+  const hh = Math.min(23, Math.max(0, Number(match[1]) || 0));
+  const mm = Math.min(59, Math.max(0, Number(match[2]) || 0));
+  const ss = Math.min(59, Math.max(0, Number(match[3]) || 0));
+  return (hh * 3600 + mm * 60 + ss) / 86400;
+}
+
+function dniExcel(value) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  if (!digits) return null;
+  const number = Number(digits);
+  return Number.isSafeInteger(number) ? number : null;
+}
+
 function money(value) {
   return Number(value || 0);
 }
@@ -1737,24 +1754,18 @@ function addCalendarSheet(workbook, summary, metadata) {
 }
 
 function addAgreementRowsSheet(workbook, rows) {
-  const ws = workbook.addWorksheet("Gestiones_con_acuerdo");
-  titleSheet(
-    ws,
-    "GESTIONES CON ACUERDO",
-    "Acuerdos efectivos por episodio · proyección de 1er pago separada del monto contractual · cruce opcional con Pagos",
-    38
-  );
-  ws.addRow([
-    "ESTADO VENCIMIENTO", "PRIMER VENCIMIENTO", "DÍAS", "EPISODIO", "REACUERDO EFECTIVO",
-    "CRUCE CON PAGOS", "PAGOS VÁLIDOS", "MONTO PAGOS VÁLIDOS", "ÚLTIMO PAGO ANTERIOR", "MONTO ÚLTIMO PAGO ANTERIOR",
-    "DÍAS ANTES", "PAGOS MISMO DÍA", "TIPO ACUERDO", "1ER PAGO PROYECTADO", "1ER PAGO COBRADO",
-    "FECHA 1ER PAGO COBRADO", "1ER PAGO CUBIERTO", "MONTO CONTRACTUAL", "FECHA ANTICIPO", "MONTO ANTICIPO",
-    "CUOTAS", "MONTO CUOTA", "DEUDA MÁXIMA", "DNI", "TELÉFONO GESTIÓN", "NOMBRE DEUDOR", "FECHA GESTIÓN",
-    "HORA", "USUARIO ACUERDO", "ENTIDAD", "TIPO CONTACTO", "RESULTADO GESTIÓN",
-    "ESTADO DE LA CUENTA", "OBSERVACIÓN ORIGINAL", "ÚLTIMA GESTIÓN MANGO",
-    "HORA ÚLTIMA GESTIÓN", "ÚLTIMO GESTOR", "RESULTADO ÚLTIMA GESTIÓN",
-  ]);
-  styleHeader(ws.getRow(4));
+  // Exportación operativa: una tabla simple, con alturas normales y sin 38
+  // columnas de diagnóstico. Los datos técnicos extensos quedan en el sistema.
+  const ws = workbook.addWorksheet("Acuerdos");
+  const headers = [
+    "ESTADO", "PRIMER VENCIMIENTO", "DÍAS", "EPISODIO", "TIPO DE ACUERDO",
+    "1ER PAGO PROYECTADO", "MONTO ACUERDO", "PAGOS VÁLIDOS", "MONTO PAGOS VÁLIDOS",
+    "ÚLTIMO PAGO", "DNI", "NOMBRE", "ENTIDAD", "OPERADOR", "FECHA GESTIÓN",
+    "HORA", "RESULTADO GESTIÓN", "ESTADO CUENTA", "TELÉFONO", "OBSERVACIÓN",
+  ];
+  ws.addRow(headers);
+  styleHeader(ws.getRow(1));
+  ws.getRow(1).height = 22;
 
   rows.forEach((item) => {
     const episodio = item.episodioNumero
@@ -1765,48 +1776,32 @@ function addAgreementRowsSheet(workbook, rows) {
       excelDate(item.primerVencimiento),
       item.estadoVencimiento === "VENCIDO" ? item.diasVencido : item.diasParaVencer ?? "",
       episodio,
-      item.esReacuerdoEfectivo ? "SÍ" : "NO",
-      item.estadoPagoAcuerdo,
-      item.cantidadPagosPosteriores,
-      money(item.montoPagosPosteriores),
-      excelDate(item.ultimoPagoAnterior),
-      money(item.montoUltimoPagoAnterior),
-      item.diasPagoAnterior ?? "",
-      item.cantidadPagosMismoDia,
       item.tipoAcuerdo,
       money(item.primerPago),
-      money(item.montoPrimerPagoCobrado),
-      excelDate(item.fechaPrimerPagoCobrado),
-      item.primerPagoCubierto ? "SÍ" : "NO",
       money(item.montoTotalAcuerdo),
-      excelDate(item.fechaAnticipo),
-      money(item.montoAnticipo),
-      item.cuotas,
-      money(item.montoCuota),
-      money(item.deudaMaxima),
-      Number(item.dni || 0) || item.dni,
-      item.telefonoGestion,
+      Number(item.cantidadPagosPosteriores || 0),
+      money(item.montoPagosPosteriores),
+      excelDate(item.fechaPrimerPagoCobrado || item.ultimoPagoValido),
+      dniExcel(item.dni),
       item.nombreDeudor,
-      excelDate(item.fecha),
-      item.hora,
-      item.usuario,
       item.entidad,
-      item.tipoContacto,
+      item.usuario,
+      excelDate(item.fecha),
+      excelTime(item.hora),
       item.resultadoGestion,
       item.estadoCuenta,
+      item.telefonoGestion,
       item.observacionGestion,
-      excelDate(item.ultimaGestionMangoFecha),
-      item.ultimaGestionMangoHora,
-      item.ultimaGestionMangoUsuario,
-      item.ultimaGestionMangoResultado,
     ]);
     styleDataRow(row, {
-      height: 24,
-      center: [1, 2, 3, 4, 5, 6, 7, 9, 11, 12, 16, 17, 19, 21, 24, 25, 27, 28, 35, 36],
-      moneyCols: [8, 10, 14, 15, 18, 20, 22, 23],
-      dateCols: [2, 9, 16, 19, 27, 35],
-      wrapCols: [34, 38],
+      height: 18,
+      center: [1, 2, 3, 4, 8, 10, 11, 15, 16],
+      moneyCols: [6, 7, 9],
+      dateCols: [2, 10, 15],
+      wrapCols: [],
     });
+    row.getCell(11).numFmt = "0";
+    row.getCell(16).numFmt = "hh:mm:ss";
 
     const fillColor = item.estadoVencimiento === "VENCIDO"
       ? COLORS.redSoft
@@ -1816,37 +1811,12 @@ function addAgreementRowsSheet(workbook, rows) {
       ? COLORS.lilac
       : COLORS.greenSoft;
     row.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: fillColor } };
-    row.getCell(1).font = { bold: true, color: { argb: item.estadoVencimiento === "VENCIDO" ? COLORS.red : COLORS.dark } };
-
-    if (item.esReacuerdoEfectivo) {
-      [4, 5].forEach((col) => {
-        row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLORS.lilac } };
-        row.getCell(col).font = { bold: true, color: { argb: COLORS.purple } };
-      });
-    }
-
-    const paymentCell = row.getCell(6);
-    const paymentFill = ["CON PAGO POSTERIOR", "CON PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo)
-      ? COLORS.greenSoft
-      : ["PAGO MISMO DÍA", "PAGO MISMO DÍA VÁLIDO"].includes(item.estadoPagoAcuerdo)
-      ? COLORS.yellow
-      : ["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo)
-      ? COLORS.redSoft
-      : COLORS.gray;
-    paymentCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: paymentFill } };
-    paymentCell.font = { bold: true, color: { argb: ["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo) ? COLORS.red : COLORS.dark } };
-
-    if (item.primerPagoCubierto) {
-      [15, 17].forEach((col) => {
-        row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLORS.greenSoft } };
-        row.getCell(col).font = { bold: true, color: { argb: "FF075D43" } };
-      });
-    }
+    row.getCell(1).font = { color: { argb: item.estadoVencimiento === "VENCIDO" ? COLORS.red : COLORS.dark } };
   });
 
-  setWidths(ws, [19, 16, 9, 11, 18, 24, 15, 22, 19, 22, 12, 16, 31, 20, 19, 20, 18, 19, 16, 17, 10, 17, 17, 14, 20, 27, 16, 12, 20, 21, 23, 29, 27, 54, 17, 13, 20, 34]);
-  ws.autoFilter = { from: "A4", to: `AL${Math.max(4, rows.length + 4)}` };
-  ws.views = [{ state: "frozen", xSplit: 1, ySplit: 4, showGridLines: false }];
+  setWidths(ws, [16, 16, 8, 10, 25, 18, 18, 14, 20, 15, 13, 27, 22, 21, 15, 11, 28, 24, 20, 36]);
+  ws.autoFilter = { from: "A1", to: `T${Math.max(1, rows.length + 1)}` };
+  ws.views = [{ state: "frozen", ySplit: 1, showGridLines: true }];
   ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
 }
 
@@ -1883,8 +1853,8 @@ function addDueSheet(workbook, rows) {
       excelDate(item.ultimoPagoAnterior), money(item.montoUltimoPagoAnterior), item.diasPagoAnterior ?? "", item.cantidadPagosMismoDia,
       money(item.primerPago), money(item.montoPrimerPagoCobrado), excelDate(item.fechaPrimerPagoCobrado), item.primerPagoCubierto ? "SÍ" : "NO",
       money(item.montoTotalAcuerdo), item.tipoAcuerdo,
-      item.usuario, item.entidad, Number(item.dni || 0) || item.dni, item.telefonoGestion, item.nombreDeudor,
-      excelDate(item.fecha), item.hora, item.resultadoGestion, item.estadoCuenta,
+      item.usuario, item.entidad, dniExcel(item.dni), item.telefonoGestion, item.nombreDeudor,
+      excelDate(item.fecha), excelTime(item.hora), item.resultadoGestion, item.estadoCuenta,
       item.tipoContacto, item.observacionGestion, item.id,
     ]);
     styleDataRow(row, {
@@ -1894,6 +1864,8 @@ function addDueSheet(workbook, rows) {
       dateCols: [1, 9, 15, 24],
       wrapCols: [29],
     });
+    row.getCell(21).numFmt = "0";
+    row.getCell(25).numFmt = "hh:mm:ss";
     [1, 2, 3].forEach((col) => {
       row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLORS.redSoft } };
       row.getCell(col).font = { color: { argb: COLORS.red }, bold: col === 2 };

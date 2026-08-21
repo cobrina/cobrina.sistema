@@ -660,11 +660,25 @@ export async function listar(req, res) {
 
 
 
-function fechaExportacionDMY(value) {
-  const key = claveFechaCalendario(value);
-  if (!key) return "";
-  const [yyyy, mm, dd] = key.split("-");
-  return `${dd}/${mm}/${yyyy}`;
+function fechaExportacionExcel(value) {
+  return toDateOnly(value);
+}
+
+function dniExportacionExcel(value) {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  if (!digits) return null;
+  const number = Number(digits);
+  return Number.isSafeInteger(number) ? number : null;
+}
+
+function horaExportacionExcel(value) {
+  const normalizada = normalizarHora(value || "");
+  const match = /^(\d{2}):(\d{2}):(\d{2})$/.exec(normalizada);
+  if (!match) return null;
+  const hh = Number(match[1]);
+  const mm = Number(match[2]);
+  const ss = Number(match[3]);
+  return (hh * 3600 + mm * 60 + ss) / 86400;
 }
 
 function nombreArchivoGestiones(desde, hasta) {
@@ -819,7 +833,7 @@ export async function exportarGestionesExcel(req, res) {
     etapa = "inicializando Excel";
     const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({
       filename: tempFile,
-      useStyles: false,
+      useStyles: true,
       useSharedStrings: false,
     });
 
@@ -838,8 +852,13 @@ export async function exportarGestionesExcel(req, res) {
       { header: "ENTIDAD", key: "entidad", width: 24 },
     ];
 
-    // Con el writer streaming priorizamos compatibilidad y estabilidad del archivo.
-    // No agregamos vistas/filtros que no son necesarios para la exportación masiva.
+    // Tipos reales para que Excel pueda ordenar/filtrar sin conversiones manuales.
+    ws.getColumn("dni").numFmt = "0";
+    ws.getColumn("fecha").numFmt = "dd/mm/yyyy";
+    ws.getColumn("hora").numFmt = "hh:mm:ss";
+    ws.getRow(1).height = 20;
+    ws.getRow(1).font = { bold: true };
+    ws.getRow(1).alignment = { vertical: "middle" };
     ws.getRow(1).commit();
 
     const projection = {
@@ -872,10 +891,10 @@ export async function exportarGestionesExcel(req, res) {
         throw err;
       }
       ws.addRow({
-        dni: textoSeguroExcel(item?.dni, 64),
+        dni: dniExportacionExcel(item?.dni),
         nombreDeudor: textoSeguroExcel(item?.nombreDeudor, 240),
-        fecha: fechaExportacionDMY(item?.fecha),
-        hora: normalizarHora(item?.hora || ""),
+        fecha: fechaExportacionExcel(item?.fecha),
+        hora: horaExportacionExcel(item?.hora),
         usuario: textoSeguroExcel(item?.usuario, 120),
         tipoContacto: textoSeguroExcel(item?.tipoContacto, 180),
         resultadoGestion: textoSeguroExcel(item?.resultadoGestion, 240),
@@ -3525,7 +3544,7 @@ export async function exportarAcuerdosGestionesExcel(req, res) {
       metadata: data.params,
       kind: "gestiones",
     });
-    const filename = nombreExcelAcuerdos("GESTIONES_CON_ACUERDO_COBRINA", data.params);
+    const filename = nombreExcelAcuerdos("ACUERDOS_COBRINA", data.params);
     return enviarExcel(res, buffer, filename);
   } catch (error) {
     if (error?.code === "CLIENT_ABORTED") return res.status(499).end();

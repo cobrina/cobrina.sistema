@@ -237,6 +237,7 @@ export async function resumenSupervision(req, res) {
     const acuerdosProyeccionDesdeUTC = new Date(selectedDesdeUTC.getTime() - 185 * 86400000);
     const hoyDesdeUTC = hoyDesde;
     const hoyHastaUTC = hoyHasta;
+    const ventanaCasosNuevosDesdeUTC = new Date(hoyDesdeUTC.getTime() - 90 * 86400000);
     const desdeNovedades = selectedDesdeUTC;
     const hastaNovedades = selectedHastaUTC;
 
@@ -252,7 +253,8 @@ export async function resumenSupervision(req, res) {
     const [pagosTres, objetivos, novedadesRRHH, gestionesActividadPeriodo,
       proyeccionesCaidas, proyeccionesManuales, colchonSinGestion, pendientesColchon, pendientesProyecciones, ultimaPago,
       ultimaGestionAcuerdo, ultimaGestion, ultimaGestionDia, fichadosAhora,
-      jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad, colchonResumenRows, ultimaColchon, ultimaNovedadRRHH, entidadesCatalogo, gestionesAcuerdoProyeccion] = await Promise.all([
+      jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad, colchonResumenRows, ultimaColchon, ultimaNovedadRRHH, entidadesCatalogo, gestionesAcuerdoProyeccion,
+      gestionesCasosDia, gestionesCasosPrevios90] = await Promise.all([
       Pago.find({ fechaPago: { $gte: desdeTres, $lte: hasta } })
         .select("dni monto fechaPago operadorId operadorUsername entidadId subCesionId")
         .lean()
@@ -272,7 +274,7 @@ export async function resumenSupervision(req, res) {
         fecha: { $gte: selectedDesdeUTC, $lte: selectedHastaUTC },
         borrado: { $ne: true },
         usuario: { $in: listaUsuariosControlados },
-      }).select("fecha hora usuario").lean().maxTimeMS(SUPERVISION_QUERY_MS),
+      }).select("fecha hora usuario dni").lean().maxTimeMS(SUPERVISION_QUERY_MS),
       Proyeccion.countDocuments({
         fechaPromesa: { $gte: desde, $lte: hasta },
         $or: [
@@ -366,6 +368,26 @@ export async function resumenSupervision(req, res) {
         [],
         erroresFuentes
       ),
+      consultaOpcional(
+        "Gestiones · casos del día",
+        ReporteGestion.aggregate([
+          { $match: { fecha: { $gte: hoyDesdeUTC, $lte: hoyHastaUTC }, borrado: { $ne: true }, usuario: { $in: listaUsuariosControlados }, dni: { $nin: [null, ""] } } },
+          { $group: { _id: { usuario: "$usuario", dni: "$dni" } } },
+          { $project: { _id: 0, usuario: "$_id.usuario", dni: "$_id.dni" } },
+        ]).option({ maxTimeMS: SUPERVISION_QUERY_MS }).allowDiskUse(true),
+        [],
+        erroresFuentes
+      ),
+      consultaOpcional(
+        "Gestiones · historial 90 días",
+        ReporteGestion.aggregate([
+          { $match: { fecha: { $gte: ventanaCasosNuevosDesdeUTC, $lt: hoyDesdeUTC }, borrado: { $ne: true }, usuario: { $in: listaUsuariosControlados }, dni: { $nin: [null, ""] } } },
+          { $group: { _id: { usuario: "$usuario", dni: "$dni" } } },
+          { $project: { _id: 0, usuario: "$_id.usuario", dni: "$_id.dni" } },
+        ]).option({ maxTimeMS: SUPERVISION_QUERY_MS }).allowDiskUse(true),
+        [],
+        erroresFuentes
+      ),
     ]);
 
     const diaCorteComparacion = Number(hoyClave.slice(8, 10));
@@ -455,6 +477,47 @@ export async function resumenSupervision(req, res) {
     );
     const actividadMensual = resumirActividadMensual(gestionesActividadPeriodo);
     const actividadHoy = actividadDeUsuarioEnFecha(gestionesActividadPeriodo, hoyClave);
+
+    const paresPrevios90 = new Set((gestionesCasosPrevios90 || []).map((item) =>
+      `${normalizeUsername(item?.usuario)}|${String(item?.dni || "").trim()}`
+    ));
+    const cuentasPorUsuarioHoy = new Map();
+    const nuevosPorUsuarioHoy = new Map();
+    let casosNuevosEquipoHoy = 0;
+    for (const item of gestionesCasosDia || []) {
+      const usuario = normalizeUsername(item?.usuario);
+      const dni = String(item?.dni || "").trim();
+      if (!usuario || !dni) continue;
+      cuentasPorUsuarioHoy.set(usuario, Number(cuentasPorUsuarioHoy.get(usuario) || 0) + 1);
+      if (!paresPrevios90.has(`${usuario}|${dni}`)) {
+        nuevosPorUsuarioHoy.set(usuario, Number(nuevosPorUsuarioHoy.get(usuario) || 0) + 1);
+        casosNuevosEquipoHoy += 1;
+      }
+    }
+    const gestionesPorOperadorHoy = empleadosControlados.map((empleado) => {
+      const username = normalizeUsername(empleado.username);
+      const actividad = actividadHoy.get(username) || {};
+      return {
+        empleadoId: empleado._id,
+        nombre: empleado.nombre || empleado.username,
+        username: empleado.username,
+        gestiones: Number(actividad.gestiones || 0),
+        cuentasTrabajadas: Number(cuentasPorUsuarioHoy.get(username) || 0),
+        casosNuevos: Number(nuevosPorUsuarioHoy.get(username) || 0),
+        primeraGestion: actividad.primeraGestion || "",
+        ultimaGestion: actividad.ultimaGestion || "",
+      };
+    });
+    const resumenGestionesHoy = {
+      totalGestiones: gestionesPorOperadorHoy.reduce((sum, item) => sum + Number(item.gestiones || 0), 0),
+      cuentasTrabajadas: Number((gestionesCasosDia || []).length),
+      casosNuevos: casosNuevosEquipoHoy,
+      operadoresConActividad: gestionesPorOperadorHoy.filter((item) => Number(item.gestiones || 0) > 0).length,
+      ventanaCasosNuevosDias: 90,
+      porOperador: gestionesPorOperadorHoy
+        .filter((item) => Number(item.gestiones || 0) > 0 || Number(item.cuentasTrabajadas || 0) > 0)
+        .sort((a, b) => b.gestiones - a.gestiones || b.casosNuevos - a.casosNuevos || String(a.username).localeCompare(String(b.username), "es")),
+    };
 
     const novedadesPorEmpleado = new Map();
     for (const novedad of novedadesRRHH) {
@@ -574,6 +637,13 @@ export async function resumenSupervision(req, res) {
         abiertoAlCorte: Boolean(breakConsideradoHoyRaw.abiertoAlCorte),
         corteDatosHora: breakConsideradoHoyRaw.corteDatosHora || "",
       } : null;
+      // "Trabajo efectivo" es una estimación operativa: parte de la franja entre
+      // primera y última gestión dentro del horario RRHH y descuenta el break flexible
+      // reconocido + los cortes visibles (>20 min) restantes. Las pausas de hasta
+      // 20 min se mantienen como continuidad normal, por eso no se presenta como reloj exacto.
+      const breakDescontadoHoyMin = Math.round(Number(breakConsideradoHoy?.breakConsideradoMin || 0));
+      const cortesDescontadosHoyMin = Math.round(bachesDetalleHoy.reduce((sum, intervalo) => sum + Number(intervalo.duracionMin || 0), 0));
+      const minutosTrabajoEfectivoHoy = Math.max(0, Math.round(minutosTrabajadosHoy - breakDescontadoHoyMin - cortesDescontadosHoyMin));
       const baches20Hoy = bachesDetalleHoy.length;
       // Se conserva el campo histórico +30 para no romper consumidores anteriores.
       const baches30Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > 30 && !intervalo.abiertoAlCorte).length;
@@ -692,6 +762,9 @@ export async function resumenSupervision(req, res) {
         ultimaGestionHoy: actividadDelDia.ultimaGestion || "",
         gestionesHoy: Number(actividadDelDia.gestiones || 0),
         minutosTrabajadosHoy,
+        minutosTrabajoEfectivoHoy,
+        breakDescontadoHoyMin,
+        cortesDescontadosHoyMin,
         minutosProgramadosHoy,
         minutosExigiblesHoy,
         diferenciaHoyMin,
@@ -1189,7 +1262,9 @@ export async function resumenSupervision(req, res) {
     const conGestionesHoy = actividadHoy.size;
 
     const duracionMs = Date.now() - iniciadoEnMs;
-    if (duracionMs > 3000) {
+    // Evita ensuciar la terminal en desarrollo normal. Si alguna vez necesitás
+    // medir consultas lentas de Supervisión, iniciar con SUPERVISION_DEBUG=true.
+    if (process.env.SUPERVISION_DEBUG === "true" && duracionMs > 3000) {
       console.warn(`[Supervisión] resumen ${hoyClave} preparado en ${duracionMs} ms`, {
         gestionesActividad: gestionesActividadPeriodo?.length || 0,
         acuerdosMango: gestionesAcuerdoProyeccion?.length || 0,
@@ -1214,6 +1289,7 @@ export async function resumenSupervision(req, res) {
         fuentesSinSnapshot: ["Colchón"],
       },
       evaluadoEn: hoyReal,
+      gestiones: resumenGestionesHoy,
       recaudacion: {
         ultimosTresMeses: recaudacionTresMeses,
         mesActual: totalActual,

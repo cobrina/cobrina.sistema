@@ -2839,6 +2839,12 @@ export const exportarProyeccionesExcel = async (req, res) => {
       { header: "Observaciones", key: "observaciones", width: 30 },
     ];
 
+    // Tipos reales de Excel: DNI numérico y fechas como fechas, no texto.
+    worksheet.getColumn("dni").numFmt = "0";
+    ["fechaPromesa", "fechaProximoLlamado", "creado", "ultimaModificacion", "ultimaGestion"].forEach((key) => {
+      worksheet.getColumn(key).numFmt = "dd/mm/yyyy";
+    });
+
     // Formato numérico de dinero
     const moneyFmt = "#,##0.00";
     ["importe", "importePagado"].forEach((k) => {
@@ -2846,6 +2852,27 @@ export const exportarProyeccionesExcel = async (req, res) => {
       col.numFmt = moneyFmt;
       col.alignment = { horizontal: "right" };
     });
+
+    const dniExcel = (value) => {
+      const digits = String(value ?? "").replace(/\D/g, "");
+      if (!digits) return null;
+      const number = Number(digits);
+      return Number.isSafeInteger(number) ? number : null;
+    };
+
+    // Para timestamps mantenemos exactamente el día calendario que ya muestra Cobrina
+    // en Buenos Aires; sólo cambiamos el TIPO de celda del Excel.
+    const timestampExcelFechaArgentina = (value) => {
+      if (!value) return null;
+      const d = value instanceof Date ? value : new Date(value);
+      if (Number.isNaN(d.getTime())) return null;
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "America/Argentina/Buenos_Aires",
+        year: "numeric", month: "2-digit", day: "2-digit",
+      }).formatToParts(d);
+      const v = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+      return new Date(Date.UTC(Number(v.year), Number(v.month) - 1, Number(v.day), 12, 0, 0, 0));
+    };
 
     // Normaliza a número (acepta "7,2" -> 7.2, etc.)
     const toNumber = (v) => {
@@ -2863,7 +2890,7 @@ export const exportarProyeccionesExcel = async (req, res) => {
     proyecciones.forEach((p) => {
       worksheet.addRow({
         creadoPor: p.empleadoId?.username || "-",
-        dni: p.dni,
+        dni: dniExcel(p.dni),
         nombreTitular: p.nombreTitular,
         importe: toNumber(p.importe),
         importePagado: toNumber(p.importePagado),
@@ -2874,15 +2901,41 @@ export const exportarProyeccionesExcel = async (req, res) => {
           p.subCesionId?._id || p.subCesionId,
           p.subCesionId?.nombre
         ),
-        fechaPromesa: formatearFecha(p.fechaPromesa),
-        fechaProximoLlamado: formatearFecha(p.fechaProximoLlamado),
-        creado: formatearFechaArgentina(p.creado),
-        ultimaModificacion: formatearFechaArgentina(p.ultimaModificacion),
+        fechaPromesa: toDateOnly(p.fechaPromesa),
+        fechaProximoLlamado: toDateOnly(p.fechaProximoLlamado),
+        creado: timestampExcelFechaArgentina(p.creado),
+        ultimaModificacion: timestampExcelFechaArgentina(p.ultimaModificacion),
         vecesTocada: p.vecesTocada ?? 0,
-        ultimaGestion: formatearFechaArgentina(p.ultimaGestion),
+        ultimaGestion: timestampExcelFechaArgentina(p.ultimaGestion),
         observaciones: p.observaciones,
       });
     });
+
+    worksheet.views = [{ state: "frozen", ySplit: 1 }];
+    worksheet.autoFilter = { from: "A1", to: `P${Math.max(1, proyecciones.length + 1)}` };
+    worksheet.getRow(1).height = 22;
+    worksheet.eachRow((row, rowNumber) => { if (rowNumber > 1) row.height = 18; });
+
+    const safeArchivo = (value) => String(value || "")
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^0-9A-Za-z._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 42);
+    const fechaArchivo = (value) => {
+      const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      return match ? `${match[3]}-${match[2]}-${match[1]}` : "";
+    };
+    const nombrePartes = ["proyecciones"];
+    if (_fechaDesde || _fechaHasta) {
+      const d = fechaArchivo(_fechaDesde);
+      const h = fechaArchivo(_fechaHasta);
+      nombrePartes.push(d && h ? `${d}_al_${h}` : (d || h));
+    }
+    if (usuarioId) {
+      const operador = proyecciones.find((row) => row?.empleadoId?.username)?.empleadoId?.username;
+      if (operador) nombrePartes.push(`operador-${safeArchivo(operador)}`);
+    }
+    if (idsSeleccionados.length) nombrePartes.push(`seleccion-${idsSeleccionados.length}`);
+    if (nombrePartes.length === 1) nombrePartes.push(fechaArchivo(fechaClaveArgentina()));
+    const nombreArchivo = `${nombrePartes.filter(Boolean).join("_")}.xlsx`;
 
     res.setHeader(
       "Content-Type",
@@ -2890,7 +2943,7 @@ export const exportarProyeccionesExcel = async (req, res) => {
     );
     res.setHeader(
       "Content-Disposition",
-      "attachment; filename=proyecciones.xlsx"
+      `attachment; filename="${nombreArchivo}"`
     );
 
     await workbook.xlsx.write(res);
@@ -3936,6 +3989,33 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
 
   acuerdos = await enriquecerAcuerdosMangoConPagosInformados(acuerdos);
 
+  // Orden solicitado desde la tabla. Se aplica después del cruce con pagos porque
+  // varias columnas (pagado válido, estado y último pago) son valores derivados.
+  const sortKey = String(req.query?.sortKey || "fecha");
+  const sortDir = String(req.query?.sortDir || "desc").toLowerCase() === "asc" ? 1 : -1;
+  const sortValue = (item, key) => {
+    switch (key) {
+      case "fecha": return new Date(item.fecha || 0).getTime() || 0;
+      case "estado": return String(item.estadoSeguimiento || "").toLocaleLowerCase("es");
+      case "titular": return `${String(item.nombreDeudor || "").toLocaleLowerCase("es")} ${String(item.dni || "")}`;
+      case "entidad": return `${String(item.entidadNumero || "").padStart(5, "0")} ${String(item.entidad || "").toLocaleLowerCase("es")}`;
+      case "tipoAcuerdo": return String(item.tipoAcuerdo || item.resultado || "").toLocaleLowerCase("es");
+      case "pagoEsperado": return Number(item.primerPago || item.anticipoMonto || item.montoCuota || 0);
+      case "montoTotalAcuerdo": return Number(item.montoTotalAcuerdo || 0);
+      case "pagadoValido": return Number(item.montoPagosValidos ?? item.montoPagosPosteriores ?? 0);
+      case "estadoPago": return String(item.estadoPagoAcuerdo || "").toLocaleLowerCase("es");
+      case "ultimoPago": return item.ultimoPagoValido ? new Date(item.ultimoPagoValido).getTime() : 0;
+      case "operador": return String(item.operador || item.usuario || "").toLocaleLowerCase("es");
+      default: return new Date(item.fecha || 0).getTime() || 0;
+    }
+  };
+  acuerdos.sort((a, b) => {
+    const av = sortValue(a, sortKey);
+    const bv = sortValue(b, sortKey);
+    if (typeof av === "number" && typeof bv === "number") return (av - bv) * sortDir;
+    return String(av).localeCompare(String(bv), "es", { numeric: true, sensitivity: "base" }) * sortDir;
+  });
+
   return {
     acuerdos,
     total: acuerdos.length,
@@ -4177,10 +4257,24 @@ export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
       { header: "Observación Mango", key: "observacion", width: 45 },
     ];
 
+    const horaExcelMango = (value) => {
+      const match = /^(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(String(value || ""));
+      if (!match) return null;
+      const hh = Math.min(23, Math.max(0, Number(match[1]) || 0));
+      const mm = Math.min(59, Math.max(0, Number(match[2]) || 0));
+      const ss = Math.min(59, Math.max(0, Number(match[3]) || 0));
+      return (hh * 3600 + mm * 60 + ss) / 86400;
+    };
+    const dniExcelMango = (value) => {
+      const digits = String(value ?? "").replace(/\D/g, "");
+      const number = Number(digits);
+      return digits && Number.isSafeInteger(number) ? number : null;
+    };
+
     acuerdos.forEach((item) => worksheet.addRow({
-      fecha: item.fecha ? new Date(item.fecha) : "",
-      hora: item.hora || "",
-      dni: item.dni || "",
+      fecha: toDateOnly(item.fecha),
+      hora: horaExcelMango(item.hora),
+      dni: dniExcelMango(item.dni),
       titular: item.nombreDeudor || "",
       entidadNumero: item.entidadNumero || "",
       entidad: item.entidad || "",
@@ -4207,6 +4301,8 @@ export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
       worksheet.getColumn(key).numFmt = '$ #,##0.00';
     });
     worksheet.getColumn("fecha").numFmt = "dd/mm/yyyy";
+    worksheet.getColumn("hora").numFmt = "hh:mm:ss";
+    worksheet.getColumn("dni").numFmt = "0";
     worksheet.getColumn("ultimoPago").numFmt = "dd/mm/yyyy";
     worksheet.autoFilter = { from: "A1", to: "T1" };
 

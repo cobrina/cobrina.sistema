@@ -288,6 +288,12 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
     const long = allGaps.filter((gap) => gap.duracionMin > PAUSA_BREVE_MAX);
     const critical = long.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN && !gap.abiertoAlCorte);
     const longTotal = long.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
+    const breakDescontadoMin = Math.round(Number(breakDetalle?.breakConsideradoMin || 0));
+    const cortesDescontadosMin = Math.round(longTotal);
+    // Estimación operativa de tiempo efectivo: franja laboral entre primera/última
+    // gestión menos el break flexible reconocido y los cortes visibles (>20 min).
+    // Las pausas de hasta 20 min continúan considerándose continuidad normal.
+    const trabajoEfectivoMin = Math.max(0, Math.round(workedMin - breakDescontadoMin - cortesDescontadosMin));
     const currentPauseMin = allGaps
       .filter((gap) => gap.origen === "abierto")
       .reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
@@ -373,6 +379,9 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
       ultimaGestion: hhmm(last),
       franjaTotalMin: Math.max(0, last - first),
       horasTrabajadasMin: Math.round(workedMin),
+      trabajoEfectivoMin,
+      breakDescontadoMin,
+      cortesDescontadosMin,
       gestiones: item.events.length,
       casos: uniqueCases,
       gestionesPorHora: workedMin > 0 ? item.events.length / (workedMin / 60) : 0,
@@ -449,6 +458,7 @@ function summarizeDaily(rows, employee, desde, hasta, novedades = []) {
   const expectedDays = esperadoPorDia.filter((item) => item.minutos > 0).length;
   const expectedTotal = esperadoPorDia.reduce((total, item) => total + item.minutos, 0);
   const worked = sum("horasTrabajadasMin");
+  const effectiveWorked = sum("trabajoEfectivoMin");
   const gestiones = sum("gestiones");
   const cases = sum("casos");
   const longTotal = sum("pausaLargaTotalMin");
@@ -459,6 +469,7 @@ function summarizeDaily(rows, employee, desde, hasta, novedades = []) {
     horasPrevistasMin: expectedTotal,
     franjaRegistradaMin: sum("franjaTotalMin"),
     horasTrabajadasMin: worked,
+    trabajoEfectivoMin: effectiveWorked,
     diferenciaPrevistaMin: expectedTotal ? worked - expectedTotal : null,
     gestiones,
     casos: cases,
@@ -882,7 +893,7 @@ export async function seguimientoOperadores(req, res) {
           jornadaPartida: horario.jornadaPartida, horarioModificado: horario.cambioHorario,
           licenciaMedica: horario.licenciaMedica, horarioLibre: horario.horarioLibre,
           novedadDia: novedadDia ? { tipo: novedadDia.tipo, descripcion: novedadDia.descripcion || "", etiqueta: etiquetaNovedad(novedadDia), justificado: Boolean(novedadDia.justificado || ["falta-justificada", "licencia-medica", "dia-estudio", "permiso"].includes(novedadDia.tipo)) } : null,
-          primeraGestion: "—", ultimaGestion: "—", franjaTotalMin: 0, horasTrabajadasMin: 0, gestiones: 0, casos: 0,
+          primeraGestion: "—", ultimaGestion: "—", franjaTotalMin: 0, horasTrabajadasMin: 0, trabajoEfectivoMin: 0, breakDescontadoMin: 0, cortesDescontadosMin: 0, gestiones: 0, casos: 0,
           gestionesPorHora: 0, pausasBreves: 0, pausasLargas: pausasDetalle.length, pausasCriticas: pausasDetalle.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN && !gap.abiertoAlCorte).length, pausaLargaTotalMin: pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0),
           pausaLargaPromedioMin: pausasDetalle.length ? Math.round(pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0) / pausasDetalle.length) : 0, pausaMaximaMin: pausasDetalle.length ? Math.max(...pausasDetalle.map((gap) => gap.duracionMin)) : 0, pausasDetalle,
           breakPermitidoMin: minutosBreakFlexiblePermitido(horario), breakConsiderado: null,
@@ -925,7 +936,8 @@ export async function seguimientoOperadores(req, res) {
     });
 
     const definitions = {
-      horasTrabajadas: "Tiempo de actividad calculado dentro de los bloques laborales efectivos de RRHH. En jornadas partidas, los espacios entre bloques quedan fuera del cálculo.",
+      horasTrabajadas: "Franja de actividad calculada dentro de los bloques laborales efectivos de RRHH. En jornadas partidas, los espacios entre bloques quedan fuera del cálculo.",
+      trabajoEfectivo: "Estimación de tiempo efectivamente activo: a la franja entre primera y última gestión se le descuenta el break flexible reconocido y los cortes visibles de más de 20 minutos. Las pausas de hasta 20 minutos se consideran continuidad normal.",
       franjaTotal: "Tiempo transcurrido entre la primera y la última gestión del día; puede incluir pausas.",
       pausaNormal: `Hasta ${PAUSA_NORMAL_MAX} minutos entre gestiones se considera continuidad normal.`,
       pausaBreve: `Más de ${PAUSA_NORMAL_MAX} y hasta ${PAUSA_BREVE_MAX} minutos se informa como pausa breve, pero permanece dentro del bloque de actividad.`,
