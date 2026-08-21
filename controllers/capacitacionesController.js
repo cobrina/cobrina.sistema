@@ -34,6 +34,11 @@ const TEMAS_GESTION = [
   ["REGISTRO_GESTION", "Registro de gestión"],
   ["BUSQUEDA_BARRIDO", "Búsqueda / barrido"],
   ["CALIDAD_COMUNICACION", "Calidad de comunicación"],
+  ["ORGANIZACION_TRABAJO", "Orden / organización"],
+  ["COLCHON_CUOTAS", "Colchón / cuotas"],
+  ["MASIVOS", "Trabajo de masivos"],
+  ["ESTRUCTURA_LLAMADA", "Estructura de llamada"],
+  ["OTRO", "Otro / aclaraciones"],
 ].map(([value, label]) => ({ value, label }));
 
 const HERRAMIENTAS = [
@@ -41,6 +46,8 @@ const HERRAMIENTAS = [
   ["CERTERO", "Certero"],
   ["INFORMES_DIGITALES", "Informes Digitales"],
   ["COBRINA", "Cobrina"],
+  ["EXCEL", "Excel / planilla"],
+  ["WHATSAPP", "WhatsApp / wa.me"],
   ["OTRA", "Otra herramienta"],
 ].map(([value, label]) => ({ value, label }));
 
@@ -56,7 +63,7 @@ const MATERIALES = [
   "Material teórico",
 ];
 
-const AREAS_DUDAS = ["MANGO", "CERTERO", "INFORMES_DIGITALES", "COBRINA", "PROCEDIMIENTO", "NEGOCIACION", "OTRO"];
+const AREAS_DUDAS = ["MANGO", "CERTERO", "INFORMES_DIGITALES", "COBRINA", "EXCEL", "WHATSAPP", "PROCEDIMIENTO", "NEGOCIACION", "OTRO"];
 const DERIVACIONES = ["SUPERVISION", "ADMINISTRACION", "SISTEMAS", "AUDITORIA", "JEFATURA", "OTRO"];
 
 function cleanText(value, max = 12000) {
@@ -120,9 +127,12 @@ function displayUsername(op) {
   return op?.nombre || op?.username || "—";
 }
 
-function calcDuration(horaInicio, horaFin, explicitValue = null) {
-  const explicit = Number(explicitValue);
-  if (Number.isFinite(explicit) && explicit >= 0) return Math.min(1440, Math.round(explicit));
+function calcDuration(horaInicio, horaFin, explicitValue) {
+  const hasExplicit = explicitValue !== undefined && explicitValue !== null && String(explicitValue).trim() !== "";
+  if (hasExplicit) {
+    const explicit = Number(explicitValue);
+    if (Number.isFinite(explicit) && explicit >= 0) return Math.min(1440, Math.round(explicit));
+  }
   const parse = (raw) => {
     const m = String(raw || "").match(/^(\d{2}):(\d{2})$/);
     return m ? Number(m[1]) * 60 + Number(m[2]) : null;
@@ -131,6 +141,12 @@ function calcDuration(horaInicio, horaFin, explicitValue = null) {
   const b = parse(horaFin);
   if (a == null || b == null || b < a) return 0;
   return b - a;
+}
+
+function resolvedDuration(item) {
+  const stored = Number(item?.duracionMinutos);
+  if (Number.isFinite(stored) && stored > 0) return Math.min(1440, Math.round(stored));
+  return calcDuration(item?.horaInicio, item?.horaFin);
 }
 
 async function resolveOperators(raw) {
@@ -340,6 +356,9 @@ async function applyPayload(doc, body, req, { mode = "save", preserveAssignment 
   if (["", "SI", "PARCIAL", "NO"].includes(reconoce)) doc.reconocePuntos = reconoce;
 
   if (body.observacionCapacitadora !== undefined) doc.observacionCapacitadora = cleanText(body.observacionCapacitadora, 12000);
+  if (body.fortalezas !== undefined) doc.fortalezas = cleanText(body.fortalezas, 8000);
+  if (body.puntoPrincipalReforzar !== undefined) doc.puntoPrincipalReforzar = cleanText(body.puntoPrincipalReforzar, 8000);
+  if (body.recomendacionSupervision !== undefined) doc.recomendacionSupervision = cleanText(body.recomendacionSupervision, 8000);
   if (body.hallazgos !== undefined) doc.hallazgos = cleanArray(body.hallazgos, 50, 4000);
   if (body.dudas !== undefined) doc.dudas = normalizeDudas(body.dudas);
   if (body.compromisos !== undefined) doc.compromisos = normalizeCompromisos(body.compromisos);
@@ -671,6 +690,51 @@ export async function agregarSeguimiento(req, res) {
   }
 }
 
+export async function editarSeguimiento(req, res) {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id) || !mongoose.Types.ObjectId.isValid(req.params.seguimientoId)) {
+      return res.status(400).json({ error: "ID inválido." });
+    }
+    const doc = await Capacitacion.findOne({ _id: req.params.id, borrado: { $ne: true } });
+    if (!doc) return res.status(404).json({ error: "Capacitación no encontrada." });
+    const seguimiento = doc.seguimientos.id(req.params.seguimientoId);
+    if (!seguimiento) return res.status(404).json({ error: "Seguimiento no encontrado." });
+
+    if (req.body?.fecha !== undefined) seguimiento.fecha = safeDate(req.body.fecha, seguimiento.fecha || new Date());
+    if (req.body?.resultado !== undefined) {
+      const resultado = String(req.body.resultado || "").toUpperCase();
+      if (!["MEJORO", "MEJORA_PARCIAL", "PERSISTE", "SIN_INFO"].includes(resultado)) {
+        return res.status(400).json({ error: "Elegí un resultado de seguimiento válido." });
+      }
+      seguimiento.resultado = resultado;
+    }
+    if (req.body?.observacion !== undefined) seguimiento.observacion = cleanText(req.body.observacion, 6000);
+
+    await doc.save();
+    return res.json({ ok: true, item: doc.toObject() });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || "No se pudo editar el seguimiento." });
+  }
+}
+
+export async function borrarSeguimiento(req, res) {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id) || !mongoose.Types.ObjectId.isValid(req.params.seguimientoId)) {
+      return res.status(400).json({ error: "ID inválido." });
+    }
+    const doc = await Capacitacion.findOne({ _id: req.params.id, borrado: { $ne: true } });
+    if (!doc) return res.status(404).json({ error: "Capacitación no encontrada." });
+    const seguimiento = doc.seguimientos.id(req.params.seguimientoId);
+    if (!seguimiento) return res.status(404).json({ error: "Seguimiento no encontrado." });
+
+    doc.seguimientos.pull({ _id: seguimiento._id });
+    await doc.save();
+    return res.json({ ok: true, item: doc.toObject() });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || "No se pudo eliminar el seguimiento." });
+  }
+}
+
 export async function borrar(req, res) {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "ID inválido." });
@@ -696,7 +760,7 @@ export async function resumen(req, res) {
     delete base.estado;
 
     const docs = await Capacitacion.find(base)
-      .select("operadores estado duracionMinutos temasGestion herramientas dudas requiereSeguimiento fechaSeguimiento seguimientos")
+      .select("operadores estado duracionMinutos horaInicio horaFin temasGestion herramientas dudas requiereSeguimiento fechaSeguimiento seguimientos")
       .lean();
 
     const operadores = new Set();
@@ -713,7 +777,7 @@ export async function resumen(req, res) {
 
       (doc.operadores || []).forEach((op) => operadores.add(op.username));
       realizadas += 1;
-      minutos += Number(doc.duracionMinutos) || 0;
+      minutos += resolvedDuration(doc);
       if (doc.estado === "REQUIERE_SEGUIMIENTO") seguimientosPeriodo += 1;
 
       for (const item of [...(doc.temasGestion || []), ...(doc.herramientas || [])]) {
@@ -887,7 +951,7 @@ function writeCapacitacionPDF(pdf, item, index = null) {
   drawSummaryRow(pdf, [
     { label: "Fecha", value: formatDateAR(item.fechaCapacitacion), accent: "#29154f" },
     { label: "Modalidad", value: pdfLabel(MODALIDAD_PDF_LABELS, item.modalidad, item.modalidad || "—"), accent: "#aa2cf4" },
-    { label: "Duración", value: formatMinutes(item.duracionMinutos), accent: "#00b968" },
+    { label: "Duración", value: resolvedDuration(item) ? formatMinutes(resolvedDuration(item)) : "—", accent: "#00b968" },
     { label: "Origen", value: pdfLabel(ORIGEN_PDF_LABELS, item.origen, item.origen || "—"), accent: "#ff00cc" },
   ]);
 
@@ -927,11 +991,18 @@ function writeCapacitacionPDF(pdf, item, index = null) {
     pdf.font("Helvetica").fontSize(7.1).fillColor("#4f4657").text(item.observacionCapacitadora, { lineGap: 1 });
   }
 
+  if (item.fortalezas || item.puntoPrincipalReforzar || item.recomendacionSupervision) {
+    sectionTitle(pdf, "Resumen para supervisión", "#00b968");
+    if (item.fortalezas) docLine(pdf, "Fortalezas observadas", item.fortalezas);
+    if (item.puntoPrincipalReforzar) docLine(pdf, "Punto principal a reforzar", item.puntoPrincipalReforzar);
+    if (item.recomendacionSupervision) docLine(pdf, "Sugerencia a supervisión", item.recomendacionSupervision);
+  }
+
   if (item.dudas?.length) {
     sectionTitle(pdf, "Dudas del operador", "#aa2cf4");
     item.dudas.forEach((d) => {
       ensurePage(pdf, 34);
-      pdf.font("Helvetica-Bold").fontSize(7.0).fillColor("#322247").text(`• ${pdfLabel({ MANGO: "Mango", CERTERO: "Certero", INFORMES_DIGITALES: "Informes Digitales", COBRINA: "Cobrina", PROCEDIMIENTO: "Procedimiento", NEGOCIACION: "Negociación", OTRO: "Otro" }, d.area, d.area)} · ${pdfLabel(RESOLUCION_DUDA_PDF_LABELS, d.resolucion, d.resolucion)}`);
+      pdf.font("Helvetica-Bold").fontSize(7.0).fillColor("#322247").text(`• ${pdfLabel({ MANGO: "Mango", CERTERO: "Certero", INFORMES_DIGITALES: "Informes Digitales", COBRINA: "Cobrina", EXCEL: "Excel / planilla", WHATSAPP: "WhatsApp / wa.me", PROCEDIMIENTO: "Procedimiento", NEGOCIACION: "Negociación", OTRO: "Otro" }, d.area, d.area)} · ${pdfLabel(RESOLUCION_DUDA_PDF_LABELS, d.resolucion, d.resolucion)}`);
       pdf.font("Helvetica").fontSize(7.0).fillColor("#51495a").text(d.duda);
       if (d.respuesta) pdf.font("Helvetica").fontSize(6.8).fillColor("#7b7187").text(`Respuesta / aclaración: ${d.respuesta}`);
     });
@@ -1068,7 +1139,7 @@ function writeCompactReportRow(pdf, item, index) {
   pdf.roundedRect(42, y, width, 61, 8).fillAndStroke("#ffffff", "#eae1f3");
   pdf.rect(42, y, 4, 61).fill(item.requiereSeguimiento ? "#ff00aa" : "#00b968");
   pdf.fillColor("#3b1ea6").font("Helvetica-Bold").fontSize(8.4).text(`${index}. ${item.operadores?.map(displayUsername).join(", ") || "Sin operador"}`, 54, y + 8, { width: 225, lineBreak: false });
-  pdf.fillColor("#776d82").font("Helvetica").fontSize(6.7).text(`${formatDateAR(item.fechaCapacitacion)} · ${pdfLabel(MODALIDAD_PDF_LABELS, item.modalidad, item.modalidad || "—")} · ${formatMinutes(item.duracionMinutos)}`, 54, y + 21, { width: 260, lineBreak: false });
+  pdf.fillColor("#776d82").font("Helvetica").fontSize(6.7).text(`${formatDateAR(item.fechaCapacitacion)} · ${pdfLabel(MODALIDAD_PDF_LABELS, item.modalidad, item.modalidad || "—")} · ${resolvedDuration(item) ? formatMinutes(resolvedDuration(item)) : "—"}`, 54, y + 21, { width: 260, lineBreak: false });
   pdf.fillColor("#5b5065").font("Helvetica").fontSize(6.8).text(truncatePdfText(temas.join(" · ") || "Sin temas registrados", 115), 54, y + 34, { width: width - 190, lineBreak: false });
   if (item.observacionCapacitadora) pdf.fillColor("#8b8096").font("Helvetica").fontSize(6.2).text(`Obs.: ${truncatePdfText(item.observacionCapacitadora, 95)}`, 54, y + 47, { width: width - 190, lineBreak: false });
   pdf.fillColor(item.requiereSeguimiento ? "#b22d61" : "#14745a").font("Helvetica-Bold").fontSize(6.8).text(follow, pdf.page.width - 180, y + 10, { width: 126, align: "right" });
@@ -1106,7 +1177,7 @@ export async function exportarPDF(req, res) {
     reportHeader(pdf, "Reporte de Capacitación y Seguimiento", `Período ${desde} a ${hasta} · generado ${formatDateAR(new Date())}`);
 
     const uniqueOps = new Set(items.flatMap((x) => (x.operadores || []).map((o) => o.username)));
-    const minutes = items.reduce((acc, x) => acc + (Number(x.duracionMinutos) || 0), 0);
+    const minutes = items.reduce((acc, x) => acc + resolvedDuration(x), 0);
     const followPending = items.filter((x) => x.requiereSeguimiento).length;
     const openQuestions = items.reduce((acc, x) => acc + (x.dudas || []).filter((d) => d.resolucion !== "RESUELTA").length, 0);
 
@@ -1131,7 +1202,7 @@ export async function exportarPDF(req, res) {
     sectionTitle(pdf, "Lectura general del período", "#29154f");
     const temas = countEntries(items, (item) => [...(item.temasGestion || []), ...(item.herramientas || [])].map((x) => x.label || x.clave));
     const recepciones = countEntries(items, (item) => RECEPCION_PDF_LABELS[item.recepcion] || "Sin registrar");
-    const dudas = countEntries(items, (item) => (item.dudas || []).map((d) => pdfLabel({ MANGO: "Mango", CERTERO: "Certero", INFORMES_DIGITALES: "Informes Digitales", COBRINA: "Cobrina", PROCEDIMIENTO: "Procedimiento", NEGOCIACION: "Negociación", OTRO: "Otro" }, d.area, d.area)));
+    const dudas = countEntries(items, (item) => (item.dudas || []).map((d) => pdfLabel({ MANGO: "Mango", CERTERO: "Certero", INFORMES_DIGITALES: "Informes Digitales", COBRINA: "Cobrina", EXCEL: "Excel / planilla", WHATSAPP: "WhatsApp / wa.me", PROCEDIMIENTO: "Procedimiento", NEGOCIACION: "Negociación", OTRO: "Otro" }, d.area, d.area)));
 
     const panelY = pdf.y + 3;
     const gap = 10;
@@ -1197,6 +1268,9 @@ export async function exportarExcel(req, res) {
       { header: "RECEPCIÓN", key: "recepcion", width: 18 },
       { header: "COMPRENSIÓN", key: "comprension", width: 20 },
       { header: "OBSERVACIÓN", key: "observacion", width: 60 },
+      { header: "FORTALEZAS", key: "fortalezas", width: 48 },
+      { header: "PUNTO A REFORZAR", key: "reforzar", width: 48 },
+      { header: "SUGERENCIA A SUPERVISIÓN", key: "supervision", width: 52 },
       { header: "DUDAS", key: "dudas", width: 55 },
       { header: "COMPROMISOS", key: "compromisos", width: 55 },
       { header: "SEGUIMIENTO", key: "seguimiento", width: 24 },
@@ -1211,10 +1285,13 @@ export async function exportarExcel(req, res) {
         origen: item.origen,
         motivos: (item.motivos || []).map((x) => labelFrom(MOTIVOS, x, x)).join(" | "),
         temas: [...(item.temasGestion || []), ...(item.herramientas || [])].map((x) => x.label || x.clave).join(" | "),
-        duracion: formatMinutes(item.duracionMinutos),
+        duracion: resolvedDuration(item) ? formatMinutes(resolvedDuration(item)) : "—",
         recepcion: item.recepcion,
         comprension: item.comprension,
         observacion: item.observacionCapacitadora,
+        fortalezas: item.fortalezas || "",
+        reforzar: item.puntoPrincipalReforzar || "",
+        supervision: item.recomendacionSupervision || "",
         dudas: (item.dudas || []).map((x) => `${x.area}: ${x.duda} [${x.resolucion}]`).join(" | "),
         compromisos: (item.compromisos || []).map((x) => `${x.texto} (${x.responsable})`).join(" | "),
         seguimiento: item.requiereSeguimiento ? `Sí${item.fechaSeguimiento ? ` · ${formatDateAR(item.fechaSeguimiento)}` : ""}` : "No",
@@ -1222,7 +1299,7 @@ export async function exportarExcel(req, res) {
       });
     }
     ws.views = [{ state: "frozen", ySplit: 1 }];
-    ws.autoFilter = { from: "A1", to: "N1" };
+    ws.autoFilter = { from: "A1", to: "Q1" };
     ws.eachRow((row, idx) => {
       row.alignment = { vertical: "top", wrapText: true };
       if (idx === 1) row.height = 24;

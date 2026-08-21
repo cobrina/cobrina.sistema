@@ -14,6 +14,8 @@ import {
   seguimientosPendientes,
   detalle,
   agregarSeguimiento,
+  editarSeguimiento,
+  borrarSeguimiento,
   borrar,
   resumen,
   exportarPDF,
@@ -44,6 +46,8 @@ router.post("/desde-auditoria/:auditoriaId", ...escritura, desdeAuditoria);
 router.post("/crear", ...escritura, crear);
 router.put("/:id", ...escritura, editar);
 router.post("/:id/seguimientos", ...escritura, agregarSeguimiento);
+router.put("/:id/seguimientos/:seguimientoId", ...escritura, editarSeguimiento);
+router.delete("/:id/seguimientos/:seguimientoId", ...escritura, borrarSeguimiento);
 router.delete("/:id", ...escritura, borrar);
 
 export default router;
