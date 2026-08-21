@@ -237,7 +237,6 @@ export async function resumenSupervision(req, res) {
     const acuerdosProyeccionDesdeUTC = new Date(selectedDesdeUTC.getTime() - 185 * 86400000);
     const hoyDesdeUTC = hoyDesde;
     const hoyHastaUTC = hoyHasta;
-    const ventanaCasosNuevosDesdeUTC = new Date(hoyDesdeUTC.getTime() - 90 * 86400000);
     const desdeNovedades = selectedDesdeUTC;
     const hastaNovedades = selectedHastaUTC;
 
@@ -253,8 +252,7 @@ export async function resumenSupervision(req, res) {
     const [pagosTres, objetivos, novedadesRRHH, gestionesActividadPeriodo,
       proyeccionesCaidas, proyeccionesManuales, colchonSinGestion, pendientesColchon, pendientesProyecciones, ultimaPago,
       ultimaGestionAcuerdo, ultimaGestion, ultimaGestionDia, fichadosAhora,
-      jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad, colchonResumenRows, ultimaColchon, ultimaNovedadRRHH, entidadesCatalogo, gestionesAcuerdoProyeccion,
-      gestionesCasosDia, gestionesCasosPrevios90] = await Promise.all([
+      jornadasSinSalida, ultimaAcuerdoManual, acuerdosManualesCantidad, colchonResumenRows, ultimaColchon, ultimaNovedadRRHH, entidadesCatalogo, gestionesAcuerdoProyeccion] = await Promise.all([
       Pago.find({ fechaPago: { $gte: desdeTres, $lte: hasta } })
         .select("dni monto fechaPago operadorId operadorUsername entidadId subCesionId")
         .lean()
@@ -274,7 +272,7 @@ export async function resumenSupervision(req, res) {
         fecha: { $gte: selectedDesdeUTC, $lte: selectedHastaUTC },
         borrado: { $ne: true },
         usuario: { $in: listaUsuariosControlados },
-      }).select("fecha hora usuario dni").lean().maxTimeMS(SUPERVISION_QUERY_MS),
+      }).select("fecha hora usuario").lean().maxTimeMS(SUPERVISION_QUERY_MS),
       Proyeccion.countDocuments({
         fechaPromesa: { $gte: desde, $lte: hasta },
         $or: [
@@ -368,26 +366,6 @@ export async function resumenSupervision(req, res) {
         [],
         erroresFuentes
       ),
-      consultaOpcional(
-        "Gestiones · casos del día",
-        ReporteGestion.aggregate([
-          { $match: { fecha: { $gte: hoyDesdeUTC, $lte: hoyHastaUTC }, borrado: { $ne: true }, usuario: { $in: listaUsuariosControlados }, dni: { $nin: [null, ""] } } },
-          { $group: { _id: { usuario: "$usuario", dni: "$dni" } } },
-          { $project: { _id: 0, usuario: "$_id.usuario", dni: "$_id.dni" } },
-        ]).option({ maxTimeMS: SUPERVISION_QUERY_MS }).allowDiskUse(true),
-        [],
-        erroresFuentes
-      ),
-      consultaOpcional(
-        "Gestiones · historial 90 días",
-        ReporteGestion.aggregate([
-          { $match: { fecha: { $gte: ventanaCasosNuevosDesdeUTC, $lt: hoyDesdeUTC }, borrado: { $ne: true }, usuario: { $in: listaUsuariosControlados }, dni: { $nin: [null, ""] } } },
-          { $group: { _id: { usuario: "$usuario", dni: "$dni" } } },
-          { $project: { _id: 0, usuario: "$_id.usuario", dni: "$_id.dni" } },
-        ]).option({ maxTimeMS: SUPERVISION_QUERY_MS }).allowDiskUse(true),
-        [],
-        erroresFuentes
-      ),
     ]);
 
     const diaCorteComparacion = Number(hoyClave.slice(8, 10));
@@ -478,22 +456,10 @@ export async function resumenSupervision(req, res) {
     const actividadMensual = resumirActividadMensual(gestionesActividadPeriodo);
     const actividadHoy = actividadDeUsuarioEnFecha(gestionesActividadPeriodo, hoyClave);
 
-    const paresPrevios90 = new Set((gestionesCasosPrevios90 || []).map((item) =>
-      `${normalizeUsername(item?.usuario)}|${String(item?.dni || "").trim()}`
-    ));
-    const cuentasPorUsuarioHoy = new Map();
-    const nuevosPorUsuarioHoy = new Map();
-    let casosNuevosEquipoHoy = 0;
-    for (const item of gestionesCasosDia || []) {
-      const usuario = normalizeUsername(item?.usuario);
-      const dni = String(item?.dni || "").trim();
-      if (!usuario || !dni) continue;
-      cuentasPorUsuarioHoy.set(usuario, Number(cuentasPorUsuarioHoy.get(usuario) || 0) + 1);
-      if (!paresPrevios90.has(`${usuario}|${dni}`)) {
-        nuevosPorUsuarioHoy.set(usuario, Number(nuevosPorUsuarioHoy.get(usuario) || 0) + 1);
-        casosNuevosEquipoHoy += 1;
-      }
-    }
+    // El panel principal conserva la misma consulta de Jornada que tenía antes
+    // de incorporar "Gestiones". Aquí sólo reutilizamos ese resumen en memoria.
+    // Cuentas trabajadas + casos nuevos se calculan aparte para no bloquear todo
+    // Supervisión con el cruce histórico de 90 días.
     const gestionesPorOperadorHoy = empleadosControlados.map((empleado) => {
       const username = normalizeUsername(empleado.username);
       const actividad = actividadHoy.get(username) || {};
@@ -502,21 +468,22 @@ export async function resumenSupervision(req, res) {
         nombre: empleado.nombre || empleado.username,
         username: empleado.username,
         gestiones: Number(actividad.gestiones || 0),
-        cuentasTrabajadas: Number(cuentasPorUsuarioHoy.get(username) || 0),
-        casosNuevos: Number(nuevosPorUsuarioHoy.get(username) || 0),
+        cuentasTrabajadas: null,
+        casosNuevos: null,
         primeraGestion: actividad.primeraGestion || "",
         ultimaGestion: actividad.ultimaGestion || "",
       };
     });
     const resumenGestionesHoy = {
       totalGestiones: gestionesPorOperadorHoy.reduce((sum, item) => sum + Number(item.gestiones || 0), 0),
-      cuentasTrabajadas: Number((gestionesCasosDia || []).length),
-      casosNuevos: casosNuevosEquipoHoy,
+      cuentasTrabajadas: null,
+      casosNuevos: null,
+      casosNuevosPendiente: true,
       operadoresConActividad: gestionesPorOperadorHoy.filter((item) => Number(item.gestiones || 0) > 0).length,
       ventanaCasosNuevosDias: 90,
       porOperador: gestionesPorOperadorHoy
-        .filter((item) => Number(item.gestiones || 0) > 0 || Number(item.cuentasTrabajadas || 0) > 0)
-        .sort((a, b) => b.gestiones - a.gestiones || b.casosNuevos - a.casosNuevos || String(a.username).localeCompare(String(b.username), "es")),
+        .filter((item) => Number(item.gestiones || 0) > 0)
+        .sort((a, b) => b.gestiones - a.gestiones || String(a.username).localeCompare(String(b.username), "es")),
     };
 
     const novedadesPorEmpleado = new Map();
@@ -1417,6 +1384,149 @@ export async function resumenSupervision(req, res) {
   } catch (error) {
     console.error("Panel supervisión:", error);
     const payload = { error: "No se pudo preparar el panel de supervisión" };
+    if (process.env.NODE_ENV !== "production") payload.detalle = String(error?.message || error || "Error desconocido");
+    return res.status(500).json(payload);
+  }
+}
+
+
+/**
+ * Gestiones del día + casos nuevos contra los 90 días previos.
+ *
+ * Está separado del resumen principal a propósito: en RDC el universo de
+ * gestiones es sensiblemente mayor que en PROCOB. Si este análisis tarda, sólo
+ * espera el bloque "Gestiones" y el resto de Supervisión permanece disponible.
+ *
+ * La consulta histórica NO agrupa todo el universo de 90 días. Primero toma los
+ * DNIs efectivamente trabajados en el día seleccionado y luego busca historia
+ * únicamente para esos DNIs. Eso reduce drásticamente el trabajo de Mongo.
+ */
+export async function resumenGestionesSupervision(req, res) {
+  const iniciadoEnMs = Date.now();
+  try {
+    const hoyRealClave = fechaClaveArgentina(new Date());
+    const fechaPedida = claveFechaCalendario(req.query?.fecha);
+    const fechaConsulta = fechaPedida && fechaPedida <= hoyRealClave ? fechaPedida : hoyRealClave;
+    const diaDesde = inicioDiaCalendarioUTC(fechaConsulta);
+    const diaHasta = finDiaCalendarioUTC(fechaConsulta);
+    const historialDesde = new Date(diaDesde.getTime() - 90 * 86400000);
+
+    const empleados = await Empleado.find({ isActive: { $ne: false } })
+      .select("username nombre role")
+      .sort({ username: 1 })
+      .lean();
+    const empleadosControlados = filtrarEmpleadosControlados(empleados);
+    const listaUsuariosControlados = [...usernamesControlados(empleados)];
+
+    const filasDia = await ReporteGestion.find({
+      fecha: { $gte: diaDesde, $lte: diaHasta },
+      borrado: { $ne: true },
+      usuario: { $in: listaUsuariosControlados },
+    })
+      .select("usuario dni hora")
+      .lean()
+      .maxTimeMS(120000);
+
+    const actividadDia = actividadDeUsuarioEnFecha(
+      filasDia.map((row) => ({ ...row, fecha: diaDesde })),
+      fechaConsulta
+    );
+
+    const paresHoy = new Set();
+    const dnisHoy = new Set();
+    const cuentasPorUsuario = new Map();
+    for (const item of filasDia || []) {
+      const usuario = normalizeUsername(item?.usuario);
+      const dni = String(item?.dni || "").trim();
+      if (!usuario || !dni) continue;
+      const par = `${usuario}|${dni}`;
+      if (paresHoy.has(par)) continue;
+      paresHoy.add(par);
+      dnisHoy.add(dni);
+      cuentasPorUsuario.set(usuario, Number(cuentasPorUsuario.get(usuario) || 0) + 1);
+    }
+
+    let historial = [];
+    if (dnisHoy.size) {
+      // El DNI tiene índice propio en ReporteGestion. Limitar el historial a los
+      // DNIs presentes HOY evita agrupar todas las gestiones de 90 días.
+      historial = await ReporteGestion.find({
+        fecha: { $gte: historialDesde, $lt: diaDesde },
+        borrado: { $ne: true },
+        usuario: { $in: listaUsuariosControlados },
+        dni: { $in: [...dnisHoy] },
+      })
+        .select("usuario dni")
+        .lean()
+        .maxTimeMS(120000);
+    }
+
+    const paresPrevios90 = new Set();
+    for (const item of historial || []) {
+      const usuario = normalizeUsername(item?.usuario);
+      const dni = String(item?.dni || "").trim();
+      if (usuario && dni) paresPrevios90.add(`${usuario}|${dni}`);
+    }
+
+    const nuevosPorUsuario = new Map();
+    let casosNuevos = 0;
+    for (const par of paresHoy) {
+      if (paresPrevios90.has(par)) continue;
+      const [usuario] = par.split("|");
+      nuevosPorUsuario.set(usuario, Number(nuevosPorUsuario.get(usuario) || 0) + 1);
+      casosNuevos += 1;
+    }
+
+    const porOperador = empleadosControlados.map((empleado) => {
+      const usernameNormalizado = normalizeUsername(empleado.username);
+      const actividad = actividadDia.get(usernameNormalizado) || {};
+      return {
+        empleadoId: empleado._id,
+        nombre: empleado.nombre || empleado.username,
+        username: empleado.username,
+        gestiones: Number(actividad.gestiones || 0),
+        cuentasTrabajadas: Number(cuentasPorUsuario.get(usernameNormalizado) || 0),
+        casosNuevos: Number(nuevosPorUsuario.get(usernameNormalizado) || 0),
+        primeraGestion: actividad.primeraGestion || "",
+        ultimaGestion: actividad.ultimaGestion || "",
+      };
+    })
+      .filter((item) => item.gestiones > 0 || item.cuentasTrabajadas > 0)
+      .sort((a, b) => b.gestiones - a.gestiones || b.casosNuevos - a.casosNuevos || String(a.username).localeCompare(String(b.username), "es"));
+
+    const duracionMs = Date.now() - iniciadoEnMs;
+    if (process.env.SUPERVISION_DEBUG === "true") {
+      console.warn(`[Supervisión] gestiones ${fechaConsulta} preparadas en ${duracionMs} ms`, {
+        filasDia: filasDia.length,
+        cuentasDia: paresHoy.size,
+        dnisDia: dnisHoy.size,
+        filasHistorialRevisadas: historial.length,
+      });
+    }
+
+    return res.json({
+      fechaConsulta,
+      resumen: {
+        totalGestiones: porOperador.reduce((sum, item) => sum + Number(item.gestiones || 0), 0),
+        cuentasTrabajadas: paresHoy.size,
+        casosNuevos,
+        casosNuevosPendiente: false,
+        operadoresConActividad: porOperador.filter((item) => item.gestiones > 0).length,
+        ventanaCasosNuevosDias: 90,
+        porOperador,
+      },
+      meta: {
+        duracionMs,
+        filasDia: filasDia.length,
+        cuentasDia: paresHoy.size,
+        dnisDia: dnisHoy.size,
+        filasHistorialRevisadas: historial.length,
+        ventanaDias: 90,
+      },
+    });
+  } catch (error) {
+    console.error("Gestiones de Supervisión:", error);
+    const payload = { error: "No se pudo preparar el análisis de gestiones" };
     if (process.env.NODE_ENV !== "production") payload.detalle = String(error?.message || error || "Error desconocido");
     return res.status(500).json(payload);
   }
