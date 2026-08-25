@@ -16,6 +16,7 @@ import {
 import { actividadDeUsuarioEnFecha } from "../utils/actividadGestiones.js";
 import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
 import { normalizeUsername } from "../config/roles.js";
+import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
 
 const TIME_ZONE = "America/Argentina/Buenos_Aires";
 const HORA_CIERRE_AUTOMATICO = "21:00";
@@ -591,6 +592,7 @@ export async function actualizarHorario(req, res) {
 
     if (!empleado) return res.status(404).json({ error: "Empleado no encontrado" });
 
+    invalidateSeguimientoCache();
     return res.json({ ok: true, empleado });
   } catch (error) {
     return res.status(error?.statusCode || 500).json({

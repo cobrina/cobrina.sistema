@@ -18,6 +18,7 @@ import {
   normalizeAssignableRole,
 } from "../config/roles.js";
 import { fechaClaveArgentina, inicioDiaCalendarioUTC, finDiaCalendarioUTC } from "../utils/fecha.util.js";
+import { invalidateSeguimientoCache } from "../controllers/reportesSeguimientoController.js";
 
 const router = express.Router();
 const gestoresUsuarios = [verifyToken, permitirModulos("usuarios")];
@@ -52,25 +53,47 @@ function empleadoSeguro(empleado) {
 
 
 function limpiarHorarioLaboral(raw = {}) {
-  const modalidad = String(raw?.modalidad || "fijo").toLowerCase() === "libre" ? "libre" : "fijo";
+  const recibido = raw && typeof raw === "object" ? raw : {};
+  const tieneConfiguracion = Object.keys(recibido).length > 0;
+  const modalidad = String(recibido?.modalidad || "fijo").toLowerCase() === "libre" ? "libre" : "fijo";
   if (modalidad === "libre") {
     return { modalidad: "libre", dias: [], entrada: "", salida: "", toleranciaMinutos: 0 };
   }
-  const dias = Array.isArray(raw?.dias)
-    ? [...new Set(raw.dias.map(Number).filter((dia) => Number.isInteger(dia) && dia >= 0 && dia <= 6))]
+
+  const dias = Array.isArray(recibido?.dias)
+    ? [...new Set(recibido.dias.map(Number).filter((dia) => Number.isInteger(dia) && dia >= 0 && dia <= 6))]
     : [1, 2, 3, 4, 5];
-  const entrada = String(raw?.entrada || "").trim();
-  const salida = String(raw?.salida || "").trim();
+  const entrada = String(recibido?.entrada || (tieneConfiguracion ? "" : "09:00")).trim();
+  const salida = String(recibido?.salida || (tieneConfiguracion ? "" : "18:00")).trim();
   const hhmm = /^([01]\d|2[0-3]):[0-5]\d$/;
-  if ((entrada && !hhmm.test(entrada)) || (salida && !hhmm.test(salida))) {
-    throw new Error("Horario laboral inválido");
+
+  if (!dias.length) {
+    const error = new Error("Seleccioná al menos un día laboral");
+    error.statusCode = 400;
+    throw error;
   }
+  if (!hhmm.test(entrada) || !hhmm.test(salida)) {
+    const error = new Error("Completá una hora de entrada y salida válida");
+    error.statusCode = 400;
+    throw error;
+  }
+  const [eh, em] = entrada.split(":").map(Number);
+  const [sh, sm] = salida.split(":").map(Number);
+  if (sh * 60 + sm <= eh * 60 + em) {
+    const error = new Error("La hora de salida debe ser posterior a la entrada");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const tolerancia = Number(recibido?.toleranciaMinutos ?? 10);
   return {
     modalidad: "fijo",
-    dias: dias.length ? dias : [1, 2, 3, 4, 5],
+    dias,
     entrada,
     salida,
-    toleranciaMinutos: Math.max(0, Math.min(180, Number(raw?.toleranciaMinutos ?? 10))),
+    toleranciaMinutos: Number.isFinite(tolerancia)
+      ? Math.max(0, Math.min(180, Math.round(tolerancia)))
+      : 10,
   };
 }
 
@@ -117,6 +140,7 @@ router.post(
       if (dupUser) return res.status(409).json({ error: "Ese nombre de usuario ya existe" });
       if (dupEmail) return res.status(409).json({ error: "Ese correo ya existe" });
 
+      const horarioLaboral = limpiarHorarioLaboral(req.body.horarioLaboral || {});
       const nuevo = await Empleado.create({
         username,
         nombre: String(req.body.nombre || "").trim(),
@@ -125,18 +149,24 @@ router.post(
         email,
         role,
         isActive: req.body.isActive !== false,
-        horarioLaboral: limpiarHorarioLaboral(req.body.horarioLaboral || {}),
+        horarioLaboral,
       });
+
+      // Leemos nuevamente desde Mongo para devolver exactamente lo que quedó
+      // persistido. Así la ficha y Jornada/Asistencia comparten una única fuente.
+      const persistido = await Empleado.findById(nuevo._id).select("-password").lean();
+      invalidateSeguimientoCache();
 
       return res.status(201).json({
         message: "✅ Empleado creado exitosamente",
-        empleado: empleadoSeguro(nuevo),
+        empleado: empleadoSeguro(persistido || nuevo),
       });
     } catch (error) {
       if (error?.message?.includes("super-admin") || error?.message === "Rol inválido") {
         return res.status(403).json({ error: error.message });
       }
       if (process.env.NODE_ENV === "development") console.error("❌ crear empleado:", error);
+      if (error?.statusCode === 400) return res.status(400).json({ error: error.message });
       if (error?.code === 11000) {
         const campo = Object.keys(error.keyPattern || {})[0] || "campo";
         return res.status(409).json({ error: `Duplicado: ${campo} ya está en uso` });
@@ -332,12 +362,14 @@ router.put(
         runValidators: true,
       }).select("-password");
 
+      if (req.body.horarioLaboral !== undefined) invalidateSeguimientoCache();
       return res.json({ message: "✅ Empleado actualizado", empleado: empleadoSeguro(actualizado) });
     } catch (error) {
       if (error?.message?.includes("super-admin") || error?.message === "Rol inválido") {
         return res.status(403).json({ error: error.message });
       }
       if (process.env.NODE_ENV === "development") console.error("❌ actualizar empleado:", error);
+      if (error?.statusCode === 400) return res.status(400).json({ error: error.message });
       if (error?.code === 11000) {
         const campo = Object.keys(error.keyPattern || {})[0] || "campo";
         return res.status(409).json({ error: `Duplicado: ${campo} ya está en uso` });

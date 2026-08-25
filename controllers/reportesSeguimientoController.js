@@ -441,20 +441,187 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
   return daily;
 }
 
-function summarizeDaily(rows, employee, desde, hasta, novedades = []) {
+function buildEmptyDailyRow(username, employee, fecha, novedadesEmpleado = [], evaluationContext = {}) {
+  const horario = horarioEfectivoParaFecha(employee, fecha, novedadesEmpleado);
+  const novedadDia = novedadLaboralDelDia(novedadesEmpleado, fecha);
+  const ausenciaJustificada = ["licencia-medica", "vacaciones", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
+  const esperado = ausenciaJustificada ? 0 : Number(horario.minutosEsperados || 0);
+  const todayKey = evaluationContext.todayKey || fechaClaveArgentina();
+  const startMin = minutesOfDay(horario.entrada);
+  const endMin = minutesOfDay(horario.salida);
+  const esHoy = fecha === todayKey;
+  const esPasado = fecha < todayKey;
+  const cutoffDisponible = esHoy && evaluationContext.sourceUpdatedToday && Number.isFinite(evaluationContext.dataCutoffMin);
+  const stateNowMin = cutoffDisponible ? Number(evaluationContext.dataCutoffMin) : Number(evaluationContext.viewNowMin ?? minutoActualArgentina());
+  const dayEnded = esPasado || (esHoy && Number.isFinite(endMin) && stateNowMin >= endMin);
+  const notStarted = esHoy && Number.isFinite(startMin) && stateNowMin < startMin;
+  const enDescanso = esHoy && minutoEnDescansoProgramado(stateNowMin, horario.bloquesHorario);
+  const openDesde = Number.isFinite(startMin) ? startMin : null;
+  const openGaps = cutoffDisponible && Number.isFinite(openDesde) && stateNowMin > openDesde
+    ? intervalosLaboralesSinDescanso([{ desdeMin: openDesde, hastaMin: stateNowMin }], horario)
+    : [];
+  const pausaAlCorteMin = openGaps.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
+  const pausaActualMin = evaluationContext.sourceFresh ? pausaAlCorteMin : 0;
+  const pausasDetalle = openGaps
+    .filter((gap) => Number(gap.duracionMin || 0) > PAUSA_BREVE_MAX)
+    .map((gap) => ({
+      desde: hhmm(gap.desdeMin),
+      hasta: hhmm(gap.hastaMin),
+      duracionMin: Math.round(Number(gap.duracionMin || 0)),
+      actual: Boolean(evaluationContext.sourceFresh && !dayEnded),
+      abiertoAlCorte: Boolean(!evaluationContext.sourceFresh && !dayEnded),
+      corteDatosHora: evaluationContext.dataCutoffLabel || hhmm(stateNowMin),
+    }));
+  const fuenteSinActualizarHoy = esHoy && !evaluationContext.sourceUpdatedToday;
+  const fuenteDesactualizada = esHoy && evaluationContext.sourceUpdatedToday && !evaluationContext.sourceFresh;
+  const estadoSinActividad = novedadDia
+    ? (novedadDia.tipo === "falta" ? "falta" : "novedad")
+    : fuenteSinActualizarHoy
+      ? "pendiente"
+      : esperado > 0
+        ? (notStarted
+            ? "pendiente"
+            : enDescanso
+              ? "descanso"
+              : dayEnded
+                ? "sin-actividad"
+                : evaluationContext.sourceFresh && pausaActualMin > PAUSA_CRITICA_MIN
+                  ? "alerta"
+                  : fuenteDesactualizada
+                    ? "en-curso"
+                    : "sin-actividad")
+        : "sin-horario";
+  const etiquetaSinActividad = novedadDia
+    ? etiquetaNovedad(novedadDia)
+    : fuenteSinActualizarHoy
+      ? "Gestiones sin actualización de hoy"
+      : esperado > 0
+        ? (notStarted
+            ? `Todavía no inicia · ${horario.entrada}`
+            : enDescanso
+              ? "Entre bloques de horario"
+              : dayEnded
+                ? "Ausente · sin gestiones"
+                : fuenteDesactualizada
+                  ? `Sin gestiones al corte ${evaluationContext.dataCutoffLabel || hhmm(stateNowMin)}`
+                  : `Sin gestiones desde ${horario.entrada} · ${humanMinutes(pausaActualMin)}`)
+        : (horario.horarioLibre ? "Horario libre" : "Sin horario esperado");
+
+  return {
+    username,
+    fecha,
+    horarioAsignado: horario.etiqueta,
+    bloquesHorario: horario.bloquesHorario || [],
+    jornadaPartida: horario.jornadaPartida,
+    horarioModificado: horario.cambioHorario,
+    licenciaMedica: horario.licenciaMedica,
+    horarioLibre: horario.horarioLibre,
+    novedadDia: novedadDia ? {
+      tipo: novedadDia.tipo,
+      descripcion: novedadDia.descripcion || "",
+      etiqueta: etiquetaNovedad(novedadDia),
+      justificado: Boolean(novedadDia.justificado || ["falta-justificada", "licencia-medica", "dia-estudio", "permiso"].includes(novedadDia.tipo)),
+    } : null,
+    primeraGestion: "—",
+    ultimaGestion: "—",
+    franjaTotalMin: 0,
+    horasTrabajadasMin: 0,
+    trabajoEfectivoMin: 0,
+    breakDescontadoMin: 0,
+    cortesDescontadosMin: 0,
+    gestiones: 0,
+    casos: 0,
+    gestionesPorHora: 0,
+    pausasBreves: 0,
+    pausasLargas: pausasDetalle.length,
+    pausasCriticas: pausasDetalle.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN && !gap.abiertoAlCorte).length,
+    pausaLargaTotalMin: pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0),
+    pausaLargaPromedioMin: pausasDetalle.length ? Math.round(pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0) / pausasDetalle.length) : 0,
+    pausaMaximaMin: pausasDetalle.length ? Math.max(...pausasDetalle.map((gap) => gap.duracionMin)) : 0,
+    pausasDetalle,
+    breakPermitidoMin: minutosBreakFlexiblePermitido(horario),
+    breakConsiderado: null,
+    pausaActualMin: Math.round(pausaActualMin),
+    pausaAlCorteMin: evaluationContext.sourceFresh ? 0 : Math.round(pausaAlCorteMin),
+    corteDatosHora: evaluationContext.dataCutoffLabel || "",
+    fuenteActualizada: !esHoy || Boolean(evaluationContext.sourceFresh),
+    bloques: [],
+    esperadoProgramadoMin: Number(horario.minutosEsperados || 0),
+    esperadoMin: esperado,
+    diferenciaPrevistaMin: esperado > 0 ? -esperado : null,
+    faltanMin: esperado,
+    extraMin: 0,
+    cumplimientoPct: esperado > 0 ? 0 : null,
+    estadoHoras: estadoSinActividad,
+    estadoHorasLabel: etiquetaSinActividad,
+    inicioTardioMin: 0,
+    inicioAnticipadoMin: 0,
+    finAnticipadoMin: 0,
+    concentracionDosHorasPct: 0,
+  };
+}
+
+function deudaHorarioEnRango(employee, novedades = [], clavesRango = []) {
+  if (employee?.horarioLaboral?.modalidad === "libre") return 0;
+  const diasBase = Array.isArray(employee?.horarioLaboral?.dias) && employee.horarioLaboral.dias.length
+    ? employee.horarioLaboral.dias.map(Number)
+    : [1, 2, 3, 4, 5];
+  const cambios = novedades.filter((item) => item?.tipo === "cambio-horario" && item?.estado !== "anulado");
+
+  return clavesRango.reduce((total, fechaClave) => {
+    const fecha = new Date(`${fechaClave}T12:00:00.000Z`);
+    if (!diasBase.includes(fecha.getUTCDay())) return total;
+    const cambio = cambios
+      .filter((item) => novedadCubreFecha(item, fechaClave))
+      .sort((a, b) => new Date(b.updatedAt || b.createdAt || b.fechaDesde) - new Date(a.updatedAt || a.createdAt || a.fechaDesde))[0];
+    if (!cambio || cambio.generaDeudaHoras === false) return total;
+    const deudaGuardada = Number(cambio.minutosDeudaPorDia);
+    if (Number.isFinite(deudaGuardada)) return total + Math.max(0, deudaGuardada);
+    return total + Math.max(0, Number(cambio.minutosBaseJornada || 0) - Number(cambio.minutosNuevaJornada || 0));
+  }, 0);
+}
+
+function summarizeDaily(rows, employee, desde, hasta, novedades = [], evaluationContext = {}) {
   const sum = (key) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
   const max = (key) => rows.reduce((value, row) => Math.max(value, Number(row[key] || 0)), 0);
   const longCount = sum("pausasLargas");
   const horarioLibre = employee?.horarioLaboral?.modalidad === "libre";
   const clavesRango = rangeDays(desde, hasta);
+  const todayKey = evaluationContext.todayKey || fechaClaveArgentina();
+  const nowMin = Number(evaluationContext.viewNowMin ?? minutoActualArgentina());
+  const activityDates = new Set(rows.filter((row) => Number(row?.gestiones || 0) > 0).map((row) => row.fecha));
+  const novedadesPorTipo = {
+    falta: 0,
+    "falta-justificada": 0,
+    "licencia-medica": 0,
+    vacaciones: 0,
+    "dia-estudio": 0,
+    permiso: 0,
+  };
+
   const esperadoPorDia = horarioLibre
     ? []
     : clavesRango.map((day) => {
         const horario = horarioEfectivoParaFecha(employee, day, novedades);
         const novedadDia = novedadLaboralDelDia(novedades, day);
+        if (novedadDia?.tipo && Object.prototype.hasOwnProperty.call(novedadesPorTipo, novedadDia.tipo)) {
+          novedadesPorTipo[novedadDia.tipo] += 1;
+        }
         const ausenciaJustificada = ["licencia-medica", "vacaciones", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
-        return { day, minutos: ausenciaJustificada ? 0 : Number(horario.minutosEsperados || 0) };
+        const minutosProgramados = Number(horario.minutosEsperados || 0);
+        const minutos = ausenciaJustificada ? 0 : minutosProgramados;
+        const endMin = minutesOfDay(horario.salida);
+        const jornadaCerrada = day < todayKey || (day === todayKey && Number.isFinite(endMin) && nowMin >= endMin);
+        return {
+          day,
+          minutos,
+          minutosProgramados,
+          novedadDia,
+          jornadaCerrada,
+          tuvoActividad: activityDates.has(day),
+        };
       });
+
   const expectedDays = esperadoPorDia.filter((item) => item.minutos > 0).length;
   const expectedTotal = esperadoPorDia.reduce((total, item) => total + item.minutos, 0);
   const worked = sum("horasTrabajadasMin");
@@ -462,10 +629,28 @@ function summarizeDaily(rows, employee, desde, hasta, novedades = []) {
   const gestiones = sum("gestiones");
   const cases = sum("casos");
   const longTotal = sum("pausaLargaTotalMin");
+  const diasConActividad = activityDates.size;
+  const diasSinActividad = horarioLibre ? 0 : esperadoPorDia.filter((item) => item.minutos > 0 && item.jornadaCerrada && !item.tuvoActividad).length;
+  const cambiosHorarioDias = clavesRango.filter((day) => novedades.some((item) => item?.tipo === "cambio-horario" && novedadCubreFecha(item, day))).length;
+  const llegadasTardeRRHH = clavesRango.filter((day) => novedades.some((item) => item?.tipo === "llegada-tarde" && novedadCubreFecha(item, day))).length;
+  const minutosDeudaHorario = deudaHorarioEnRango(employee, novedades, clavesRango);
+  const diasConBaches = rows.filter((row) => Number(row?.pausasLargas || 0) > 0).length;
+  const diasConBachesUrgentes = rows.filter((row) => Number(row?.pausasCriticas || 0) > 0).length;
+
   return {
     horarioLibre,
-    diasConActividad: rows.length,
+    diasConActividad,
     diasLaboralesEsperados: expectedDays,
+    diasSinActividad,
+    faltasSinJustificar: novedadesPorTipo.falta,
+    faltasJustificadas: novedadesPorTipo["falta-justificada"],
+    licenciasMedicas: novedadesPorTipo["licencia-medica"],
+    vacaciones: novedadesPorTipo.vacaciones,
+    diasEstudio: novedadesPorTipo["dia-estudio"],
+    permisos: novedadesPorTipo.permiso,
+    cambiosHorarioDias,
+    llegadasTardeRRHH,
+    minutosDeudaHorario,
     horasPrevistasMin: expectedTotal,
     franjaRegistradaMin: sum("franjaTotalMin"),
     horasTrabajadasMin: worked,
@@ -477,12 +662,14 @@ function summarizeDaily(rows, employee, desde, hasta, novedades = []) {
     pausasBreves: sum("pausasBreves"),
     pausasLargas: longCount,
     pausasCriticas: sum("pausasCriticas"),
+    diasConBaches,
+    diasConBachesUrgentes,
     pausaLargaTotalMin: longTotal,
     pausaLargaPromedioMin: longCount ? longTotal / longCount : 0,
     pausaMaximaMin: max("pausaMaximaMin"),
-    diasInicioTardio: rows.filter((row) => row.inicioTardioMin > 0).length,
-    diasFinAnticipado: rows.filter((row) => row.finAnticipadoMin > 0).length,
-    diasMenosCuatroHoras: rows.filter((row) => row.horasTrabajadasMin < 240).length,
+    diasInicioTardio: rows.filter((row) => Number(row.inicioTardioMin || 0) > TARDANZA_INICIO_VISIBLE_MIN).length,
+    diasFinAnticipado: rows.filter((row) => Number(row.finAnticipadoMin || 0) > 0).length,
+    diasMenosCuatroHoras: rows.filter((row) => Number(row.gestiones || 0) > 0 && row.horasTrabajadasMin < 240).length,
     diasActividadConcentrada: rows.filter((row) => row.concentracionDosHorasPct >= 50).length,
   };
 }
@@ -775,7 +962,7 @@ export async function seguimientoOperadores(req, res) {
       employeeIds.length
         ? NovedadRRHH.find({
             empleadoId: { $in: employeeIds },
-            tipo: { $in: ["cambio-horario", "licencia-medica", "vacaciones", "falta", "falta-justificada", "dia-estudio", "permiso"] },
+            tipo: { $in: ["cambio-horario", "licencia-medica", "vacaciones", "falta", "falta-justificada", "dia-estudio", "permiso", "llegada-tarde"] },
             estado: { $ne: "anulado" },
             fechaDesde: { $lte: hasta },
             $or: [{ fechaHasta: null }, { fechaHasta: { $gte: desde } }],
@@ -832,80 +1019,30 @@ export async function seguimientoOperadores(req, res) {
       const employee = employeeByUsername.get(username) || { username };
       const days = daily.filter((row) => row.username === username);
       const novedadesEmpleado = novedadesByEmployee.get(String(employee?._id || "")) || [];
-      const summary = summarizeDaily(days, employee, desde, hasta, novedadesEmpleado);
-      const alerts = buildActivityRecommendations(summary);
       let diasSalida = days;
-      if (!days.length && includeDailyRows && isSingleDayRange(desde, hasta)) {
-        const fecha = desde.toISOString().slice(0, 10);
-        const horario = horarioEfectivoParaFecha(employee, fecha, novedadesEmpleado);
-        const novedadDia = novedadLaboralDelDia(novedadesEmpleado, fecha);
-        const ausenciaJustificada = ["licencia-medica", "vacaciones", "falta-justificada", "dia-estudio", "permiso"].includes(novedadDia?.tipo);
-        const esperado = ausenciaJustificada ? 0 : Number(horario.minutosEsperados || 0);
-        const todayKey = evaluationContext.todayKey || fechaClaveArgentina();
-        const startMin = minutesOfDay(horario.entrada);
-        const endMin = minutesOfDay(horario.salida);
-        const esHoy = fecha === todayKey;
-        const cutoffDisponible = esHoy && evaluationContext.sourceUpdatedToday && Number.isFinite(evaluationContext.dataCutoffMin);
-        const stateNowMin = cutoffDisponible ? Number(evaluationContext.dataCutoffMin) : Number(evaluationContext.viewNowMin ?? minutoActualArgentina());
-        const dayEnded = fecha < todayKey || (esHoy && Number.isFinite(endMin) && stateNowMin >= endMin);
-        const notStarted = esHoy && Number.isFinite(startMin) && stateNowMin < startMin;
-        const enDescanso = esHoy && minutoEnDescansoProgramado(stateNowMin, horario.bloquesHorario);
-        const openDesde = Number.isFinite(startMin) ? startMin : null;
-        const openGaps = cutoffDisponible && Number.isFinite(openDesde) && stateNowMin > openDesde
-          ? intervalosLaboralesSinDescanso([{ desdeMin: openDesde, hastaMin: stateNowMin }], horario)
-          : [];
-        const pausaAlCorteMin = openGaps.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
-        const pausaActualMin = evaluationContext.sourceFresh ? pausaAlCorteMin : 0;
-        const pausasDetalle = openGaps.filter((gap) => Number(gap.duracionMin || 0) > PAUSA_BREVE_MAX).map((gap) => ({
-          desde: hhmm(gap.desdeMin),
-          hasta: hhmm(gap.hastaMin),
-          duracionMin: Math.round(Number(gap.duracionMin || 0)),
-          actual: Boolean(evaluationContext.sourceFresh && !dayEnded),
-          abiertoAlCorte: Boolean(!evaluationContext.sourceFresh && !dayEnded),
-          corteDatosHora: evaluationContext.dataCutoffLabel || hhmm(stateNowMin),
-        }));
-        const fuenteSinActualizarHoy = esHoy && !evaluationContext.sourceUpdatedToday;
-        const fuenteDesactualizada = esHoy && evaluationContext.sourceUpdatedToday && !evaluationContext.sourceFresh;
-        const estadoSinActividad = novedadDia
-          ? (novedadDia.tipo === "falta" ? "falta" : "novedad")
-          : fuenteSinActualizarHoy
-            ? "pendiente"
-            : esperado > 0
-              ? (notStarted ? "pendiente" : enDescanso ? "descanso" : dayEnded ? "sin-actividad" : evaluationContext.sourceFresh && pausaActualMin > PAUSA_CRITICA_MIN ? "alerta" : fuenteDesactualizada ? "en-curso" : "sin-actividad")
-              : "sin-horario";
-        const etiquetaSinActividad = novedadDia
-          ? etiquetaNovedad(novedadDia)
-          : fuenteSinActualizarHoy
-            ? "Gestiones sin actualización de hoy"
-            : esperado > 0
-              ? (notStarted
-                  ? `Todavía no inicia · ${horario.entrada}`
-                  : enDescanso
-                    ? "Entre bloques de horario"
-                    : dayEnded
-                      ? "Ausente · sin gestiones"
-                      : fuenteDesactualizada
-                        ? `Sin gestiones al corte ${evaluationContext.dataCutoffLabel || hhmm(stateNowMin)}`
-                        : `Sin gestiones desde ${horario.entrada} · ${humanMinutes(pausaActualMin)}`)
-              : (horario.horarioLibre ? "Horario libre" : "Sin horario esperado");
-        diasSalida = [{
-          username, fecha, horarioAsignado: horario.etiqueta, bloquesHorario: horario.bloquesHorario || [],
-          jornadaPartida: horario.jornadaPartida, horarioModificado: horario.cambioHorario,
-          licenciaMedica: horario.licenciaMedica, horarioLibre: horario.horarioLibre,
-          novedadDia: novedadDia ? { tipo: novedadDia.tipo, descripcion: novedadDia.descripcion || "", etiqueta: etiquetaNovedad(novedadDia), justificado: Boolean(novedadDia.justificado || ["falta-justificada", "licencia-medica", "dia-estudio", "permiso"].includes(novedadDia.tipo)) } : null,
-          primeraGestion: "—", ultimaGestion: "—", franjaTotalMin: 0, horasTrabajadasMin: 0, trabajoEfectivoMin: 0, breakDescontadoMin: 0, cortesDescontadosMin: 0, gestiones: 0, casos: 0,
-          gestionesPorHora: 0, pausasBreves: 0, pausasLargas: pausasDetalle.length, pausasCriticas: pausasDetalle.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN && !gap.abiertoAlCorte).length, pausaLargaTotalMin: pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0),
-          pausaLargaPromedioMin: pausasDetalle.length ? Math.round(pausasDetalle.reduce((sum, gap) => sum + gap.duracionMin, 0) / pausasDetalle.length) : 0, pausaMaximaMin: pausasDetalle.length ? Math.max(...pausasDetalle.map((gap) => gap.duracionMin)) : 0, pausasDetalle,
-          breakPermitidoMin: minutosBreakFlexiblePermitido(horario), breakConsiderado: null,
-          pausaActualMin: Math.round(pausaActualMin), pausaAlCorteMin: evaluationContext.sourceFresh ? 0 : Math.round(pausaAlCorteMin), corteDatosHora: evaluationContext.dataCutoffLabel || "", fuenteActualizada: !esHoy || Boolean(evaluationContext.sourceFresh), bloques: [], esperadoProgramadoMin: Number(horario.minutosEsperados || 0),
-          esperadoMin: esperado, diferenciaPrevistaMin: esperado > 0 ? -esperado : null, faltanMin: esperado, extraMin: 0,
-          cumplimientoPct: esperado > 0 ? 0 : null,
-          estadoHoras: estadoSinActividad,
-          estadoHorasLabel: etiquetaSinActividad,
-          inicioTardioMin: 0, inicioAnticipadoMin: 0, finAnticipadoMin: 0, concentracionDosHorasPct: 0,
-        }];
-        alerts.unshift('Sin actividad registrada en el rango seleccionado.');
+
+      if (includeDailyRows) {
+        const fechasObjetivo = usernames.length === 1
+          ? rangeDays(desde, hasta)
+          : [desde.toISOString().slice(0, 10)];
+        const existentes = new Set(days.map((day) => day.fecha));
+        const faltantes = fechasObjetivo
+          .filter((fecha) => {
+            if (existentes.has(fecha)) return false;
+            const novedadDia = novedadLaboralDelDia(novedadesEmpleado, fecha);
+            if (novedadDia) return true;
+            if (fecha > evaluationContext.todayKey) return false;
+            const horario = horarioEfectivoParaFecha(employee, fecha, novedadesEmpleado);
+            return Number(horario.minutosEsperados || 0) > 0 || isSingleDayRange(desde, hasta);
+          })
+          .map((fecha) => buildEmptyDailyRow(username, employee, fecha, novedadesEmpleado, evaluationContext));
+
+        diasSalida = [...days, ...faltantes]
+          .sort((a, b) => String(a.fecha || "").localeCompare(String(b.fecha || "")));
       }
+
+      const summary = summarizeDaily(diasSalida, employee, desde, hasta, novedadesEmpleado, evaluationContext);
+      const alerts = buildActivityRecommendations(summary);
       return {
         username,
         nombre: employee.nombre || "",
@@ -921,6 +1058,11 @@ export async function seguimientoOperadores(req, res) {
           jornadaPartidaNueva: Boolean(novedad.jornadaPartidaNueva),
           horaEntradaSegundaNueva: novedad.horaEntradaSegundaNueva || "",
           horaSalidaSegundaNueva: novedad.horaSalidaSegundaNueva || "",
+          generaDeudaHoras: novedad.generaDeudaHoras !== false,
+          minutosDeudaPorDia: Number(novedad.minutosDeudaPorDia || 0),
+          minutosBaseJornada: Number(novedad.minutosBaseJornada || 0),
+          minutosNuevaJornada: Number(novedad.minutosNuevaJornada || 0),
+          justificado: Boolean(novedad.justificado),
           descripcion: novedad.descripcion || "",
         })),
         resumen: summary,

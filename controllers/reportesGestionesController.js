@@ -13,7 +13,6 @@ import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
 import Pago from "../models/Pago.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
-import { invalidateCalidadCache } from "./calidadGestionesController.js";
 import { ROLES, getEffectiveRole } from "../config/roles.js";
 import { sincronizarContactados } from "../services/contactadosService.js";
 import {
@@ -529,7 +528,6 @@ export async function cargar(req, res) {
     if (insertados > 0 || reemplazarTodo) {
       invalidateReportesAnalyticsCache();
       invalidateSeguimientoCache();
-      invalidateCalidadCache();
       // No bloquea la importación: Contactados se actualiza inmediatamente
       // y además tiene sincronización periódica como respaldo.
       sincronizarContactados().catch(() => {});
@@ -1149,7 +1147,6 @@ export async function limpiar(req, res) {
     if ((r.deletedCount || 0) > 0) {
       invalidateReportesAnalyticsCache();
       invalidateSeguimientoCache();
-      invalidateCalidadCache();
     }
     return res.json({ ok: true, borrados: r.deletedCount || 0 });
   } catch (e) {

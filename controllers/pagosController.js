@@ -1518,6 +1518,27 @@ export const updatePago = async (req, res) => {
 
     // solo campos editables (no tocamos estado ni la clave de negocio ni el ID)
     const camposEditables = { ...req.body };
+
+    // El dueño/operador del pago SÍ es editable. Se valida contra Empleados y
+    // se mantienen sincronizados username + ObjectId para que Supervisión,
+    // rankings y reportes atribuyan el cobro a la persona correcta.
+    if (camposEditables.operadorUsername !== undefined) {
+      const operadorUsername = String(camposEditables.operadorUsername || "").trim().toLowerCase();
+      if (!operadorUsername) {
+        return res.status(400).json({ ok: false, msg: "Elegí el dueño del pago" });
+      }
+      const operador = await Empleado.findOne({ username: operadorUsername, isActive: { $ne: false } })
+        .select("_id username")
+        .lean();
+      if (!operador) {
+        return res.status(400).json({ ok: false, msg: "El operador seleccionado no existe o está inactivo" });
+      }
+      camposEditables.operadorUsername = operador.username;
+      camposEditables.operadorId = operador._id;
+    } else {
+      delete camposEditables.operadorId;
+    }
+
     delete camposEditables.estado;
     delete camposEditables.dni;
     delete camposEditables.entidadId;
@@ -1537,6 +1558,13 @@ export const updatePago = async (req, res) => {
 
     if (!pago)
       return res.status(404).json({ ok: false, msg: "Pago no encontrado" });
+
+    await pago.populate([
+      { path: "subCesionId", select: "nombre" },
+      { path: "operadorId", select: "username nombre" },
+      { path: "creadoPor", select: "username nombre" },
+      { path: "modificadoPor", select: "username nombre" },
+    ]);
 
     res.json({ ok: true, pago });
   } catch (error) {

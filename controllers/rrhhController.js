@@ -8,7 +8,15 @@ import Empleado from "../models/Empleado.js";
 import Pago from "../models/Pago.js";
 import Entidad from "../models/Entidad.js";
 import SubCesion from "../models/SubCesion.js";
-import { novedadSolapaRango, rangoMesLocal } from "../utils/calculoAsistencia.js";
+import {
+  bloquesHorarioDesdeNovedad,
+  clavesEntre,
+  minutosDeHorario,
+  minutosEsperadosBloques,
+  novedadCubreFecha,
+  novedadSolapaRango,
+  rangoMesLocal,
+} from "../utils/calculoAsistencia.js";
 import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
 import { normalizarEntidadNumero } from "../utils/normalizacionNegocio.js";
 import { ROLES, normalizeStoredRole, normalizeUsername } from "../config/roles.js";
@@ -107,6 +115,48 @@ const parseDiasLaborales = (value) => {
 const horaValida = (value) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || "").trim());
 
 const fechaFinNoAnterior = (desde, hasta) => !hasta || hasta >= desde;
+
+function calcularDeudaCambioHorario(empleado, datos = {}) {
+  const base = empleado?.horarioLaboral || {};
+  const horarioLibre = base.modalidad === "libre";
+  const minutosBaseJornada = horarioLibre ? 0 : minutosDeHorario(base.entrada, base.salida);
+  const minutosNuevaJornada = minutosEsperadosBloques(bloquesHorarioDesdeNovedad(datos, {}));
+  const generaDeudaHoras = datos.generaDeudaHoras !== false;
+  return {
+    generaDeudaHoras,
+    minutosBaseJornada,
+    minutosNuevaJornada,
+    minutosDeudaPorDia: generaDeudaHoras && !horarioLibre
+      ? Math.max(0, minutosBaseJornada - minutosNuevaJornada)
+      : 0,
+  };
+}
+
+function deudaPorDiaCambioHistorico(cambio, empleado) {
+  if (!cambio || cambio.generaDeudaHoras === false || empleado?.horarioLaboral?.modalidad === "libre") return 0;
+  if (Number.isFinite(Number(cambio.minutosDeudaPorDia))) {
+    return Math.max(0, Number(cambio.minutosDeudaPorDia));
+  }
+  const base = minutosDeHorario(empleado?.horarioLaboral?.entrada, empleado?.horarioLaboral?.salida);
+  const nuevo = minutosEsperadosBloques(bloquesHorarioDesdeNovedad(cambio, {}));
+  return Math.max(0, base - nuevo);
+}
+
+function minutosDeudaCambioEnMes(empleado, cambios = [], desdeClave, hastaClave) {
+  if (empleado?.horarioLaboral?.modalidad === "libre") return 0;
+  const diasBase = Array.isArray(empleado?.horarioLaboral?.dias) && empleado.horarioLaboral.dias.length
+    ? empleado.horarioLaboral.dias.map(Number)
+    : [1, 2, 3, 4, 5];
+
+  return clavesEntre(desdeClave, hastaClave).reduce((total, fechaClave) => {
+    const fecha = new Date(`${fechaClave}T12:00:00.000Z`);
+    if (!diasBase.includes(fecha.getUTCDay())) return total;
+    const cambio = cambios
+      .filter((item) => item.tipo === "cambio-horario" && novedadCubreFecha(item, fechaClave))
+      .sort((a, b) => new Date(b.updatedAt || b.createdAt || b.fechaDesde) - new Date(a.updatedAt || a.createdAt || a.fechaDesde))[0];
+    return total + deudaPorDiaCambioHistorico(cambio, empleado);
+  }, 0);
+}
 
 function validarDatosNovedad(tipo, body, fechaDesde, fechaHasta) {
   if (!fechaFinNoAnterior(fechaDesde, fechaHasta)) {
@@ -208,6 +258,16 @@ export async function crearNovedad(req, res) {
     const horarioNuevo = tipo === "cambio-horario"
       ? `${entradaNueva}-${salidaNueva}${jornadaPartidaNueva ? ` / ${entradaSegundaNueva}-${salidaSegundaNueva}` : ""}`
       : String(req.body.horarioNuevo || "");
+    const deudaHorario = tipo === "cambio-horario"
+      ? calcularDeudaCambioHorario(empleado, {
+          ...req.body,
+          horaEntradaNueva: entradaNueva,
+          horaSalidaNueva: salidaNueva,
+          jornadaPartidaNueva,
+          horaEntradaSegundaNueva: entradaSegundaNueva,
+          horaSalidaSegundaNueva: salidaSegundaNueva,
+        })
+      : { generaDeudaHoras: false, minutosBaseJornada: 0, minutosNuevaJornada: 0, minutosDeudaPorDia: 0 };
 
     const item = await NovedadRRHH.create({
       empleadoId,
@@ -231,6 +291,7 @@ export async function crearNovedad(req, res) {
       toleranciaMinutosNueva: tipo === "cambio-horario"
         ? Math.max(0, Math.min(180, Number(req.body.toleranciaMinutosNueva ?? empleado.horarioLaboral?.toleranciaMinutos ?? 10)))
         : 10,
+      ...deudaHorario,
       minutosTarde: Number(req.body.minutosTarde || 0),
       justificado: Boolean(req.body.justificado || ["falta-justificada", "licencia-medica", "vacaciones"].includes(tipo)),
       descripcion,
@@ -291,6 +352,14 @@ export async function actualizarNovedad(req, res) {
       update.horaSalidaSegundaNueva = partida ? String(datosCombinados.horaSalidaSegundaNueva || "").trim() : "";
       update.horarioNuevo = `${datosCombinados.horaEntradaNueva}-${datosCombinados.horaSalidaNueva}${partida ? ` / ${update.horaEntradaSegundaNueva}-${update.horaSalidaSegundaNueva}` : ""}`;
       update.toleranciaMinutosNueva = Math.max(0, Math.min(180, Number(datosCombinados.toleranciaMinutosNueva ?? 10)));
+
+      const empleadoCambioId = update.empleadoId || actual.empleadoId;
+      const empleadoCambio = await Empleado.findById(empleadoCambioId).select("_id horarioLaboral").lean();
+      if (!empleadoCambio) return res.status(404).json({ error: "Empleado no encontrado" });
+      update.horarioAnterior = `${empleadoCambio.horarioLaboral?.entrada || ""}-${empleadoCambio.horarioLaboral?.salida || ""}`;
+      Object.assign(update, calcularDeudaCambioHorario(empleadoCambio, { ...datosCombinados, ...update }));
+    } else {
+      Object.assign(update, { generaDeudaHoras: false, minutosBaseJornada: 0, minutosNuevaJornada: 0, minutosDeudaPorDia: 0 });
     }
 
     const item = await NovedadRRHH.findByIdAndUpdate(req.params.id, update, {
@@ -672,6 +741,7 @@ export async function importarHorariosMasivos(req, res) {
       }, { runValidators: true });
       actualizados += 1;
     }
+    if (actualizados > 0) invalidateSeguimientoCache();
     return res.json({ ok: true, actualizados, errores, totalFilas: filas.length });
   } catch (error) {
     console.error("RRHH importar horarios:", error);
@@ -864,6 +934,12 @@ export async function resumenEmpleados(req, res) {
       const adelantosEmp = adelantos.filter((a) => String(a.empleadoId) === id);
       const montoAdelantos = adelantosEmp.reduce((sum, a) => sum + Number(a.monto || 0), 0);
       const montoObjetivo = Number(objetivo?.montoObjetivo || 0);
+      const minutosDeudaHorario = minutosDeudaCambioEnMes(
+        empleado,
+        novedadesEmp.filter((n) => n.tipo === "cambio-horario"),
+        desdeClave,
+        hastaClave
+      );
       return {
         empleado,
         recaudacion,
@@ -885,6 +961,7 @@ export async function resumenEmpleados(req, res) {
         licenciasMedicas: novedadesEmp.filter((n) => n.tipo === "licencia-medica").length,
         vacaciones: novedadesEmp.filter((n) => n.tipo === "vacaciones").length,
         cambiosHorario: novedadesEmp.filter((n) => n.tipo === "cambio-horario").length,
+        minutosDeudaHorario,
         adelantosCantidad: puedeVerAdelantos ? adelantosEmp.length : null,
         adelantosMonto: puedeVerAdelantos ? montoAdelantos : null,
       };

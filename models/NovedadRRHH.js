@@ -86,6 +86,13 @@ const NovedadRRHHSchema = new mongoose.Schema(
       match: [/^$|^([01]\d|2[0-3]):[0-5]\d$/, "Hora de segunda salida inválida"],
     },
     toleranciaMinutosNueva: { type: Number, default: 10, min: 0, max: 180 },
+    // Si la excepción acorta la jornada base, la diferencia puede quedar
+    // registrada como tiempo a recuperar sin alterar el cálculo operativo
+    // del horario efectivo usado por los reportes.
+    generaDeudaHoras: { type: Boolean, default: true },
+    minutosBaseJornada: { type: Number, default: 0, min: 0 },
+    minutosNuevaJornada: { type: Number, default: 0, min: 0 },
+    minutosDeudaPorDia: { type: Number, default: 0, min: 0 },
     minutosTarde: { type: Number, default: 0, min: 0 },
     justificado: { type: Boolean, default: false },
     descripcion: { type: String, required: true, trim: true, maxlength: 3000 },

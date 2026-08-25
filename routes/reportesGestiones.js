@@ -3,7 +3,6 @@ import { Router } from "express";
 import verifyToken from "../middleware/verifyToken.js";
 import permitirModulos from "../middleware/permitirModulos.js";
 import { seguimientoOperadores, seguimientoAuditorias } from "../controllers/reportesSeguimientoController.js";
-import { calidadGestiones } from "../controllers/calidadGestionesController.js";
 
 import {
   ping,
@@ -65,7 +64,6 @@ router.get("/comparativo", guard, comparativo);
 router.get("/analytics/resumen", guard, analyticsResumen);
 router.get("/analytics/seguimiento-operadores", guard, seguimientoOperadores);
 router.get("/analytics/seguimiento-auditorias", guard, seguimientoAuditorias);
-router.get("/analytics/calidad-gestiones", guard, calidadGestiones);
 router.get("/analytics/resumen-dia", guard, resumenDia);
 router.get("/analytics/actividad-rango", guard, actividadRango);
 router.get("/analytics/calendario-mes", guard, calendarioMes);

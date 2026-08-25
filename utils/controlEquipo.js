@@ -57,6 +57,11 @@ export function filtrarFilasReportesControl(
 
 export function esEmpleadoControlTiempos(empleado = {}) {
   const username = normalizeUsername(empleado?.username);
+  const rolEfectivo = getEffectiveRole(empleado?.role, empleado?.username);
+  // Defensa puntual: abernat pertenece a Administración y no debe entrar en Jornada/Asistencia,
+  // incluso si un registro histórico tuviera el rol mal cargado.
+  if (username === "abernat") return false;
+  if ([ROLES.ADMINISTRACION, ROLES.SUPERVISOR, ROLES.SUPER_ADMIN].includes(rolEfectivo)) return false;
   return esEmpleadoControlado(empleado) && !USUARIOS_NO_CONTROL_TIEMPOS.has(username);
 }
 
