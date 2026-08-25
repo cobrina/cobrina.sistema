@@ -17,6 +17,7 @@ import {
   // ✅ Analytics
   analyticsResumen,          // NUEVO
   resumenDia,                // NUEVO
+  actividadRango,            // pulso operativo diario
   calendarioMes,             // NUEVO
   calendarioMesMatriz,       // NUEVO
   asistenciaMes,             // V16 · calendario + matriz en una sola consulta
@@ -66,6 +67,7 @@ router.get("/analytics/seguimiento-operadores", guard, seguimientoOperadores);
 router.get("/analytics/seguimiento-auditorias", guard, seguimientoAuditorias);
 router.get("/analytics/calidad-gestiones", guard, calidadGestiones);
 router.get("/analytics/resumen-dia", guard, resumenDia);
+router.get("/analytics/actividad-rango", guard, actividadRango);
 router.get("/analytics/calendario-mes", guard, calendarioMes);
 router.get("/analytics/calendario-matriz", guard, calendarioMesMatriz);
 router.get("/analytics/asistencia-mes", guard, asistenciaMes);

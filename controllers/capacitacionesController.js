@@ -5,9 +5,32 @@ import Capacitacion from "../models/Capacitacion.js";
 import AuditoriaContactoDirecto from "../models/AuditoriaContactoDirecto.js";
 import Empleado from "../models/Empleado.js";
 import AgendaItem from "../models/AgendaItem.js";
+import { getEffectiveRole, ROLES } from "../config/roles.js";
 
 const ESTADOS_ACTIVOS = ["PENDIENTE", "EN_CAPACITACION"];
 const ESTADOS_REALIZADOS = ["REALIZADA", "REQUIERE_SEGUIMIENTO", "CERRADA"];
+const ROLES_RESPONSABLE_CAPACITACION = new Set([
+  ROLES.CAPACITADORA,
+  ROLES.ADMINISTRACION,
+  ROLES.SUPERVISOR,
+  ROLES.SUPER_ADMIN,
+]);
+
+async function resolveResponsableCapacitacion(rawUsername, fallbackUsername = "") {
+  const username = cleanText(rawUsername || fallbackUsername, 120).toLowerCase();
+  if (!username) throw new Error("Elegí una persona responsable de la capacitación.");
+
+  const empleado = await Empleado.findOne({ username, isActive: { $ne: false } })
+    .select("username role")
+    .lean();
+  if (!empleado) throw new Error("La persona responsable seleccionada no está activa.");
+
+  const role = getEffectiveRole(empleado.role, empleado.username);
+  if (!ROLES_RESPONSABLE_CAPACITACION.has(role)) {
+    throw new Error("La capacitación solo puede asignarse a un mando activo, no a un operador.");
+  }
+  return String(empleado.username || username).toLowerCase();
+}
 
 const MOTIVOS = [
   ["AUDITORIA_CALIDAD", "Auditoría de calidad"],
@@ -215,7 +238,7 @@ async function sincronizarAgendaCapacitacion(doc, req, rawAgenda) {
 
   const operatorNames = (doc.operadores || []).map((op) => op?.nombre || op?.username).filter(Boolean).join(", ");
   const trainer = empleados.find((e) => String(e.username || "").toLowerCase() === String(doc.capacitadoraUsername || "").toLowerCase());
-  const trainerLabel = trainer?.nombre || trainer?.username || doc.capacitadoraUsername || "Capacitadora";
+  const trainerLabel = trainer?.nombre || trainer?.username || doc.capacitadoraUsername || "Responsable";
   const titulo = `Capacitación programada · ${operatorNames || "operador"}`.slice(0, 180);
 
   const creados = empleados.length
@@ -226,7 +249,7 @@ async function sincronizarAgendaCapacitacion(doc, req, rawAgenda) {
         fechaClave,
         hora,
         titulo,
-        detalle: `Devolución / capacitación programada. Capacitadora: ${trainerLabel}. Aviso 15 minutos antes.`.slice(0, 1200),
+        detalle: `Devolución / capacitación programada. Responsable: ${trainerLabel}. Aviso 15 minutos antes.`.slice(0, 1200),
         tipo: "reunion",
         completada: false,
         avisarMinutosAntes,
@@ -368,7 +391,10 @@ async function applyPayload(doc, body, req, { mode = "save", preserveAssignment 
   if (!doc.requiereSeguimiento) doc.fechaSeguimiento = null;
 
   if (mode === "draft" || mode === "final" || !preserveAssignment || !doc.capacitadoraUsername) {
-    doc.capacitadoraUsername = cleanText(body.capacitadoraUsername || req.user.username, 120).toLowerCase();
+    doc.capacitadoraUsername = await resolveResponsableCapacitacion(
+      body.capacitadoraUsername,
+      req.user.username
+    );
   }
 
   updateStateFromPayload(doc, body, mode);
@@ -439,9 +465,13 @@ export async function catalogos(_req, res) {
 export async function crearPendiente(req, res) {
   try {
     const operadores = await resolveOperators(req.body?.operadores ?? req.body?.operadoresUsername ?? []);
+    const responsableUsername = await resolveResponsableCapacitacion(
+      req.body?.capacitadoraUsername,
+      req.user.username
+    );
     const doc = new Capacitacion({
       operadores,
-      capacitadoraUsername: cleanText(req.body?.capacitadoraUsername || req.user.username, 120).toLowerCase(),
+      capacitadoraUsername: responsableUsername,
       creadaPorUsername: req.user.username,
       asignadaPorUsername: req.user.username,
       fechaCapacitacion: safeDate(req.body?.fechaCapacitacion, new Date()),
@@ -487,11 +517,7 @@ export async function editarPendiente(req, res) {
     if (req.body?.capacitadoraUsername !== undefined) {
       const capacitadoraUsername = cleanText(req.body.capacitadoraUsername, 120).toLowerCase();
       if (capacitadoraUsername) {
-        const capacitadora = await Empleado.findOne({ username: capacitadoraUsername, isActive: { $ne: false } })
-          .select("username role")
-          .lean();
-        if (!capacitadora) throw new Error("La capacitadora seleccionada no está activa.");
-        doc.capacitadoraUsername = capacitadoraUsername;
+        doc.capacitadoraUsername = await resolveResponsableCapacitacion(capacitadoraUsername);
       }
     }
 
@@ -543,9 +569,10 @@ export async function desdeAuditoria(req, res) {
     }
 
     const operadores = await resolveOperators([audit.operadorUsername]);
+    const responsableUsername = await resolveResponsableCapacitacion("", req.user.username);
     const doc = new Capacitacion({
       operadores,
-      capacitadoraUsername: req.user.username,
+      capacitadoraUsername: responsableUsername,
       creadaPorUsername: req.user.username,
       asignadaPorUsername: req.user.username,
       fechaCapacitacion: new Date(),
@@ -936,7 +963,7 @@ function writeCapacitacionPDF(pdf, item, index = null) {
   ensurePage(pdf, 165);
 
   const title = item.operadores?.map(displayUsername).join(", ") || "Sin operador";
-  const subtitle = item.capacitadoraUsername ? `Capacitadora: ${item.capacitadoraUsername}` : "";
+  const subtitle = item.capacitadoraUsername ? `Responsable: ${item.capacitadoraUsername}` : "";
   const headingY = pdf.y;
   pdf.save();
   pdf.roundedRect(42, headingY, pdf.page.width - 84, 25, 7).fillAndStroke("#ffffff", "#e8dcf8");
@@ -987,7 +1014,7 @@ function writeCapacitacionPDF(pdf, item, index = null) {
   }
 
   if (item.observacionCapacitadora) {
-    sectionTitle(pdf, "Observación de la capacitadora", "#29154f");
+    sectionTitle(pdf, "Observación de la persona responsable", "#29154f");
     pdf.font("Helvetica").fontSize(7.1).fillColor("#4f4657").text(item.observacionCapacitadora, { lineGap: 1 });
   }
 
@@ -1260,7 +1287,7 @@ export async function exportarExcel(req, res) {
     ws.columns = [
       { header: "FECHA", key: "fecha", width: 14 },
       { header: "OPERADOR/ES", key: "operadores", width: 32 },
-      { header: "CAPACITADORA", key: "capacitadora", width: 22 },
+      { header: "RESPONSABLE", key: "capacitadora", width: 22 },
       { header: "ORIGEN", key: "origen", width: 20 },
       { header: "MOTIVOS", key: "motivos", width: 38 },
       { header: "TEMAS / HERRAMIENTAS", key: "temas", width: 48 },

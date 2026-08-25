@@ -14,6 +14,7 @@ import Entidad from "../models/Entidad.js";
 import Pago from "../models/Pago.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
 import { invalidateCalidadCache } from "./calidadGestionesController.js";
+import { ROLES, getEffectiveRole } from "../config/roles.js";
 import { sincronizarContactados } from "../services/contactadosService.js";
 import {
   filtrarEmpleadosControlados,
@@ -186,6 +187,36 @@ async function activeUserFilter(rawOperator) {
     ? requested.filter((value) => activeSet.has(value))
     : active;
   if (!selected.length) return { $in: ["__cobrina_sin_usuario_activo__"] };
+  return selected.length === 1 ? selected[0] : { $in: selected };
+}
+
+// Control de gestiones: además de usuarios activos, excluye mandos medios y
+// superiores / usuarios expresamente no controlados. A diferencia del filtro
+// general, acá su actividad tampoco integra los totales ni la evolución diaria.
+let __controlledActiveUsersCache = { exp: 0, names: [] };
+async function controlledActiveUserFilter(rawOperator) {
+  let controlled = __controlledActiveUsersCache.names;
+  if (Date.now() >= __controlledActiveUsersCache.exp || !controlled.length) {
+    const rows = await Empleado.find({ isActive: { $ne: false } })
+      .select("username role")
+      .lean();
+    const rolesOperativos = new Set([ROLES.OPERADOR, ROLES.OPERADOR_VIP, ROLES.CUOTERO, ROLES.CAPACITADORA]);
+    controlled = filtrarEmpleadosControlados(rows)
+      .filter((row) => rolesOperativos.has(getEffectiveRole(row?.role, row?.username)))
+      .map((row) => String(row?.username || "").trim().toLowerCase())
+      .filter(Boolean);
+    __controlledActiveUsersCache = { exp: Date.now() + 60_000, names: controlled };
+  }
+
+  const controlledSet = new Set(controlled);
+  const requested = splitCSV(rawOperator)
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean);
+  const selected = requested.length
+    ? requested.filter((value) => controlledSet.has(value))
+    : controlled;
+
+  if (!selected.length) return { $in: ["__cobrina_sin_usuario_controlado__"] };
   return selected.length === 1 ? selected[0] : { $in: selected };
 }
 
@@ -2360,17 +2391,372 @@ agg = agg.map((d) => ({ ...d }));
   }
 }
 
+/**
+ * Control de gestiones por rango: consolida el equipo y cada operador por día.
+ * Un DNI es nuevo cuando el mismo operador no registra actividad sobre ese
+ * caso dentro de la ventana previa indicada (90 días por defecto).
+ */
+export async function actividadRango(req, res) {
+  try {
+    attachAbortFlag(req, res);
+
+    const usuarioId = getUsuarioId(req);
+    if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!ensureNoOperador(req, res)) return;
+
+    const {
+      desde,
+      hasta,
+      operador,
+      entidad,
+      tipoContacto,
+      estadoCuenta,
+      dni,
+      minDias = 90,
+    } = req.query || {};
+
+    const d1 = diaInicioUTC(desde);
+    const d2 = diaInicioUTC(hasta);
+    if (!d1 || !d2 || d2 < d1) {
+      return res.status(400).json({ error: "Rango de fechas inválido." });
+    }
+
+    const cantidadDias = Math.floor((d2.getTime() - d1.getTime()) / 86400000) + 1;
+    if (cantidadDias > 366) {
+      return res.status(400).json({ error: "El control de gestiones admite un rango máximo de 366 días." });
+    }
+
+    const ventanaDias = Number.isFinite(Number(minDias))
+      ? Math.max(0, Math.min(3650, Math.round(Number(minDias))))
+      : 90;
+    const d2Fin = new Date(d2.getTime() + 86399999);
+    const historiaDesde = new Date(d1.getTime() - ventanaDias * 86400000);
+
+    const filtrosComunes = {
+      ...ownerScope(req),
+      borrado: { $ne: true },
+      usuario: await controlledActiveUserFilter(operador),
+    };
+    const fEntidad = rxExactMulti(entidad, (value) => value.toUpperCase());
+    const fTipo = rxExactMulti(tipoContacto);
+    const fEstado = rxExactMulti(estadoCuenta);
+    const dniFilter = buildDniFilter(dni);
+    if (fEntidad) filtrosComunes.entidad = fEntidad;
+    if (fTipo) filtrosComunes.tipoContacto = fTipo;
+    if (fEstado) filtrosComunes.estadoCuenta = fEstado;
+    if (dniFilter) filtrosComunes.dni = dniFilter;
+
+    const matchRango = {
+      ...filtrosComunes,
+      fecha: { $gte: d1, $lte: d2Fin },
+    };
+    const matchHistoria = {
+      ...filtrosComunes,
+      fecha: { $gte: historiaDesde, $lt: d1 },
+    };
+    const DNI_SAFE = {
+      $convert: { input: "$dni", to: "string", onError: "", onNull: "" },
+    };
+    const DIA_UTC = {
+      $dateToString: { date: "$fecha", format: "%Y-%m-%d", timezone: "UTC" },
+    };
+    const HORA_SAFE = {
+      $convert: { input: "$hora", to: "string", onError: "00:00:00", onNull: "00:00:00" },
+    };
+
+    throwIfAborted(req);
+
+    const [
+      totalesDiarios,
+      historia,
+      paresDiarios,
+      actividadOperadorDia,
+      historiaOperador,
+      paresOperadorDia,
+    ] = await Promise.all([
+      ReporteGestion.aggregate([
+        { $match: matchRango },
+        { $project: { fecha: 1, dniNormalizado: DNI_SAFE } },
+        {
+          $group: {
+            _id: DIA_UTC,
+            gestiones: { $sum: 1 },
+            dnis: { $addToSet: "$dniNormalizado" },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            fecha: "$_id",
+            gestiones: 1,
+            dnisUnicos: { $size: { $setDifference: ["$dnis", [""]] } },
+          },
+        },
+        { $sort: { fecha: 1 } },
+      ]).allowDiskUse(true).option({ maxTimeMS: 30000 }),
+      ReporteGestion.aggregate([
+        { $match: matchHistoria },
+        { $project: { fecha: 1, dniNormalizado: DNI_SAFE } },
+        { $match: { dniNormalizado: { $ne: "" } } },
+        { $group: { _id: "$dniNormalizado", ultimaFecha: { $max: "$fecha" } } },
+      ]).allowDiskUse(true).option({ maxTimeMS: 30000 }),
+      ReporteGestion.aggregate([
+        { $match: matchRango },
+        { $project: { fecha: 1, dniNormalizado: DNI_SAFE, dia: DIA_UTC } },
+        { $match: { dniNormalizado: { $ne: "" } } },
+        { $group: { _id: { fecha: "$dia", dni: "$dniNormalizado" } } },
+        { $project: { _id: 0, fecha: "$_id.fecha", dni: "$_id.dni" } },
+        { $sort: { fecha: 1, dni: 1 } },
+      ]).allowDiskUse(true).option({ maxTimeMS: 30000 }),
+      ReporteGestion.aggregate([
+        { $match: matchRango },
+        {
+          $project: {
+            usuario: 1,
+            dia: DIA_UTC,
+            dniNormalizado: DNI_SAFE,
+            horaSafe: HORA_SAFE,
+          },
+        },
+        {
+          $group: {
+            _id: { usuario: "$usuario", fecha: "$dia" },
+            gestiones: { $sum: 1 },
+            dnis: { $addToSet: "$dniNormalizado" },
+            minHora: { $min: "$horaSafe" },
+            maxHora: { $max: "$horaSafe" },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            usuario: "$_id.usuario",
+            fecha: "$_id.fecha",
+            gestiones: 1,
+            dnisUnicos: { $size: { $setDifference: ["$dnis", [""]] } },
+            inicio: { $substrBytes: ["$minHora", 0, 5] },
+            fin: { $substrBytes: ["$maxHora", 0, 5] },
+          },
+        },
+        { $sort: { usuario: 1, fecha: 1 } },
+      ]).allowDiskUse(true).option({ maxTimeMS: 30000 }).collation({ locale: "es", strength: 1 }),
+      ReporteGestion.aggregate([
+        { $match: matchHistoria },
+        { $project: { usuario: 1, fecha: 1, dniNormalizado: DNI_SAFE } },
+        { $match: { dniNormalizado: { $ne: "" } } },
+        {
+          $group: {
+            _id: { usuario: "$usuario", dni: "$dniNormalizado" },
+            ultimaFecha: { $max: "$fecha" },
+          },
+        },
+      ]).allowDiskUse(true).option({ maxTimeMS: 30000 }).collation({ locale: "es", strength: 1 }),
+      ReporteGestion.aggregate([
+        { $match: matchRango },
+        { $project: { usuario: 1, dniNormalizado: DNI_SAFE, dia: DIA_UTC } },
+        { $match: { dniNormalizado: { $ne: "" } } },
+        { $group: { _id: { usuario: "$usuario", fecha: "$dia", dni: "$dniNormalizado" } } },
+        {
+          $project: {
+            _id: 0,
+            usuario: "$_id.usuario",
+            fecha: "$_id.fecha",
+            dni: "$_id.dni",
+          },
+        },
+        { $sort: { fecha: 1, usuario: 1, dni: 1 } },
+      ]).allowDiskUse(true).option({ maxTimeMS: 30000 }).collation({ locale: "es", strength: 1 }),
+    ]);
+
+    throwIfAborted(req);
+
+    const ultimaActividadPorDni = new Map(
+      (historia || []).map((row) => [String(row?._id || ""), new Date(row.ultimaFecha).getTime()])
+    );
+    const nuevosPorDia = new Map();
+    const dnisNuevosRango = new Set();
+    const dnisRango = new Set();
+
+    for (const row of paresDiarios || []) {
+      const dniNormalizado = String(row?.dni || "");
+      const fechaISO = String(row?.fecha || "");
+      const fechaMs = Date.parse(`${fechaISO}T00:00:00Z`);
+      if (!dniNormalizado || !Number.isFinite(fechaMs)) continue;
+
+      dnisRango.add(dniNormalizado);
+      const anteriorMs = ultimaActividadPorDni.get(dniNormalizado);
+      const diasDesdeAnterior = Number.isFinite(anteriorMs)
+        ? Math.floor((fechaMs - anteriorMs) / 86400000)
+        : null;
+      if (diasDesdeAnterior == null || diasDesdeAnterior > ventanaDias) {
+        nuevosPorDia.set(fechaISO, (nuevosPorDia.get(fechaISO) || 0) + 1);
+        dnisNuevosRango.add(dniNormalizado);
+      }
+      ultimaActividadPorDni.set(dniNormalizado, fechaMs);
+    }
+
+    const totalPorFecha = new Map(
+      (totalesDiarios || []).map((row) => [String(row.fecha || ""), row])
+    );
+    const dias = [];
+    for (let offset = 0; offset < cantidadDias; offset += 1) {
+      const fechaDate = new Date(d1.getTime() + offset * 86400000);
+      const fechaISO = fechaDate.toISOString().slice(0, 10);
+      const total = totalPorFecha.get(fechaISO) || {};
+      dias.push({
+        fecha: fechaISO,
+        gestiones: Number(total.gestiones || 0),
+        dnisUnicos: Number(total.dnisUnicos || 0),
+        dnisNuevos: Number(nuevosPorDia.get(fechaISO) || 0),
+      });
+    }
+
+    const resumen = {
+      gestiones: dias.reduce((sum, row) => sum + row.gestiones, 0),
+      dnisUnicos: dnisRango.size,
+      dnisTotalesDiarios: dias.reduce((sum, row) => sum + row.dnisUnicos, 0),
+      dnisNuevos: dnisNuevosRango.size,
+      aparicionesNuevas: dias.reduce((sum, row) => sum + row.dnisNuevos, 0),
+      diasConActividad: dias.filter((row) => row.gestiones > 0).length,
+    };
+
+    const ultimaActividadOperadorDni = new Map(
+      (historiaOperador || []).map((row) => [
+        `${String(row?._id?.usuario || "")}|${String(row?._id?.dni || "")}`,
+        new Date(row.ultimaFecha).getTime(),
+      ])
+    );
+    const nuevosPorOperadorDia = new Map();
+    for (const row of paresOperadorDia || []) {
+      const usuario = String(row?.usuario || "").trim();
+      const dniNormalizado = String(row?.dni || "").trim();
+      const fechaISO = String(row?.fecha || "");
+      const fechaMs = Date.parse(`${fechaISO}T00:00:00Z`);
+      if (!usuario || !dniNormalizado || !Number.isFinite(fechaMs)) continue;
+
+      const casoKey = `${usuario}|${dniNormalizado}`;
+      const anteriorMs = ultimaActividadOperadorDni.get(casoKey);
+      const diasDesdeAnterior = Number.isFinite(anteriorMs)
+        ? Math.floor((fechaMs - anteriorMs) / 86400000)
+        : null;
+      if (diasDesdeAnterior == null || diasDesdeAnterior > ventanaDias) {
+        const diaKey = `${usuario}|${fechaISO}`;
+        nuevosPorOperadorDia.set(diaKey, (nuevosPorOperadorDia.get(diaKey) || 0) + 1);
+      }
+      ultimaActividadOperadorDni.set(casoKey, fechaMs);
+    }
+
+    const horaAMinutos = (value) => {
+      const match = String(value || "").match(/^(\d{1,2}):(\d{2})/);
+      if (!match) return null;
+      const hours = Number(match[1]);
+      const minutes = Number(match[2]);
+      if (!Number.isFinite(hours) || !Number.isFinite(minutes) || hours > 23 || minutes > 59) return null;
+      return hours * 60 + minutes;
+    };
+    const minutosAHora = (value) => {
+      if (!Number.isFinite(value)) return "";
+      const total = Math.max(0, Math.min(1439, Math.round(value)));
+      return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+    };
+
+    const mapaOperadores = new Map();
+    for (const row of actividadOperadorDia || []) {
+      const usuario = String(row?.usuario || "").trim();
+      const fechaISO = String(row?.fecha || "");
+      if (!usuario || !fechaISO) continue;
+
+      if (!mapaOperadores.has(usuario)) {
+        mapaOperadores.set(usuario, {
+          usuario,
+          gestiones: 0,
+          dnisTotales: 0,
+          dnisNuevos: 0,
+          diasActivos: 0,
+          horasTrabajadasMin: 0,
+          dias: [],
+          _inicioAcumulado: 0,
+          _finAcumulado: 0,
+          _diasConHora: 0,
+        });
+      }
+
+      const actual = mapaOperadores.get(usuario);
+      const inicioMin = horaAMinutos(row?.inicio);
+      const finMin = horaAMinutos(row?.fin);
+      const minutosTrabajados = Number.isFinite(inicioMin) && Number.isFinite(finMin)
+        ? Math.max(0, finMin - inicioMin)
+        : 0;
+      const dnisNuevos = Number(nuevosPorOperadorDia.get(`${usuario}|${fechaISO}`) || 0);
+
+      actual.gestiones += Number(row?.gestiones || 0);
+      actual.dnisTotales += Number(row?.dnisUnicos || 0);
+      actual.dnisNuevos += dnisNuevos;
+      actual.diasActivos += Number(row?.gestiones || 0) > 0 ? 1 : 0;
+      actual.horasTrabajadasMin += minutosTrabajados;
+      if (Number.isFinite(inicioMin) && Number.isFinite(finMin)) {
+        actual._inicioAcumulado += inicioMin;
+        actual._finAcumulado += finMin;
+        actual._diasConHora += 1;
+      }
+      actual.dias.push({
+        fecha: fechaISO,
+        gestiones: Number(row?.gestiones || 0),
+        dnisTotales: Number(row?.dnisUnicos || 0),
+        dnisNuevos,
+        inicio: String(row?.inicio || ""),
+        fin: String(row?.fin || ""),
+        horasTrabajadasMin: minutosTrabajados,
+      });
+    }
+
+    const porOperadorTodos = Array.from(mapaOperadores.values())
+      .map((row) => {
+        const divisor = Math.max(1, Number(row._diasConHora || 0));
+        return {
+          usuario: row.usuario,
+          gestiones: row.gestiones,
+          dnisTotales: row.dnisTotales,
+          dnisNuevos: row.dnisNuevos,
+          diasActivos: row.diasActivos,
+          inicioPromedio: row._diasConHora ? minutosAHora(row._inicioAcumulado / divisor) : "",
+          finPromedio: row._diasConHora ? minutosAHora(row._finAcumulado / divisor) : "",
+          horasTrabajadasMin: row.horasTrabajadasMin,
+          dias: row.dias.sort((a, b) => a.fecha.localeCompare(b.fecha)),
+        };
+      })
+      .sort((a, b) => a.usuario.localeCompare(b.usuario, "es", { sensitivity: "base" }));
+    const porOperador = filtrarFilasReportesControl(porOperadorTodos, (row) => row?.usuario);
+
+    return res.json({
+      ok: true,
+      dias,
+      resumen,
+      porOperador,
+      params: {
+        desde: d1.toISOString().slice(0, 10),
+        hasta: d2.toISOString().slice(0, 10),
+        minDias: ventanaDias,
+      },
+    });
+  } catch (error) {
+    if (error?.code === "CLIENT_ABORTED") return res.status(499).end();
+    if (String(error?.message || "").toLowerCase().includes("exceeded time limit")) {
+      return res.status(504).json({ error: "El control de gestiones es demasiado pesado. Probá con menos días." });
+    }
+    return res.status(500).json({ error: error?.message || "No se pudo calcular el control de gestiones." });
+  }
+}
+
 export async function calendarioMesMatriz(req, res) {
   try {
     attachAbortFlag(req, res);
 
     const usuarioId = getUsuarioId(req);
     if (!usuarioId) return res.status(401).json({ error: "Token invalido o ausente." });
-
-    // ✅ Operadores NO pueden acceder
     if (!ensureNoOperador(req, res)) return;
 
-    const { mes, operador, entidad, tipoContacto, estadoCuenta } = req.query || {};
+    const { mes, operador, entidad, tipoContacto, estadoCuenta, minDias = 90 } = req.query || {};
     if (!/^\d{4}-\d{2}$/.test(mes || "")) {
       return res.status(400).json({ error: "Parametro 'mes' invalido (yyyy-mm)." });
     }
@@ -2379,82 +2765,171 @@ export async function calendarioMesMatriz(req, res) {
     const month = Number(mes.slice(5, 7)) - 1;
     const d1 = new Date(Date.UTC(year, month, 1));
     const d2 = new Date(Date.UTC(year, month + 1, 0));
-    const endOfDay = (d) => new Date(d.getTime() + 86399999);
-
-    const base = {
-      ...ownerScope(req),
-      borrado: { $ne: true },
-      fecha: { $gte: d1, $lte: endOfDay(d2) },
-    };
+    const d2Fin = new Date(d2.getTime() + 86399999);
+    const ventanaDias = Number.isFinite(Number(minDias))
+      ? Math.max(0, Math.min(3650, Math.round(Number(minDias))))
+      : 90;
+    const historiaDesde = new Date(d1.getTime() - ventanaDias * 86400000);
 
     const activeFilter = await activeUserFilter(operador);
-    const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
+    const fEntidad = rxExactMulti(entidad, (value) => value.toUpperCase());
     const fTipo = rxExactMulti(tipoContacto);
     const fEstado = rxExactMulti(estadoCuenta);
+    const filtrosComunes = {
+      ...ownerScope(req),
+      borrado: { $ne: true },
+      usuario: activeFilter,
+    };
+    if (fEntidad) filtrosComunes.entidad = fEntidad;
+    if (fTipo) filtrosComunes.tipoContacto = fTipo;
+    if (fEstado) filtrosComunes.estadoCuenta = fEstado;
 
-    base.usuario = activeFilter;
-    if (fEntidad) base.entidad = fEntidad;
-    if (fTipo) base.tipoContacto = fTipo;
-    if (fEstado) base.estadoCuenta = fEstado;
+    const DNI_SAFE = {
+      $convert: { input: "$dni", to: "string", onError: "", onNull: "" },
+    };
+    const DIA_UTC = {
+      $dateToString: { date: "$fecha", format: "%Y-%m-%d", timezone: "UTC" },
+    };
 
     throwIfAborted(req);
 
-    const agg = await ReporteGestion.aggregate([
-      { $match: base },
-      {
-        $project: {
-          usuario: 1,
-          d: { $dateToString: { date: "$fecha", format: "%Y-%m-%d" } },
-          dni: 1,
+    const [actividadMesAgg, paresHistoricos] = await Promise.all([
+      ReporteGestion.aggregate([
+        { $match: { ...filtrosComunes, fecha: { $gte: d1, $lte: d2Fin } } },
+        { $project: { usuario: 1, dniNormalizado: DNI_SAFE, dia: DIA_UTC } },
+        {
+          $facet: {
+            matriz: [
+              {
+                $group: {
+                  _id: { usuario: "$usuario", dia: "$dia" },
+                  gestiones: { $sum: 1 },
+                  dnis: { $addToSet: "$dniNormalizado" },
+                },
+              },
+              {
+                $project: {
+                  _id: 0,
+                  usuario: "$_id.usuario",
+                  dia: "$_id.dia",
+                  gestiones: 1,
+                  dnisUnicos: { $size: { $setDifference: ["$dnis", [""]] } },
+                },
+              },
+              { $sort: { usuario: 1, dia: 1 } },
+            ],
+            dias: [
+              {
+                $group: {
+                  _id: "$dia",
+                  gestiones: { $sum: 1 },
+                  dnis: { $addToSet: "$dniNormalizado" },
+                },
+              },
+              {
+                $project: {
+                  _id: 0,
+                  dia: "$_id",
+                  gestiones: 1,
+                  dnisUnicos: { $size: { $setDifference: ["$dnis", [""]] } },
+                },
+              },
+              { $sort: { dia: 1 } },
+            ],
+          },
         },
-      },
-      {
-        $group: {
-          _id: { usuario: "$usuario", d: "$d" },
-          dnis: { $addToSet: "$dni" },
+      ]).allowDiskUse(true).option({ maxTimeMS: 30000 }).collation({ locale: "es", strength: 1 }),
+      ReporteGestion.aggregate([
+        { $match: { ...filtrosComunes, fecha: { $gte: historiaDesde, $lte: d2Fin } } },
+        { $project: { usuario: 1, dniNormalizado: DNI_SAFE, dia: DIA_UTC } },
+        { $match: { dniNormalizado: { $ne: "" } } },
+        { $group: { _id: { usuario: "$usuario", dni: "$dniNormalizado", dia: "$dia" } } },
+        {
+          $project: {
+            _id: 0,
+            usuario: "$_id.usuario",
+            dni: "$_id.dni",
+            dia: "$_id.dia",
+          },
         },
-      },
-      {
-        $project: {
-          _id: 0,
-          usuario: "$_id.usuario",
-          d: "$_id.d",
-          cuentas: { $size: "$dnis" },
-        },
-      },
-      { $sort: { usuario: 1, d: 1 } },
-    ])
-      .allowDiskUse(true)
-      .option({ maxTimeMS: 20000 })
-      .collation({ locale: "es", strength: 1 });
+        { $sort: { dia: 1, usuario: 1, dni: 1 } },
+      ]).allowDiskUse(true).option({ maxTimeMS: 30000 }).collation({ locale: "es", strength: 1 }),
+    ]);
 
-    const diasCabecera = [];
-    for (let day = 1; day <= d2.getUTCDate(); day++) {
-      const iso = `${mes}-${String(day).padStart(2, "0")}`;
-      diasCabecera.push(iso);
-    }
+    throwIfAborted(req);
 
-    const mapa = new Map();
-    for (const r of agg) {
-      if (!mapa.has(r.usuario)) mapa.set(r.usuario, { usuario: r.usuario, dias: {} });
-      mapa.get(r.usuario).dias[r.d] = r.cuentas;
-    }
-    const usuariosMatrizTodos = Array.from(mapa.values());
+    const nuevosPorUsuarioDia = new Map();
+    const nuevosPorDia = new Map();
+    const ultimaActividad = new Map();
+    const inicioMesMs = d1.getTime();
 
-    // Los totales diarios conservan TODA la actividad, incluso la de usuarios
-    // ocultos del control. Solo se ocultan sus filas identificadas.
-    const totalesPorDia = new Map();
-    for (const u of usuariosMatrizTodos) {
-      for (const d of Object.keys(u.dias)) {
-        totalesPorDia.set(d, (totalesPorDia.get(d) || 0) + u.dias[d]);
+    for (const row of paresHistoricos || []) {
+      const usuario = String(row?.usuario || "");
+      const dni = String(row?.dni || "");
+      const dia = String(row?.dia || "");
+      const diaMs = Date.parse(`${dia}T00:00:00Z`);
+      if (!usuario || !dni || !Number.isFinite(diaMs)) continue;
+
+      const key = `${usuario}|${dni}`;
+      const anteriorMs = ultimaActividad.get(key);
+      if (diaMs >= inicioMesMs) {
+        const diasDesdeAnterior = Number.isFinite(anteriorMs)
+          ? Math.floor((diaMs - anteriorMs) / 86400000)
+          : null;
+        if (diasDesdeAnterior == null || diasDesdeAnterior > ventanaDias) {
+          const userDayKey = `${usuario}|${dia}`;
+          nuevosPorUsuarioDia.set(userDayKey, (nuevosPorUsuarioDia.get(userDayKey) || 0) + 1);
+          nuevosPorDia.set(dia, (nuevosPorDia.get(dia) || 0) + 1);
+        }
       }
+      ultimaActividad.set(key, diaMs);
     }
-    const dias = diasCabecera.map((d) => ({ dia: d, cuentas: totalesPorDia.get(d) || 0 }));
+
+    const actividadMes = actividadMesAgg?.[0] || {};
+    const mapaUsuarios = new Map();
+    for (const row of actividadMes.matriz || []) {
+      const usuario = String(row?.usuario || "");
+      const dia = String(row?.dia || "");
+      if (!usuario || !dia) continue;
+      if (!mapaUsuarios.has(usuario)) mapaUsuarios.set(usuario, { usuario, dias: {} });
+      mapaUsuarios.get(usuario).dias[dia] = {
+        gestiones: Number(row.gestiones || 0),
+        dnisUnicos: Number(row.dnisUnicos || 0),
+        casosNuevos: Number(nuevosPorUsuarioDia.get(`${usuario}|${dia}`) || 0),
+      };
+    }
+
+    const diasCabecera = Array.from({ length: d2.getUTCDate() }, (_, index) => (
+      `${mes}-${String(index + 1).padStart(2, "0")}`
+    ));
+    const totalesBase = new Map((actividadMes.dias || []).map((row) => [String(row.dia || ""), row]));
+    const dias = diasCabecera.map((dia) => {
+      const total = totalesBase.get(dia) || {};
+      return {
+        dia,
+        gestiones: Number(total.gestiones || 0),
+        dnisUnicos: Number(total.dnisUnicos || 0),
+        cuentas: Number(total.dnisUnicos || 0),
+        casosNuevos: Number(nuevosPorDia.get(dia) || 0),
+      };
+    });
+    const usuariosMatrizTodos = Array.from(mapaUsuarios.values());
     const usuariosMatriz = filtrarFilasReportesControl(usuariosMatrizTodos, (row) => row?.usuario);
 
-    return res.json({ ok: true, dias, usuariosMatriz, diasCabecera });
+    return res.json({
+      ok: true,
+      mes,
+      minDias: ventanaDias,
+      metricas: ["gestiones", "dnisUnicos", "casosNuevos"],
+      dias,
+      usuariosMatriz,
+      diasCabecera,
+    });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
+    if (String(e?.message || "").toLowerCase().includes("exceeded time limit")) {
+      return res.status(504).json({ error: "El calendario mensual es demasiado pesado. Probá nuevamente." });
+    }
     return res.status(500).json({ error: e.message });
   }
 }
@@ -3443,7 +3918,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     limit: safeLimit,
     catalogos: {
       tiposAcuerdo: TIPOS_ACUERDO,
-      estadosVencimiento: ["VENCIDO", "VENCE HOY", "PRÓXIMO 3 DÍAS", "PENDIENTE"],
+      estadosVencimiento: ["PAGADO", "PAGADO PARCIAL", "VENCIDO", "VENCE HOY", "PRÓXIMO 3 DÍAS", "PENDIENTE"],
       estadosPagoAcuerdo: ["CON PAGO VÁLIDO", "PAGO MISMO DÍA VÁLIDO", "SIN PAGO VÁLIDO", "REQUIERE REVISIÓN"],
     },
     integracionPagos: paymentMeta,

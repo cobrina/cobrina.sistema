@@ -276,14 +276,21 @@ export function esBajaAcuerdo(doc = {}) {
   return explicitLowAgreement || explicitCancellation || esAcuerdoCaido(doc);
 }
 
-function clasificarTipoAcuerdo(observation, installments, advanceAmount, result) {
+function clasificarTipoAcuerdo(observation, installments, advanceAmount, result, advanceDate = null) {
   const obs = claveSimple(observation);
   const res = claveSimple(result);
-  const hasAdvance = Number(advanceAmount || 0) > 0;
+  const hasAdvance = Number(advanceAmount || 0) > 0 || Boolean(advanceDate);
   const installmentsValue = Number(installments || 0);
 
   if (res.includes("parcial") || obs.includes("pppar") || obs.includes("parcial")) return "Parcial";
-  if (res.includes("anticipo") || obs.includes("vcto del anticipo") || hasAdvance) {
+  if (
+    res.includes("anticipo") ||
+    obs.includes("fecha del anticipo") ||
+    obs.includes("fecha anticipo") ||
+    obs.includes("vcto del anticipo") ||
+    obs.includes("vencimiento anticipo") ||
+    hasAdvance
+  ) {
     return installmentsValue > 0 ? "Acuerdo en cuotas con anticipo" : "Cancelación con anticipo";
   }
   if (res.includes("cuota") || installmentsValue > 1) return "Acuerdo en cuotas sin anticipo";
@@ -401,7 +408,7 @@ export function transformarGestionEnAcuerdo(doc = {}) {
     ? installmentAmount
     : explicitTotalAmount;
 
-  const type = clasificarTipoAcuerdo(observation, installments, advanceAmount, result);
+  const type = clasificarTipoAcuerdo(observation, installments, advanceAmount, result, advanceDate);
   let paymentDate = advanceDate || firstDue;
   const hasPaymentAmount = Number(firstPayment || 0) > 0 || Number(totalAmount || 0) > 0;
 
@@ -422,12 +429,15 @@ export function transformarGestionEnAcuerdo(doc = {}) {
   // Si existe anticipo, su fecha es la fecha del primer pago; si no, usamos
   // el primer vencimiento / fecha de pago detectada. Esto evita proyectar una
   // cuota futura cuando el acuerdo exige un anticipo antes.
-  const firstPaymentDate = Number(advanceAmount || 0) > 0
-    ? (advanceDate || paymentDate || firstDue)
-    : (firstDue || paymentDate || advanceDate);
+  // Regla de negocio: la presencia de una FECHA DE ANTICIPO manda siempre,
+  // aunque el operador haya elegido "Acuerdo libre" o cualquier otro resultado.
+  // No dependemos del tipo de acuerdo ni de que el monto del anticipo se haya
+  // podido leer: si Mango informa esa fecha, ése es el primer pago exigible.
+  const firstPaymentDate = advanceDate || firstDue || paymentDate;
   const firstPaymentDateISO = fechaISO(firstPaymentDate);
-  const firstDueISO = fechaISO(firstDue || advanceDate || paymentDate);
-  const dueStatus = estadoVencimiento(firstPaymentDateISO || firstDueISO);
+  const firstInstallmentDueISO = fechaISO(firstDue);
+  const effectiveFirstDueISO = firstPaymentDateISO || firstInstallmentDueISO || fechaISO(paymentDate);
+  const dueStatus = estadoVencimiento(effectiveFirstDueISO);
 
   return {
     id: String(doc._id || ""),
@@ -448,8 +458,12 @@ export function transformarGestionEnAcuerdo(doc = {}) {
     fechaAnticipo: fechaISO(advanceDate),
     montoAnticipo: Number(advanceAmount || 0),
     cuotas: Number(installments || 0),
-    primerVencimiento: firstDueISO,
-    fechaPrimerPago: firstPaymentDateISO || firstDueISO,
+    // primerVencimiento conserva el significado operativo: primera obligación
+    // exigible. Si hay anticipo, coincide con la fecha del anticipo. La fecha de
+    // la primera cuota se guarda aparte para no perder ese dato contractual.
+    primerVencimiento: effectiveFirstDueISO,
+    primerVencimientoCuota: firstInstallmentDueISO,
+    fechaPrimerPago: effectiveFirstDueISO,
     montoCuota: Number(installmentAmount || 0),
     primerPago: Number(firstPayment || 0),
     montoTotalAcuerdo: Number(totalAmount || 0),
@@ -723,9 +737,27 @@ export function vincularPagosPosteriores(
       ? "PAGO MISMO DÍA VÁLIDO"
       : "SIN PAGO VÁLIDO";
     const paymentOwner = validPayments.at(-1)?.operadorUsername || "";
+    const estadoVencimientoCronologico = String(agreement?.estadoVencimiento || "");
+    // Una obligación con dinero aplicado no puede seguir figurando simplemente
+    // como VENCIDO: si cubre el primer pago queda PAGADO y, si todavía falta
+    // importe, queda PAGADO PARCIAL. El estado cronológico se conserva aparte.
+    const primerPagoParcial = expectedAmount > 0
+      && montoAplicadoPrimerPago > 0
+      && !primerPagoCubierto;
+    const estadoOperativo = primerPagoCubierto
+      ? "PAGADO"
+      : primerPagoParcial
+      ? "PAGADO PARCIAL"
+      : estadoVencimientoCronologico;
+    const tienePagoAplicado = primerPagoCubierto || primerPagoParcial;
 
     return {
       ...base,
+      estadoVencimientoCronologico,
+      estadoVencimiento: estadoOperativo,
+      estadoAcuerdo: estadoOperativo,
+      diasVencido: tienePagoAplicado ? 0 : Number(agreement?.diasVencido || 0),
+      diasParaVencer: tienePagoAplicado ? null : agreement?.diasParaVencer ?? null,
       estadoPagoAcuerdo: state,
       // Compatibilidad: estos campos históricos pasan a representar todos los pagos válidos
       // (posteriores + mismo día) para que reportes y exportaciones no omitan cobros válidos.
@@ -748,6 +780,8 @@ export function vincularPagosPosteriores(
       montoPrimerPagoCobrado: montoAplicadoPrimerPago,
       fechaPrimerPagoCobrado,
       primerPagoCubierto,
+      primerPagoParcial,
+      montoPrimerPagoPendiente: Math.max(0, expectedAmount - montoAplicadoPrimerPago),
       montoPagosLuegoPrimerPago,
       coincidenciaPagoPor: "DNI + entidad",
       ventanaPagoHasta: nextAgreementDate || "",
@@ -1670,11 +1704,6 @@ function addCalendarSheet(workbook, summary, metadata) {
   monthKeys(metadata).forEach(({ year, month }, monthIndex) => {
     const dayCount = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
     const monthKey = `${year}-${String(month + 1).padStart(2, "0")}`;
-    const allMonthValues = operators.flatMap((operator) =>
-      (operator.dias || []).filter((day) => String(day.fecha || "").startsWith(monthKey))
-    );
-    const maxValue = Math.max(1, ...allMonthValues.map((day) => Number(day.acuerdos || 0)));
-
     if (monthIndex > 0) rowCursor += 2;
     ws.mergeCells(rowCursor, 1, rowCursor, dayCount + 1);
     const monthCell = ws.getCell(rowCursor, 1);
@@ -1715,16 +1744,13 @@ function addCalendarSheet(workbook, summary, metadata) {
         cell.alignment = { horizontal: "center", vertical: "middle" };
         cell.font = { bold: agreements > 0, size: 8, color: { argb: agreements ? COLORS.text : "FF9D92A5" } };
 
-        const ratio = agreements / maxValue;
         const fill = agreements === 0
           ? "FFF3F1F7"
-          : ratio >= 0.75
-          ? "FFBFE8D3"
-          : ratio >= 0.45
-          ? "FFE1F2DF"
-          : ratio >= 0.2
-          ? "FFFFE7C5"
-          : "FFFFD0D5";
+          : agreements >= 3
+          ? "FF91DFB5"
+          : agreements === 2
+          ? "FFFFE078"
+          : "FFFF9FA8";
         cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: fill } };
         cell.border = {
           top: { style: "thin", color: { argb: "FFFFFFFF" } },
@@ -1753,150 +1779,213 @@ function addCalendarSheet(workbook, summary, metadata) {
   ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
 }
 
-function addAgreementRowsSheet(workbook, rows) {
-  // Exportación operativa: una tabla simple, con alturas normales y sin 38
-  // columnas de diagnóstico. Los datos técnicos extensos quedan en el sistema.
-  const ws = workbook.addWorksheet("Acuerdos");
-  const headers = [
-    "ESTADO", "PRIMER VENCIMIENTO", "DÍAS", "EPISODIO", "TIPO DE ACUERDO",
-    "1ER PAGO PROYECTADO", "MONTO ACUERDO", "PAGOS VÁLIDOS", "MONTO PAGOS VÁLIDOS",
-    "ÚLTIMO PAGO", "DNI", "NOMBRE", "ENTIDAD", "OPERADOR", "FECHA GESTIÓN",
-    "HORA", "RESULTADO GESTIÓN", "ESTADO CUENTA", "TELÉFONO", "OBSERVACIÓN",
+const AGREEMENT_DETAIL_COLUMNS = [
+  ["ESTADO", 16], ["DNI", 14], ["NOMBRE", 29], ["ENTIDAD", 22], ["OPERADOR", 21],
+  ["FECHA GESTIÓN", 16], ["HORA", 11], ["TELÉFONO GESTIÓN", 20],
+  ["TIPO DE ACUERDO", 29], ["FECHA 1ER PAGO", 17], ["DÍAS ATRASO / PARA VENCER", 14],
+  ["EPISODIO", 12], ["REACUERDO EFECTIVO", 18],
+  ["FECHA ANTICIPO", 17], ["IMPORTE ANTICIPO", 19], ["CANTIDAD CUOTAS", 16],
+  ["IMPORTE CUOTA", 18], ["PRIMER VENCIMIENTO CUOTA", 20], ["1ER PAGO PROYECTADO", 20],
+  ["MONTO CONTRACTUAL", 20], ["DEUDA MÁXIMA", 18],
+  ["ESTADO DEL CRUCE", 24], ["CANTIDAD PAGOS VÁLIDOS", 17], ["IMPORTE PAGOS VÁLIDOS", 21],
+  ["PAGOS MISMO DÍA", 16], ["IMPORTE MISMO DÍA", 19], ["1ER PAGO COBRADO", 19],
+  ["FECHA 1ER PAGO COBRADO", 21], ["1ER PAGO CUBIERTO", 18], ["ÚLTIMO PAGO VÁLIDO", 19],
+  ["ÚLTIMO PAGO ANTERIOR", 20], ["IMPORTE PAGO ANTERIOR", 21], ["DÍAS ANTES DEL ACUERDO", 16],
+  ["OBSERVACIÓN CRUCE PAGOS", 34],
+  ["TIPO CONTACTO", 21], ["RESULTADO GESTIÓN", 27], ["ESTADO CUENTA", 24], ["TEL / MAIL MARCADO", 22],
+  ["OBSERVACIÓN ORIGINAL", 55],
+  ["SEGUIMIENTO", 21], ["FECHA SEGUIMIENTO", 19], ["HORA SEGUIMIENTO", 17], ["ÚLTIMO GESTOR", 20],
+  ["RESULTADO SEGUIMIENTO", 28], ["OBSERVACIÓN SEGUIMIENTO", 38],
+];
+
+const AGREEMENT_DETAIL_GROUPS = [
+  { from: 1, to: 13, label: "IDENTIFICACIÓN Y ESTADO", color: COLORS.dark },
+  { from: 14, to: 21, label: "PLAN ACORDADO", color: "FF087A50" },
+  { from: 22, to: 34, label: "CRUCE CON PAGOS", color: "FF0876A8" },
+  { from: 35, to: 39, label: "GESTIÓN ORIGINAL", color: "FF8C2384" },
+  { from: 40, to: 45, label: "SEGUIMIENTO POSTERIOR", color: "FF6D2BFF" },
+];
+
+function agreementDays(item) {
+  if (["PAGADO", "PAGADO PARCIAL"].includes(item.estadoVencimiento)) return null;
+  if (item.estadoVencimiento === "VENCIDO") return Number(item.diasVencido || 0);
+  return item.diasParaVencer ?? null;
+}
+
+function agreementDetailValues(item) {
+  const episodio = item.episodioNumero
+    ? `${item.episodioNumero}${Number(item.episodiosCaso || 0) > 1 ? ` de ${item.episodiosCaso}` : ""}`
+    : "—";
+  const observacionCruce = item.requiereRevisionPagos
+    ? item.motivoRevisionPagos || "Requiere revisión manual."
+    : !item.integracionPagosDisponible
+    ? item.integracionPagosMotivo || "Sin datos del módulo Pagos."
+    : null;
+
+  return [
+    item.estadoVencimiento,
+    dniExcel(item.dni),
+    item.nombreDeudor,
+    item.entidad,
+    item.usuario || item.operador,
+    excelDate(item.fecha),
+    excelTime(item.hora),
+    item.telefonoGestion ? String(item.telefonoGestion) : null,
+    item.tipoAcuerdo,
+    excelDate(item.fechaPrimerPago || item.primerVencimiento),
+    agreementDays(item),
+    episodio,
+    item.esReacuerdoEfectivo ? "SÍ" : "NO",
+    excelDate(item.fechaAnticipo),
+    money(item.montoAnticipo),
+    Number(item.cuotas || 0),
+    money(item.montoCuota),
+    excelDate(item.primerVencimientoCuota),
+    money(item.primerPago),
+    money(item.montoTotalAcuerdo),
+    money(item.deudaMaxima),
+    item.estadoPagoAcuerdo,
+    Number(item.cantidadPagosValidos ?? item.cantidadPagosPosteriores ?? 0),
+    money(item.montoPagosValidos ?? item.montoPagosPosteriores),
+    Number(item.cantidadPagosMismoDia || 0),
+    money(item.montoPagosMismoDia),
+    money(item.montoPrimerPagoCobrado),
+    excelDate(item.fechaPrimerPagoCobrado),
+    item.primerPagoCubierto ? "SÍ" : "NO",
+    excelDate(item.ultimoPagoValido),
+    excelDate(item.ultimoPagoAnterior),
+    money(item.montoUltimoPagoAnterior),
+    item.diasPagoAnterior ?? null,
+    observacionCruce,
+    item.tipoContacto,
+    item.resultadoGestion,
+    item.estadoCuenta,
+    item.telMailMarcado ? String(item.telMailMarcado) : null,
+    item.observacionGestion,
+    item.ultimaGestionMangoEsPosterior ? "CON GESTIÓN POSTERIOR" : "SIN GESTIÓN POSTERIOR",
+    excelDate(item.ultimaGestionMangoFecha),
+    excelTime(item.ultimaGestionMangoHora),
+    item.ultimaGestionMangoUsuario,
+    item.ultimaGestionMangoResultado,
+    item.ultimaGestionMangoObservacion,
   ];
-  ws.addRow(headers);
-  styleHeader(ws.getRow(1));
+}
+
+function styleAgreementGroups(ws) {
+  AGREEMENT_DETAIL_GROUPS.forEach((group) => {
+    ws.mergeCells(1, group.from, 1, group.to);
+    const cell = ws.getCell(1, group.from);
+    cell.value = group.label;
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: group.color } };
+    cell.font = { color: { argb: COLORS.white }, bold: true, size: 9 };
+    cell.alignment = { horizontal: "center", vertical: "middle" };
+  });
   ws.getRow(1).height = 22;
 
-  rows.forEach((item) => {
-    const episodio = item.episodioNumero
-      ? `${item.episodioNumero}${Number(item.episodiosCaso || 0) > 1 ? ` de ${item.episodiosCaso}` : ""}`
-      : "—";
-    const row = ws.addRow([
-      item.estadoVencimiento,
-      excelDate(item.primerVencimiento),
-      item.estadoVencimiento === "VENCIDO" ? item.diasVencido : item.diasParaVencer ?? "",
-      episodio,
-      item.tipoAcuerdo,
-      money(item.primerPago),
-      money(item.montoTotalAcuerdo),
-      Number(item.cantidadPagosPosteriores || 0),
-      money(item.montoPagosPosteriores),
-      excelDate(item.fechaPrimerPagoCobrado || item.ultimoPagoValido),
-      dniExcel(item.dni),
-      item.nombreDeudor,
-      item.entidad,
-      item.usuario,
-      excelDate(item.fecha),
-      excelTime(item.hora),
-      item.resultadoGestion,
-      item.estadoCuenta,
-      item.telefonoGestion,
-      item.observacionGestion,
-    ]);
-    styleDataRow(row, {
-      height: 18,
-      center: [1, 2, 3, 4, 8, 10, 11, 15, 16],
-      moneyCols: [6, 7, 9],
-      dateCols: [2, 10, 15],
-      wrapCols: [],
-    });
-    row.getCell(11).numFmt = "0";
-    row.getCell(16).numFmt = "hh:mm:ss";
+  const header = ws.getRow(2);
+  AGREEMENT_DETAIL_COLUMNS.forEach(([label], index) => {
+    const columnNumber = index + 1;
+    const group = AGREEMENT_DETAIL_GROUPS.find((item) => columnNumber >= item.from && columnNumber <= item.to);
+    const cell = header.getCell(columnNumber);
+    cell.value = label;
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: group?.color || COLORS.dark } };
+    cell.font = { color: { argb: COLORS.white }, bold: true, size: 9 };
+    cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+    cell.border = {
+      top: { style: "thin", color: { argb: "FFFFFFFF" } },
+      left: { style: "thin", color: { argb: "FFFFFFFF" } },
+      bottom: { style: "thin", color: { argb: "FFFFFFFF" } },
+      right: { style: "thin", color: { argb: "FFFFFFFF" } },
+    };
+  });
+  header.height = 40;
+}
 
-    const fillColor = item.estadoVencimiento === "VENCIDO"
-      ? COLORS.redSoft
-      : item.estadoVencimiento === "VENCE HOY"
-      ? COLORS.yellow
-      : item.estadoVencimiento === "PRÓXIMO 3 DÍAS"
-      ? COLORS.lilac
-      : COLORS.greenSoft;
-    row.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: fillColor } };
-    row.getCell(1).font = { color: { argb: item.estadoVencimiento === "VENCIDO" ? COLORS.red : COLORS.dark } };
+function styleAgreementDetailRow(row, item) {
+  styleDataRow(row, {
+    height: 23,
+    center: [1, 2, 6, 7, 10, 11, 12, 13, 14, 16, 18, 23, 25, 28, 29, 30, 31, 33, 40, 41, 42],
+    moneyCols: [15, 17, 19, 20, 21, 24, 26, 27, 32],
+    dateCols: [6, 10, 14, 18, 28, 30, 31, 41],
+  });
+  row.getCell(2).numFmt = "0";
+  row.getCell(7).numFmt = "hh:mm:ss";
+  row.getCell(42).numFmt = "hh:mm:ss";
+  [8, 38].forEach((col) => { row.getCell(col).numFmt = "@"; });
+
+  const statusCell = row.getCell(1);
+  const statusFill = item.estadoVencimiento === "PAGADO"
+    ? "FF91DFB5"
+    : item.estadoVencimiento === "PAGADO PARCIAL"
+    ? "FFFFD67A"
+    : item.estadoVencimiento === "VENCIDO"
+    ? "FFFF9FA8"
+    : item.estadoVencimiento === "VENCE HOY"
+    ? "FFFFE078"
+    : item.estadoVencimiento === "PRÓXIMO 3 DÍAS"
+    ? "FFFFC56E"
+    : COLORS.gray;
+  statusCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: statusFill } };
+  statusCell.font = { bold: true, color: { argb: item.estadoVencimiento === "VENCIDO" ? COLORS.red : COLORS.dark } };
+
+  [14, 15].forEach((col) => {
+    if (item.fechaAnticipo || Number(item.montoAnticipo || 0) > 0) {
+      row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFDDF4E9" } };
+      row.getCell(col).font = { bold: true, color: { argb: "FF075D43" } };
+    }
+  });
+  [16, 17, 18].forEach((col) => {
+    if (Number(item.cuotas || 0) > 0) {
+      row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8F3FA" } };
+    }
   });
 
-  setWidths(ws, [16, 16, 8, 10, 25, 18, 18, 14, 20, 15, 13, 27, 22, 21, 15, 11, 28, 24, 20, 36]);
-  ws.autoFilter = { from: "A1", to: `T${Math.max(1, rows.length + 1)}` };
-  ws.views = [{ state: "frozen", ySplit: 1, showGridLines: true }];
+  const paymentCell = row.getCell(22);
+  const paymentFill = ["CON PAGO POSTERIOR", "CON PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo)
+    ? "FF91DFB5"
+    : ["PAGO MISMO DÍA", "PAGO MISMO DÍA VÁLIDO"].includes(item.estadoPagoAcuerdo)
+    ? "FFFFE078"
+    : ["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo)
+    ? "FFFF9FA8"
+    : COLORS.gray;
+  paymentCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: paymentFill } };
+  paymentCell.font = { bold: true, color: { argb: ["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo) ? COLORS.red : COLORS.dark } };
+  if (item.primerPagoCubierto) {
+    [27, 28, 29].forEach((col) => {
+      row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF91DFB5" } };
+      row.getCell(col).font = { bold: true, color: { argb: "FF075D43" } };
+    });
+  }
+}
+
+function addAgreementDetailSheet(workbook, rows, { overdueOnly = false } = {}) {
+  const ws = workbook.addWorksheet(overdueOnly ? "Vencidos" : "Acuerdos");
+  const detailRows = overdueOnly
+    ? rows
+        .filter((item) => item.estadoVencimiento === "VENCIDO")
+        .sort((a, b) => (a.fechaPrimerPago || a.primerVencimiento || "9999").localeCompare(b.fechaPrimerPago || b.primerVencimiento || "9999"))
+    : rows;
+  const columnCount = AGREEMENT_DETAIL_COLUMNS.length;
+  styleAgreementGroups(ws);
+
+  detailRows.forEach((item) => {
+    const row = ws.addRow(agreementDetailValues(item));
+    styleAgreementDetailRow(row, item);
+  });
+
+  setWidths(ws, AGREEMENT_DETAIL_COLUMNS.map(([, width]) => width));
+  const lastColumn = ws.getColumn(columnCount).letter;
+  ws.autoFilter = { from: "A2", to: `${lastColumn}${Math.max(2, detailRows.length + 2)}` };
+  ws.views = [{ state: "frozen", xSplit: 3, ySplit: 2, showGridLines: false }];
   ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
 }
 
+function addAgreementRowsSheet(workbook, rows) {
+  addAgreementDetailSheet(workbook, rows, { overdueOnly: false });
+}
+
 function addDueSheet(workbook, rows) {
-  const ws = workbook.addWorksheet("Vencidos");
-  titleSheet(
-    ws,
-    "ACUERDOS EFECTIVOS VENCIDOS",
-    "Episodios vigentes/efectivos · primer pago proyectado y cobrado · cruce con pagos válidos",
-    30
-  );
-  ws.addRow([
-    "PRIMER VENCIMIENTO", "ESTADO", "DÍAS VENCIDO", "EPISODIO", "REACUERDO EFECTIVO",
-    "CRUCE CON PAGOS", "PAGOS VÁLIDOS", "MONTO PAGOS VÁLIDOS", "ÚLTIMO PAGO ANTERIOR", "MONTO ÚLTIMO PAGO ANTERIOR",
-    "DÍAS ANTES", "PAGOS MISMO DÍA", "1ER PAGO PROYECTADO", "1ER PAGO COBRADO", "FECHA 1ER PAGO COBRADO",
-    "1ER PAGO CUBIERTO", "MONTO CONTRACTUAL", "TIPO ACUERDO", "OPERADOR ACUERDO", "ENTIDAD", "DNI", "TELÉFONO GESTIÓN", "NOMBRE",
-    "FECHA GESTIÓN", "HORA", "RESULTADO", "ESTADO CUENTA", "TIPO CONTACTO",
-    "OBSERVACIÓN ORIGINAL", "ID COBRINA",
-  ]);
-  styleHeader(ws.getRow(4));
-
-  const dueRows = rows
-    .filter((item) => item.estadoVencimiento === "VENCIDO")
-    .sort((a, b) => (a.primerVencimiento || "9999").localeCompare(b.primerVencimiento || "9999"));
-
-  dueRows.forEach((item) => {
-    const episodio = item.episodioNumero
-      ? `${item.episodioNumero}${Number(item.episodiosCaso || 0) > 1 ? ` de ${item.episodiosCaso}` : ""}`
-      : "—";
-    const row = ws.addRow([
-      excelDate(item.primerVencimiento), item.estadoVencimiento, item.diasVencido,
-      episodio, item.esReacuerdoEfectivo ? "SÍ" : "NO",
-      item.estadoPagoAcuerdo, item.cantidadPagosPosteriores, money(item.montoPagosPosteriores),
-      excelDate(item.ultimoPagoAnterior), money(item.montoUltimoPagoAnterior), item.diasPagoAnterior ?? "", item.cantidadPagosMismoDia,
-      money(item.primerPago), money(item.montoPrimerPagoCobrado), excelDate(item.fechaPrimerPagoCobrado), item.primerPagoCubierto ? "SÍ" : "NO",
-      money(item.montoTotalAcuerdo), item.tipoAcuerdo,
-      item.usuario, item.entidad, dniExcel(item.dni), item.telefonoGestion, item.nombreDeudor,
-      excelDate(item.fecha), excelTime(item.hora), item.resultadoGestion, item.estadoCuenta,
-      item.tipoContacto, item.observacionGestion, item.id,
-    ]);
-    styleDataRow(row, {
-      height: 30,
-      center: [1, 2, 3, 4, 5, 6, 7, 9, 11, 12, 15, 16, 21, 22, 24, 25],
-      moneyCols: [8, 10, 13, 14, 17],
-      dateCols: [1, 9, 15, 24],
-      wrapCols: [29],
-    });
-    row.getCell(21).numFmt = "0";
-    row.getCell(25).numFmt = "hh:mm:ss";
-    [1, 2, 3].forEach((col) => {
-      row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLORS.redSoft } };
-      row.getCell(col).font = { color: { argb: COLORS.red }, bold: col === 2 };
-    });
-    if (item.esReacuerdoEfectivo) {
-      [4, 5].forEach((col) => {
-        row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLORS.lilac } };
-        row.getCell(col).font = { bold: true, color: { argb: COLORS.purple } };
-      });
-    }
-    const paymentCell = row.getCell(6);
-    const paymentFill = ["CON PAGO POSTERIOR", "CON PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo)
-      ? COLORS.greenSoft
-      : ["PAGO MISMO DÍA", "PAGO MISMO DÍA VÁLIDO"].includes(item.estadoPagoAcuerdo)
-      ? COLORS.yellow
-      : ["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo)
-      ? COLORS.redSoft
-      : COLORS.gray;
-    paymentCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: paymentFill } };
-    paymentCell.font = { bold: true, color: { argb: ["SIN PAGO POSTERIOR", "SIN PAGO VÁLIDO"].includes(item.estadoPagoAcuerdo) ? COLORS.red : COLORS.dark } };
-    if (item.primerPagoCubierto) {
-      [14, 16].forEach((col) => {
-        row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLORS.greenSoft } };
-        row.getCell(col).font = { bold: true, color: { argb: "FF075D43" } };
-      });
-    }
-  });
-
-  setWidths(ws, [17, 16, 13, 11, 18, 24, 15, 22, 19, 22, 12, 16, 20, 19, 20, 18, 19, 27, 20, 21, 14, 20, 27, 16, 12, 29, 27, 23, 54, 26]);
-  ws.autoFilter = { from: "A4", to: `AD${Math.max(4, dueRows.length + 4)}` };
-  ws.views = [{ state: "frozen", xSplit: 1, ySplit: 4, showGridLines: false }];
+  addAgreementDetailSheet(workbook, rows, { overdueOnly: true });
 }
 
 export async function crearExcelAcuerdos({ rows = [], summary = {}, metadata = {}, kind = "estadisticas", overdueOnly = false }) {
