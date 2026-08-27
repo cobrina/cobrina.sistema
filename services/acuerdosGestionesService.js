@@ -478,7 +478,9 @@ export function transformarGestionEnAcuerdo(doc = {}) {
 /**
  * Clave estable para comparar acuerdos del mismo caso.
  * Preferimos DNI + número de entidad; si el número no está disponible usamos
- * el nombre normalizado. Esto mantiene compatibilidad con gestiones históricas.
+ * el nombre normalizado. vincularPagosPosteriores completa entidadNumero desde
+ * el catálogo antes de resolver episodios, evitando que un histórico sin número
+ * se separe del acuerdo más nuevo de la misma entidad.
  */
 export function claveCasoAcuerdo(row = {}) {
   const dni = normalizarTexto(row?.dni).replace(/\D/g, "");
@@ -548,6 +550,16 @@ export function vincularPagosPosteriores(
   const entityNumberByName = new Map(
     (entidades || []).map((item) => [claveSimple(item?.nombre), Number(item?.numero)])
   );
+  // También aprendemos la relación nombre→número desde las propias gestiones.
+  // Esto cubre históricos donde una fila trae entidadNumero y otra, del mismo
+  // titular/entidad, conserva solo el nombre aunque el catálogo de Pagos no esté.
+  for (const agreement of acuerdos || []) {
+    const nameKey = claveSimple(agreement?.entidad);
+    const number = Number(agreement?.entidadNumero || 0);
+    if (nameKey && number > 0 && !entityNumberByName.has(nameKey)) {
+      entityNumberByName.set(nameKey, number);
+    }
+  }
   const paymentsByCase = new Map();
 
   (pagos || []).forEach((payment) => {
@@ -610,8 +622,12 @@ export function vincularPagosPosteriores(
   });
 
   return (acuerdos || []).map((agreement, agreementIndex) => {
+    const resolvedEntityNumber = Number(
+      agreement?.entidadNumero || entityNumberByName.get(claveSimple(agreement?.entidad)) || 0
+    );
     const base = {
       ...agreement,
+      entidadNumero: resolvedEntityNumber || Number(agreement?.entidadNumero || 0) || null,
       integracionPagosDisponible: Boolean(disponible),
       integracionPagosMotivo: motivo || "",
       estadoPagoAcuerdo: disponible ? "SIN PAGO VÁLIDO" : "SIN DATOS DE PAGOS",
@@ -647,9 +663,7 @@ export function vincularPagosPosteriores(
 
     const dni = normalizarTexto(agreement?.dni).replace(/\D/g, "");
     const agreementDate = String(agreement?.fecha || "").slice(0, 10);
-    const entityNumber = Number(
-      agreement?.entidadNumero || entityNumberByName.get(claveSimple(agreement?.entidad)) || 0
-    );
+    const entityNumber = resolvedEntityNumber;
     if (!dni || !agreementDate || !entityNumber) {
       return {
         ...base,
@@ -829,21 +843,78 @@ export function resolverEpisodiosAcuerdos(rows = []) {
 
   const pagosDisponibles = input.some((row) => Boolean(row?.integracionPagosDisponible));
   if (!pagosDisponibles) {
-    const effective = deduplicarAcuerdosPorCasoMasReciente(input).map((row) => ({
+    // Sin el módulo Pagos no podemos saber con seguridad si un acuerdo anterior
+    // tuvo cobros y, por lo tanto, conservamos únicamente el último compromiso de
+    // cada caso. Aun así la numeración DEBE mantener el orden cronológico real:
+    // si hubo dos acuerdos y el primero quedó sustituido, el visible sigue siendo
+    // Acuerdo #2 y no vuelve artificialmente a #1.
+    const gruposFallback = new Map();
+    const sinClaveFallback = [];
+    for (const row of input) {
+      const key = claveCasoAcuerdo(row);
+      if (!key) {
+        sinClaveFallback.push(row);
+        continue;
+      }
+      if (!gruposFallback.has(key)) gruposFallback.set(key, []);
+      gruposFallback.get(key).push(row);
+    }
+
+    const effective = [];
+    const descartados = [];
+    gruposFallback.forEach((items, key) => {
+      const ordenados = [...items].sort((a, b) => selloAcuerdo(a).localeCompare(selloAcuerdo(b)));
+      const ultimo = ordenados.at(-1);
+      const episodioNumero = ordenados.length;
+      if (ultimo) {
+        effective.push({
+          ...ultimo,
+          episodioEfectivo: true,
+          episodioCaso: key,
+          episodioNumero,
+          episodiosCaso: ordenados.length,
+          esReacuerdo: episodioNumero > 1,
+          episodioMotivo: "ULTIMO_ACUERDO_SIN_CRUCE_PAGOS",
+          acuerdoReemplazadoSinPago: false,
+          acuerdosPreviosReemplazados: Math.max(0, episodioNumero - 1),
+        });
+      }
+      ordenados.slice(0, -1).forEach((row, index) => descartados.push({
+        ...row,
+        estadoVencimientoOriginal: row?.estadoVencimiento || "",
+        estadoVencimiento: "ANULADO X NUEVO",
+        estadoAcuerdo: "ANULADO X NUEVO",
+        episodioEfectivo: false,
+        episodioNumero: index + 1,
+        episodiosCaso: ordenados.length,
+        esReacuerdo: index > 0,
+        numeroCronologico: index + 1,
+        episodioMotivo: "REEMPLAZADO_SIN_CRUCE_PAGOS",
+        acuerdoReemplazadoSinPago: true,
+        acuerdoAnuladoPorNuevo: true,
+        reemplazadoPorAcuerdoNumero: index + 2,
+        reemplazadoPorAcuerdoId: String(ordenados[index + 1]?.id || ordenados[index + 1]?._id || ""),
+      }));
+    });
+
+    sinClaveFallback.forEach((row) => effective.push({
       ...row,
       episodioEfectivo: true,
       episodioNumero: 1,
-      episodioMotivo: "ULTIMO_ACUERDO_SIN_CRUCE_PAGOS",
+      episodiosCaso: 1,
+      episodioMotivo: "SIN_CLAVE_CASO_SIN_CRUCE_PAGOS",
       acuerdoReemplazadoSinPago: false,
     }));
+    effective.sort((a, b) => selloAcuerdo(b).localeCompare(selloAcuerdo(a)));
+
     return {
       rows: effective,
-      descartados: input.filter((row) => !effective.some((keep) => String(keep.id || keep._id || "") === String(row.id || row._id || ""))),
+      descartados,
       meta: {
         disponiblePagos: false,
         acuerdosCrudos: input.length,
         acuerdosEfectivos: effective.length,
-        acuerdosReemplazadosSinPago: Math.max(0, input.length - effective.length),
+        acuerdosReemplazadosSinPago: descartados.length,
         casosConMasDeUnEpisodio: 0,
         episodiosAdicionalesPagados: 0,
       },
@@ -875,11 +946,13 @@ export function resolverEpisodiosAcuerdos(rows = []) {
       const esUltimo = index === ordenados.length - 1;
       const tienePago = Number(row?.cantidadPagosValidos ?? row?.cantidadPagosPosteriores ?? 0) > 0 ||
         ["CON PAGO POSTERIOR", "CON PAGO VÁLIDO", "PAGO MISMO DÍA", "PAGO MISMO DÍA VÁLIDO"].includes(String(row?.estadoPagoAcuerdo || ""));
+      const numeroCronologico = index + 1;
 
       if (esUltimo || tienePago) {
         keepGroup.push({
           ...row,
           episodioEfectivo: true,
+          numeroCronologico,
           episodioMotivo: esUltimo
             ? (tienePago ? "ULTIMO_ACUERDO_CON_PAGO" : "ULTIMO_ACUERDO_VIGENTE")
             : "ACUERDO_PAGADO_ANTES_DE_REACUERDO",
@@ -888,9 +961,18 @@ export function resolverEpisodiosAcuerdos(rows = []) {
       } else {
         descartados.push({
           ...row,
+          estadoVencimientoOriginal: row?.estadoVencimiento || "",
+          estadoVencimiento: "ANULADO X NUEVO",
+          estadoAcuerdo: "ANULADO X NUEVO",
           episodioEfectivo: false,
+          episodioNumero: numeroCronologico,
+          episodiosCaso: ordenados.length,
+          esReacuerdo: numeroCronologico > 1,
+          numeroCronologico,
           episodioMotivo: "REEMPLAZADO_SIN_PAGO",
           acuerdoReemplazadoSinPago: true,
+          acuerdoAnuladoPorNuevo: true,
+          reemplazadoPorAcuerdoNumero: numeroCronologico + 1,
           reemplazadoPorAcuerdoId: String(ordenados[index + 1]?.id || ordenados[index + 1]?._id || ""),
         });
       }
@@ -902,12 +984,19 @@ export function resolverEpisodiosAcuerdos(rows = []) {
     }
 
     keepGroup.forEach((row, idx) => {
+      const episodioNumero = Number(row.numeroCronologico || idx + 1);
       efectivos.push({
         ...row,
         episodioCaso: key,
-        episodioNumero: idx + 1,
-        episodiosCaso: keepGroup.length,
+        // La numeración representa el orden REAL de acuerdos del caso, no la
+        // cantidad de filas que quedaron visibles. Si el acuerdo #1 venció sin
+        // pago y fue sustituido, desaparece del control de vencidos pero el nuevo
+        // sigue siendo Acuerdo #2 (no vuelve artificialmente a #1).
+        episodioNumero,
+        episodiosCaso: ordenados.length,
+        esReacuerdo: episodioNumero > 1,
         esReacuerdoEfectivo: keepGroup.length > 1 && idx > 0,
+        acuerdosPreviosReemplazados: Math.max(0, episodioNumero - 1 - idx),
       });
     });
   });
@@ -1783,7 +1872,7 @@ const AGREEMENT_DETAIL_COLUMNS = [
   ["ESTADO", 16], ["DNI", 14], ["NOMBRE", 29], ["ENTIDAD", 22], ["OPERADOR", 21],
   ["FECHA GESTIÓN", 16], ["HORA", 11], ["TELÉFONO GESTIÓN", 20],
   ["TIPO DE ACUERDO", 29], ["FECHA 1ER PAGO", 17], ["DÍAS ATRASO / PARA VENCER", 14],
-  ["EPISODIO", 12], ["REACUERDO EFECTIVO", 18],
+  ["N° DE ACUERDO", 15], ["REACUERDO EFECTIVO", 18],
   ["FECHA ANTICIPO", 17], ["IMPORTE ANTICIPO", 19], ["CANTIDAD CUOTAS", 16],
   ["IMPORTE CUOTA", 18], ["PRIMER VENCIMIENTO CUOTA", 20], ["1ER PAGO PROYECTADO", 20],
   ["MONTO CONTRACTUAL", 20], ["DEUDA MÁXIMA", 18],
@@ -1814,7 +1903,7 @@ function agreementDays(item) {
 
 function agreementDetailValues(item) {
   const episodio = item.episodioNumero
-    ? `${item.episodioNumero}${Number(item.episodiosCaso || 0) > 1 ? ` de ${item.episodiosCaso}` : ""}`
+    ? `Acuerdo #${item.episodioNumero}${Number(item.episodiosCaso || 0) > 1 ? ` de ${item.episodiosCaso}` : ""}`
     : "—";
   const observacionCruce = item.requiereRevisionPagos
     ? item.motivoRevisionPagos || "Requiere revisión manual."
@@ -1920,6 +2009,8 @@ function styleAgreementDetailRow(row, item) {
     ? "FFFFD67A"
     : item.estadoVencimiento === "VENCIDO"
     ? "FFFF9FA8"
+    : item.estadoVencimiento === "ANULADO X NUEVO"
+    ? "FFE7E0EE"
     : item.estadoVencimiento === "VENCE HOY"
     ? "FFFFE078"
     : item.estadoVencimiento === "PRÓXIMO 3 DÍAS"

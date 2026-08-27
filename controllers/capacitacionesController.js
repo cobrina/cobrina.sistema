@@ -147,7 +147,7 @@ function labelFrom(list, key, fallback = "") {
 }
 
 function displayUsername(op) {
-  return op?.nombre || op?.username || "—";
+  return op?.username || op?.nombre || "—";
 }
 
 function calcDuration(horaInicio, horaFin, explicitValue) {
@@ -236,9 +236,9 @@ async function sincronizarAgendaCapacitacion(doc, req, rawAgenda) {
     isActive: { $ne: false },
   }).select("_id username nombre role").lean();
 
-  const operatorNames = (doc.operadores || []).map((op) => op?.nombre || op?.username).filter(Boolean).join(", ");
+  const operatorNames = (doc.operadores || []).map((op) => op?.username || op?.nombre).filter(Boolean).join(", ");
   const trainer = empleados.find((e) => String(e.username || "").toLowerCase() === String(doc.capacitadoraUsername || "").toLowerCase());
-  const trainerLabel = trainer?.nombre || trainer?.username || doc.capacitadoraUsername || "Responsable";
+  const trainerLabel = trainer?.username || trainer?.nombre || doc.capacitadoraUsername || "Responsable";
   const titulo = `Capacitación programada · ${operatorNames || "operador"}`.slice(0, 180);
 
   const creados = empleados.length
@@ -278,6 +278,31 @@ function normalizeTemaItems(raw, catalog) {
       clave,
       label: allowed.get(clave),
       detalle: cleanText(item?.detalle, 3000),
+    });
+  }
+  return out;
+}
+
+function normalizeDevolucionesOperadores(raw, operadores = []) {
+  if (!Array.isArray(raw)) return [];
+  const permitidos = new Set((operadores || []).map((op) => cleanText(op?.username, 120).toLowerCase()).filter(Boolean));
+  const vistos = new Set();
+  const out = [];
+  for (const item of raw) {
+    const username = cleanText(item?.username, 120).toLowerCase();
+    if (!username || !permitidos.has(username) || vistos.has(username)) continue;
+    vistos.add(username);
+    const recepcionRaw = String(item?.recepcion || "").toUpperCase();
+    const participacionRaw = String(item?.participacion || "").toUpperCase();
+    const comprensionRaw = String(item?.comprension || "").toUpperCase();
+    const reconoceRaw = String(item?.reconocePuntos || "").toUpperCase();
+    out.push({
+      username,
+      recepcion: ["", "MUY_RECEPTIVO", "RECEPTIVO", "NEUTRAL", "RESISTENCIA", "NO_ACUERDO"].includes(recepcionRaw) ? recepcionRaw : "",
+      participacion: ["", "ALTA", "MEDIA", "BAJA"].includes(participacionRaw) ? participacionRaw : "",
+      comprension: ["", "COMPRENDIO", "PARCIAL", "REQUIERE_REFUERZO"].includes(comprensionRaw) ? comprensionRaw : "",
+      reconocePuntos: ["", "SI", "PARCIAL", "NO"].includes(reconoceRaw) ? reconoceRaw : "",
+      observacion: cleanText(item?.observacion, 6000),
     });
   }
   return out;
@@ -346,7 +371,9 @@ async function applyPayload(doc, body, req, { mode = "save", preserveAssignment 
   const modalidad = String(body.modalidad || doc.modalidad || "PRESENCIAL").toUpperCase();
   doc.modalidad = ["PRESENCIAL", "MEET", "TELEFONICA", "OTRA"].includes(modalidad) ? modalidad : "OTRA";
 
-  if (body.fechaCapacitacion !== undefined) doc.fechaCapacitacion = safeDate(body.fechaCapacitacion, doc.fechaCapacitacion || new Date());
+  if (body.fechaCapacitacion !== undefined) {
+    doc.fechaCapacitacion = body.fechaCapacitacion ? safeDate(body.fechaCapacitacion, doc.fechaCapacitacion || new Date()) : null;
+  }
   if (body.horaInicio !== undefined) doc.horaInicio = cleanText(body.horaInicio, 5);
   if (body.horaFin !== undefined) doc.horaFin = cleanText(body.horaFin, 5);
   doc.duracionMinutos = calcDuration(doc.horaInicio, doc.horaFin, body.duracionMinutos);
@@ -368,6 +395,12 @@ async function applyPayload(doc, body, req, { mode = "save", preserveAssignment 
   if (body.temasGestion !== undefined) doc.temasGestion = normalizeTemaItems(body.temasGestion, TEMAS_GESTION);
   if (body.herramientas !== undefined) doc.herramientas = normalizeTemaItems(body.herramientas, HERRAMIENTAS);
   if (body.materiales !== undefined) doc.materiales = cleanArray(body.materiales, 30, 120);
+
+  if (body.devolucionesOperadores !== undefined) {
+    doc.devolucionesOperadores = normalizeDevolucionesOperadores(body.devolucionesOperadores, doc.operadores);
+  } else if (Array.isArray(doc.devolucionesOperadores) && doc.devolucionesOperadores.length) {
+    doc.devolucionesOperadores = normalizeDevolucionesOperadores(doc.devolucionesOperadores, doc.operadores);
+  }
 
   const recepcion = String(body.recepcion ?? doc.recepcion ?? "").toUpperCase();
   if (["", "MUY_RECEPTIVO", "RECEPTIVO", "NEUTRAL", "RESISTENCIA", "NO_ACUERDO"].includes(recepcion)) doc.recepcion = recepcion;
@@ -409,6 +442,10 @@ function baseFilterFromQuery(query = {}) {
   if (query.operador) filter["operadores.username"] = cleanText(query.operador, 120).toLowerCase();
   if (query.capacitadora) filter.capacitadoraUsername = cleanText(query.capacitadora, 120).toLowerCase();
   if (query.origen) filter.origen = String(query.origen).toUpperCase();
+  if (String(query.historicoIncompleto || "").toLowerCase() === "true") {
+    filter["registroHistorico.esHistorico"] = true;
+    filter["registroHistorico.datosIncompletos"] = true;
+  }
   if (query.desde || query.hasta) {
     filter.fechaCapacitacion = {};
     if (query.desde) filter.fechaCapacitacion.$gte = startOfDay(query.desde);
@@ -619,6 +656,11 @@ export async function editar(req, res) {
     const doc = await Capacitacion.findOne({ _id: req.params.id, borrado: { $ne: true } });
     if (!doc) return res.status(404).json({ error: "Capacitación no encontrada." });
     await applyPayload(doc, req.body || {}, req, { mode: req.body?.guardarComoBorrador ? "draft" : "final", preserveAssignment: true });
+    if (doc.registroHistorico?.esHistorico && !req.body?.guardarComoBorrador && doc.fechaCapacitacion) {
+      doc.registroHistorico.datosIncompletos = false;
+      doc.registroHistorico.fechaPendiente = false;
+      doc.registroHistorico.completadoAt = new Date();
+    }
     await doc.save();
     if (!req.body?.guardarComoBorrador) {
       await AgendaItem.updateMany({ origenSistema: "capacitacion", referenciaId: doc._id }, { $set: { completada: true } });
@@ -626,6 +668,150 @@ export async function editar(req, res) {
     return res.json({ ok: true, item: doc.toObject() });
   } catch (error) {
     return res.status(400).json({ error: error?.message || "No se pudo actualizar la capacitación." });
+  }
+}
+
+
+function normalizarNombreHistorico(value) {
+  return cleanText(value, 180)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function usernameHistorico(nombre, index = 0) {
+  const slug = normalizarNombreHistorico(nombre).replace(/\s+/g, ".").slice(0, 70) || "sin.nombre";
+  const suffix = `${Date.now().toString(36)}${Number(index || 0).toString(36)}`;
+  return `historico.${slug}.${suffix}`.slice(0, 120);
+}
+
+export async function crearHistoricos(req, res) {
+  try {
+    const nombres = cleanArray(req.body?.nombres || [], 200, 180);
+    if (!nombres.length) return res.status(400).json({ error: "Pegá al menos un nombre para incorporar al histórico." });
+
+    const responsableUsername = await resolveResponsableCapacitacion(
+      req.body?.capacitadoraUsername,
+      req.user.username
+    );
+    const empleados = await Empleado.find({ isActive: { $ne: false } })
+      .select("username nombre role")
+      .lean();
+    const porUsername = new Map(empleados.map((x) => [String(x.username || "").toLowerCase(), x]));
+    const porNombre = new Map();
+    empleados.forEach((x) => {
+      const key = normalizarNombreHistorico(x.nombre);
+      if (!key) return;
+      if (!porNombre.has(key)) porNombre.set(key, []);
+      porNombre.get(key).push(x);
+    });
+
+    const previos = await Capacitacion.find({
+      borrado: { $ne: true },
+      "registroHistorico.esHistorico": true,
+      "registroHistorico.datosIncompletos": true,
+    }).select("registroHistorico.nombreOriginal").lean();
+    const existentes = new Set(previos.map((x) => normalizarNombreHistorico(x?.registroHistorico?.nombreOriginal)).filter(Boolean));
+
+    const docs = [];
+    const omitidos = [];
+    const sinVincular = [];
+    nombres.forEach((nombre, index) => {
+      const original = cleanText(nombre, 180);
+      const key = normalizarNombreHistorico(original);
+      if (!key || existentes.has(key)) {
+        if (key) omitidos.push(original);
+        return;
+      }
+      existentes.add(key);
+      const exactUsername = porUsername.get(original.toLowerCase());
+      const coincidenciasNombre = porNombre.get(key) || [];
+      const empleado = exactUsername || (coincidenciasNombre.length === 1 ? coincidenciasNombre[0] : null);
+      const username = empleado?.username ? String(empleado.username).toLowerCase() : usernameHistorico(original, index);
+      if (!empleado) sinVincular.push(original);
+      docs.push({
+        operadores: [{ username, nombre: cleanText(empleado?.nombre || original, 160) }],
+        capacitadoraUsername: responsableUsername,
+        creadaPorUsername: String(req.user.username || "").toLowerCase(),
+        asignadaPorUsername: String(req.user.username || "").toLowerCase(),
+        fechaCapacitacion: null,
+        duracionMinutos: 0,
+        tipoCapacitacion: "INDIVIDUAL",
+        modalidad: "OTRA",
+        estado: "CERRADA",
+        origen: "OTRO",
+        motivos: ["OTRO"],
+        notaAsignacion: "Registro histórico anterior a la carga en Cobrina. Falta completar fecha y detalle.",
+        cerradaAt: new Date(),
+        registroHistorico: {
+          esHistorico: true,
+          datosIncompletos: true,
+          nombreOriginal: original,
+          fechaPendiente: true,
+          completadoAt: null,
+        },
+      });
+    });
+
+    const creados = docs.length ? await Capacitacion.insertMany(docs, { ordered: true }) : [];
+    return res.status(201).json({
+      ok: true,
+      creados: creados.length,
+      omitidos,
+      sinVincular,
+      items: creados.map((x) => x.toObject()),
+    });
+  } catch (error) {
+    return res.status(400).json({ error: error?.message || "No se pudieron cargar los registros históricos." });
+  }
+}
+
+export async function coberturaHistorica(_req, res) {
+  try {
+    const [docs, empleados] = await Promise.all([
+      Capacitacion.find({ borrado: { $ne: true }, estado: { $in: ESTADOS_REALIZADOS } })
+        .select("operadores registroHistorico fechaCapacitacion")
+        .lean(),
+      Empleado.find({ isActive: { $ne: false } }).select("username nombre role").lean(),
+    ]);
+    const operadoresActivos = empleados
+      .filter((x) => [ROLES.OPERADOR, ROLES.OPERADOR_VIP].includes(getEffectiveRole(x.role, x.username)))
+      .map((x) => ({ username: String(x.username || "").toLowerCase(), nombre: cleanText(x.nombre, 160) }))
+      .filter((x) => x.username)
+      .sort((a, b) => a.username.localeCompare(b.username, "es"));
+
+    const capacitados = new Set();
+    const historicosSinUsuario = [];
+    for (const doc of docs) {
+      for (const op of doc.operadores || []) {
+        const username = String(op?.username || "").toLowerCase();
+        if (username && !username.startsWith("historico.")) capacitados.add(username);
+      }
+      if (doc?.registroHistorico?.esHistorico && doc?.registroHistorico?.datosIncompletos) {
+        const op = doc.operadores?.[0];
+        if (String(op?.username || "").startsWith("historico.")) {
+          historicosSinUsuario.push({
+            id: String(doc._id),
+            nombre: doc.registroHistorico.nombreOriginal || op?.nombre || "Sin identificar",
+          });
+        }
+      }
+    }
+
+    const detalle = operadoresActivos.map((op) => ({ ...op, capacitado: capacitados.has(op.username) }));
+    return res.json({
+      ok: true,
+      totalOperadores: detalle.length,
+      capacitados: detalle.filter((x) => x.capacitado).length,
+      faltantes: detalle.filter((x) => !x.capacitado),
+      operadores: detalle,
+      historicosSinUsuario,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: "No se pudo calcular la cobertura histórica de capacitación." });
   }
 }
 
@@ -1003,6 +1189,23 @@ function writeCapacitacionPDF(pdf, item, index = null) {
     pdf.font("Helvetica").fontSize(7.0).fillColor("#51495a").text(item.materiales.join(" · "), { lineGap: 0 });
   }
 
+  if (Array.isArray(item.devolucionesOperadores) && item.devolucionesOperadores.length) {
+    sectionTitle(pdf, "Recepción individual por operador", "#ff00cc");
+    item.devolucionesOperadores.forEach((d) => {
+      ensurePage(pdf, 42);
+      pdf.font("Helvetica-Bold").fontSize(7.4).fillColor("#322247").text(d.username || "Operador");
+      const parts = [
+        `Recepción: ${pdfLabel(RECEPCION_PDF_LABELS, d.recepcion, d.recepcion || "—")}`,
+        `Participación: ${pdfLabel(PARTICIPACION_PDF_LABELS, d.participacion, d.participacion || "—")}`,
+        `Comprensión: ${pdfLabel(COMPRENSION_PDF_LABELS, d.comprension, d.comprension || "—")}`,
+        `Reconoce: ${pdfLabel(RECONOCE_PDF_LABELS, d.reconocePuntos, d.reconocePuntos || "—")}`,
+      ];
+      pdf.font("Helvetica").fontSize(6.8).fillColor("#51495a").text(parts.join(" · "));
+      if (d.observacion) pdf.font("Helvetica").fontSize(6.8).fillColor("#7b7187").text(`Observación: ${d.observacion}`);
+      pdf.moveDown(0.35);
+    });
+  }
+
   if (item.recepcion || item.comprension || item.participacion || item.reconocePuntos) {
     sectionTitle(pdf, "Resultado de la devolución", "#ff00cc");
     drawSummaryRow(pdf, [
@@ -1294,6 +1497,7 @@ export async function exportarExcel(req, res) {
       { header: "DURACIÓN", key: "duracion", width: 14 },
       { header: "RECEPCIÓN", key: "recepcion", width: 18 },
       { header: "COMPRENSIÓN", key: "comprension", width: 20 },
+      { header: "DEVOLUCIÓN INDIVIDUAL POR OPERADOR", key: "devolucionIndividual", width: 62 },
       { header: "OBSERVACIÓN", key: "observacion", width: 60 },
       { header: "FORTALEZAS", key: "fortalezas", width: 48 },
       { header: "PUNTO A REFORZAR", key: "reforzar", width: 48 },
@@ -1315,6 +1519,7 @@ export async function exportarExcel(req, res) {
         duracion: resolvedDuration(item) ? formatMinutes(resolvedDuration(item)) : "—",
         recepcion: item.recepcion,
         comprension: item.comprension,
+        devolucionIndividual: (item.devolucionesOperadores || []).map((d) => `${d.username}: recepción ${d.recepcion || "—"}, participación ${d.participacion || "—"}, comprensión ${d.comprension || "—"}, reconoce ${d.reconocePuntos || "—"}${d.observacion ? ` · ${d.observacion}` : ""}`).join(" | "),
         observacion: item.observacionCapacitadora,
         fortalezas: item.fortalezas || "",
         reforzar: item.puntoPrincipalReforzar || "",
@@ -1326,7 +1531,7 @@ export async function exportarExcel(req, res) {
       });
     }
     ws.views = [{ state: "frozen", ySplit: 1 }];
-    ws.autoFilter = { from: "A1", to: "Q1" };
+    ws.autoFilter = { from: "A1", to: "R1" };
     ws.eachRow((row, idx) => {
       row.alignment = { vertical: "top", wrapText: true };
       if (idx === 1) row.height = 24;

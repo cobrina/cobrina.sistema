@@ -10,6 +10,8 @@ import {
   crear,
   editar,
   listar,
+  crearHistoricos,
+  coberturaHistorica,
   pendientes,
   seguimientosPendientes,
   detalle,
@@ -35,12 +37,14 @@ router.get("/resumen", ...lectura, resumen);
 router.get("/pendientes", ...lectura, pendientes);
 router.get("/seguimientos", ...lectura, seguimientosPendientes);
 router.get("/listar", ...lectura, listar);
+router.get("/cobertura", ...lectura, coberturaHistorica);
 router.get("/export/pdf", ...lectura, exportarPDF);
 router.get("/export/excel", ...lectura, exportarExcel);
 router.get("/:id/pdf", ...lectura, exportarIndividualPDF);
 router.get("/:id", ...lectura, detalle);
 
 router.post("/pendiente", ...escritura, crearPendiente);
+router.post("/historicos", ...escritura, crearHistoricos);
 router.put("/pendiente/:id", ...escritura, editarPendiente);
 router.post("/desde-auditoria/:auditoriaId", ...escritura, desdeAuditoria);
 router.post("/crear", ...escritura, crear);

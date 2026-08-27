@@ -26,6 +26,8 @@ import {
   resumirAcuerdos,
   crearExcelAcuerdos,
   vincularPagosPosteriores,
+  claveCasoAcuerdo,
+  selloAcuerdo,
   TIPOS_ACUERDO,
 } from "../services/acuerdosGestionesService.js";
 
@@ -3394,6 +3396,228 @@ async function vincularPagosConAcuerdosSinRomper(acuerdos = [], { fechaHasta = "
 }
 
 
+// Normalización local para el control preventivo de reacuerdos.
+// Se mantiene en este controller para no depender de helpers internos del service.
+const claveSimple = (value) =>
+  String(value ?? "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+function esAcuerdoEnCuotasReal(row = {}) {
+  const tipo = claveSimple(row?.tipoAcuerdo);
+  return tipo === "acuerdo en cuotas con anticipo" || tipo === "acuerdo en cuotas sin anticipo";
+}
+
+function mesISO(value) {
+  const text = String(value || "").slice(0, 7);
+  return /^\d{4}-\d{2}$/.test(text) ? text : "";
+}
+
+function mesesSonConsecutivos(anterior = "", siguiente = "") {
+  const [y1, m1] = String(anterior).split("-").map(Number);
+  const [y2, m2] = String(siguiente).split("-").map(Number);
+  if (!y1 || !m1 || !y2 || !m2) return false;
+  return (y2 * 12 + m2) - (y1 * 12 + m1) === 1;
+}
+
+function pagosValidosDelMismoMes(row = {}) {
+  const mesAcuerdo = mesISO(row?.fecha);
+  if (!mesAcuerdo) return [];
+  const pagos = Array.isArray(row?.pagosValidos) ? row.pagosValidos : [];
+  return pagos.filter((pago) => mesISO(pago?.fecha || pago?.fechaPago) === mesAcuerdo);
+}
+
+function rachaConsecutivaMasLarga(meses = []) {
+  const unicos = [...new Set((meses || []).filter(Boolean))].sort();
+  if (unicos.length < 2) return [];
+
+  let mejor = [];
+  let actual = [unicos[0]];
+  for (let i = 1; i < unicos.length; i += 1) {
+    if (mesesSonConsecutivos(unicos[i - 1], unicos[i])) {
+      actual.push(unicos[i]);
+    } else {
+      if (actual.length > mejor.length || (actual.length === mejor.length && actual.at(-1) > (mejor.at(-1) || ""))) {
+        mejor = actual;
+      }
+      actual = [unicos[i]];
+    }
+  }
+  if (actual.length > mejor.length || (actual.length === mejor.length && actual.at(-1) > (mejor.at(-1) || ""))) {
+    mejor = actual;
+  }
+  return mejor.length >= 2 ? mejor : [];
+}
+
+/**
+ * Control preventivo de reacuerdos repetidos.
+ * Busca, dentro de los 90 días terminados en la fecha "Hasta" del reporte,
+ * casos DNI + entidad donde se repite un ACUERDO EN CUOTAS (con o sin anticipo)
+ * en MESES CONSECUTIVOS y en cada uno de esos meses existe un pago válido del
+ * acuerdo cargado ese mismo mes.
+ *
+ * No dispara por Parciales ni Cancelaciones. Tampoco dispara cuando existe un
+ * acuerdo viejo, pasan uno o más meses sin este patrón y recién después se hace
+ * otro acuerdo: la señal que interesa es "paga este mes + le cargan acuerdo",
+ * y al mes siguiente vuelve a ocurrir lo mismo, en vez de continuar el acuerdo.
+ */
+async function detectarReacuerdosRecurrentes90Dias(req, { hasta = "", operador = "", entidad = "", dni = "" } = {}) {
+  const now = new Date();
+  const requestedEnd = diaFinUTC(hasta);
+  const end = requestedEnd && requestedEnd < now ? requestedEnd : now;
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - 89);
+  start.setUTCHours(0, 0, 0, 0);
+
+  const match = {
+    ...ownerScope(req),
+    borrado: { $ne: true },
+    usuario: await activeUserFilter(operador),
+    fecha: { $gte: start, $lte: end },
+    resultadoGestion: /acuerdo/i,
+  };
+  const fEntidad = rxExactMulti(entidad, (value) => value.toUpperCase());
+  const fDni = buildDniFilter(dni);
+  if (fEntidad) match.entidad = fEntidad;
+  if (fDni) match.dni = fDni;
+
+  const rawRows = await ReporteGestion.find(match)
+    .select("dni nombreDeudor fecha hora usuario resultadoGestion observacionGestion entidad entidadNumero tipoContacto estadoCuenta telMailMarcado")
+    .sort({ fecha: 1, hora: 1, _id: 1 })
+    .lean()
+    .maxTimeMS(30000);
+
+  const base = rawRows.map((row) => transformarGestionEnAcuerdo(row)).filter(Boolean);
+  if (!base.length) {
+    return {
+      disponible: true,
+      desde: start.toISOString().slice(0, 10),
+      hasta: end.toISOString().slice(0, 10),
+      totalCasos: 0,
+      casos: [],
+      porOperador: [],
+    };
+  }
+
+  const paymentLink = await vincularPagosConAcuerdosSinRomper(base, { fechaHasta: end.toISOString().slice(0, 10) });
+  if (!paymentLink.meta?.disponible) {
+    return {
+      disponible: false,
+      motivo: paymentLink.meta?.motivo || "SIN_DATOS_PAGOS",
+      desde: start.toISOString().slice(0, 10),
+      hasta: end.toISOString().slice(0, 10),
+      totalCasos: 0,
+      casos: [],
+      porOperador: [],
+    };
+  }
+
+  const groups = new Map();
+  const rowsVisibles = filtrarFilasReportesControl(paymentLink.rows || [], (row) => row?.usuario || row?.operador);
+  for (const row of rowsVisibles) {
+    const key = claveCasoAcuerdo(row);
+    if (!key) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+
+  const casos = [];
+  groups.forEach((items, key) => {
+    const ordenados = [...items].sort((a, b) => selloAcuerdo(a).localeCompare(selloAcuerdo(b)));
+    const numerados = ordenados.map((row, index) => ({ row, numero: index + 1 }));
+    const acuerdosEnCuotas = numerados.filter(({ row }) => esAcuerdoEnCuotasReal(row));
+
+    // Para esta alerta no alcanza con que el acuerdo tenga "algún pago" en su
+    // ventana. Debe haber un pago válido en el MISMO MES en que se cargó ese
+    // acuerdo. Así un acuerdo viejo que recién recibe un pago meses después no
+    // se interpreta como si el titular hubiera venido pagando mes a mes.
+    const acuerdosPagadosEnSuMes = acuerdosEnCuotas
+      .map(({ row, numero }) => {
+        const pagosDelMes = pagosValidosDelMismoMes(row);
+        return {
+          row,
+          numero,
+          mes: mesISO(row?.fecha),
+          pagosDelMes,
+          montoDelMes: pagosDelMes.reduce((total, pago) => total + Math.max(0, Number(pago?.monto || 0)), 0),
+        };
+      })
+      .filter((item) => item.mes && item.pagosDelMes.length > 0);
+
+    const mesesConPagoYAcuerdo = [...new Set(acuerdosPagadosEnSuMes.map((item) => item.mes))].sort();
+    const meses = rachaConsecutivaMasLarga(mesesConPagoYAcuerdo);
+
+    // Solo hace ruido si el patrón se repite en meses corridos: por ejemplo
+    // julio y agosto, o junio-julio-agosto. Junio + agosto NO dispara alerta.
+    if (meses.length < 2) return;
+
+    const mesesSet = new Set(meses);
+    const pagos = acuerdosPagadosEnSuMes.filter((item) => mesesSet.has(item.mes));
+    const operadores = [...new Set(pagos.map(({ row }) => String(row?.usuario || row?.operador || "").trim()).filter(Boolean))];
+    const ultimo = pagos.at(-1)?.row || ordenados.at(-1) || {};
+    const detalle = pagos.map(({ row, numero, mes, pagosDelMes, montoDelMes }) => ({
+      numeroAcuerdo: numero,
+      fecha: String(row?.fecha || "").slice(0, 10),
+      mes,
+      operador: row?.usuario || row?.operador || "",
+      tipoAcuerdo: row?.tipoAcuerdo || "",
+      montoPagosValidos: montoDelMes,
+      cantidadPagosValidos: pagosDelMes.length,
+      fechasPagosValidos: pagosDelMes.map((pago) => String(pago?.fecha || pago?.fechaPago || "").slice(0, 10)).filter(Boolean),
+    }));
+
+    casos.push({
+      clave: key,
+      dni: String(ultimo?.dni || ""),
+      nombreDeudor: String(ultimo?.nombreDeudor || ""),
+      entidad: String(ultimo?.entidad || ""),
+      operador: String(ultimo?.usuario || ultimo?.operador || ""),
+      operadores,
+      acuerdosRegistrados90d: ordenados.length,
+      acuerdosEnCuotas90d: acuerdosEnCuotas.length,
+      acuerdosConPago90d: pagos.length,
+      mesesConAcuerdoPagado: meses.length,
+      meses,
+      nivel: meses.length >= 3 ? "ALTO" : "REVISAR",
+      criterio: "ACUERDO_EN_CUOTAS_Y_PAGO_MISMO_MES_CONSECUTIVO",
+      detalle,
+    });
+  });
+
+  casos.sort((a, b) =>
+    Number(b.mesesConAcuerdoPagado || 0) - Number(a.mesesConAcuerdoPagado || 0) ||
+    Number(b.acuerdosConPago90d || 0) - Number(a.acuerdosConPago90d || 0) ||
+    String(a.operador || "").localeCompare(String(b.operador || ""), "es")
+  );
+
+  const porOperadorMap = new Map();
+  casos.forEach((caso) => {
+    const lista = caso.operadores?.length ? caso.operadores : [caso.operador].filter(Boolean);
+    lista.forEach((username) => {
+      if (!porOperadorMap.has(username)) porOperadorMap.set(username, { operador: username, casos: 0, acuerdosConPago: 0 });
+      const item = porOperadorMap.get(username);
+      item.casos += 1;
+      item.acuerdosConPago += Number(caso.detalle?.filter((x) => x.operador === username).length || 0);
+    });
+  });
+
+  return {
+    disponible: true,
+    desde: start.toISOString().slice(0, 10),
+    hasta: end.toISOString().slice(0, 10),
+    totalCasos: casos.length,
+    casos: casos.slice(0, 100),
+    porOperador: [...porOperadorMap.values()].sort((a, b) => b.casos - a.casos || String(a.operador).localeCompare(String(b.operador), "es")),
+  };
+}
+
 function clavePagoReporte(pago = {}) {
   return String(
     pago?._id ||
@@ -3796,25 +4020,38 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     episodios: episodios.meta,
     recaudacionPeriodo,
   };
-  let acuerdos = acuerdosPeriodoEfectivos;
+  let acuerdosEfectivos = acuerdosPeriodoEfectivos;
+  let acuerdosAnulados = (episodios.descartados || []).map((row) => ({
+    ...row,
+    estadoVencimientoOriginal: row?.estadoVencimientoOriginal || row?.estadoVencimiento || "",
+    estadoVencimiento: "ANULADO X NUEVO",
+    estadoAcuerdo: "ANULADO X NUEVO",
+    acuerdoAnuladoPorNuevo: true,
+  }));
 
   const tiposSolicitados = splitCSV(tipoAcuerdo).map((value) => value.toLocaleLowerCase("es"));
   if (tiposSolicitados.length) {
     const tiposSet = new Set(tiposSolicitados);
-    acuerdos = acuerdos.filter((row) => tiposSet.has(String(row.tipoAcuerdo || "").toLocaleLowerCase("es")));
+    acuerdosEfectivos = acuerdosEfectivos.filter((row) => tiposSet.has(String(row.tipoAcuerdo || "").toLocaleLowerCase("es")));
+    acuerdosAnulados = acuerdosAnulados.filter((row) => tiposSet.has(String(row.tipoAcuerdo || "").toLocaleLowerCase("es")));
   }
 
   const estadosSolicitados = splitCSV(estadoVencimiento).map((value) => value.toLocaleUpperCase("es"));
   if (estadosSolicitados.length) {
     const estadosSet = new Set(estadosSolicitados);
-    acuerdos = acuerdos.filter((row) => estadosSet.has(String(row.estadoVencimiento || "").toLocaleUpperCase("es")));
+    acuerdosEfectivos = acuerdosEfectivos.filter((row) => estadosSet.has(String(row.estadoVencimiento || "").toLocaleUpperCase("es")));
+    acuerdosAnulados = acuerdosAnulados.filter((row) => estadosSet.has(String(row.estadoVencimiento || "").toLocaleUpperCase("es")));
   }
   if (soloVencidos) {
-    acuerdos = acuerdos.filter((row) => row.estadoVencimiento === "VENCIDO");
+    acuerdosEfectivos = acuerdosEfectivos.filter((row) => row.estadoVencimiento === "VENCIDO");
+    acuerdosAnulados = [];
   }
 
+  const acuerdos = [...acuerdosEfectivos, ...acuerdosAnulados];
   const appliedSort = ordenarAcuerdos(acuerdos, sortKey, sortDir);
-  const summary = resumirAcuerdos(acuerdos, totalGestiones, gestionesPorOperador, paymentMeta);
+  const summary = resumirAcuerdos(acuerdosEfectivos, totalGestiones, gestionesPorOperador, paymentMeta);
+  summary.registrosAnuladosPorNuevo = acuerdosAnulados.length;
+  summary.alertasReacuerdos90d = await detectarReacuerdosRecurrentes90Dias(req, { hasta, operador, entidad, dni });
   const acuerdosVisibles = filtrarFilasReportesControl(acuerdos, (row) => row?.usuario);
 
   if (paginate && desde && hasta) {
@@ -3887,7 +4124,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
   }
 
   const dueRows = acuerdosVisibles
-    .filter((row) => row.fechaPrimerPago || row.primerVencimiento)
+    .filter((row) => !row.acuerdoAnuladoPorNuevo && (row.fechaPrimerPago || row.primerVencimiento))
     .slice()
     .sort((a, b) =>
       (a.fechaPrimerPago || a.primerVencimiento || "9999-12-31").localeCompare(b.fechaPrimerPago || b.primerVencimiento || "9999-12-31") ||
@@ -3915,7 +4152,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     limit: safeLimit,
     catalogos: {
       tiposAcuerdo: TIPOS_ACUERDO,
-      estadosVencimiento: ["PAGADO", "PAGADO PARCIAL", "VENCIDO", "VENCE HOY", "PRÓXIMO 3 DÍAS", "PENDIENTE"],
+      estadosVencimiento: ["PAGADO", "PAGADO PARCIAL", "VENCIDO", "VENCE HOY", "PRÓXIMO 3 DÍAS", "PENDIENTE", "ANULADO X NUEVO"],
       estadosPagoAcuerdo: ["CON PAGO VÁLIDO", "PAGO MISMO DÍA VÁLIDO", "SIN PAGO VÁLIDO", "REQUIERE REVISIÓN"],
     },
     integracionPagos: paymentMeta,

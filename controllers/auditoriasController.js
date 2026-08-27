@@ -6,15 +6,23 @@ import { toDateOnly, normalizarHora } from "../utils/fecha.util.js";
 import {
   CRITERIOS_TITULAR,
   FORMULARIOS_AUDITORIA,
+  FORMULARIOS_LEGACY,
   MOTIVOS_NO_AUDITABLE,
   PESOS_AUDITORIA,
+  QUIEN_CONDUJO_OPCIONES,
+  RESULTADO_COMERCIAL_OPCIONES,
   UMBRALES_AUDITORIA,
   calcularScoresAuditoriaItem,
+  crearSnapshotFormulario,
   criterioPorId,
+  esTipoInterlocutorVigente,
   formularioAplicadoParaTipo,
   normalizarResultadosItem,
   normalizarTipoInterlocutor,
   semaforoAuditoria,
+  valorAplicadoResultado,
+  valorResultadoCriterio,
+  versionFormularioActual,
 } from "../config/auditorias.js";
 
 /* ============================================================
@@ -146,48 +154,122 @@ function isLlamada(tipoInteraccion = "") {
 
 /* ============================================================
    Formularios, resultados y score
-   - TITULAR conserva exactamente los 24 criterios históricos.
-   - TERCERO y TERCERO_PAGADOR usan formularios separados.
-   - NO_APLICA se excluye del denominador ponderado.
+   - Las auditorías nuevas usan sólo formularios vigentes.
+   - Las históricas conservan su formulario/score y se reconstruyen con V1.
+   - NO_APLICA se excluye del cálculo.
    ============================================================ */
 const PESOS = PESOS_AUDITORIA;
 const UMBRAL_BAJO = UMBRALES_AUDITORIA.bajo;
 const UMBRAL_ALTO = UMBRALES_AUDITORIA.alto;
 
+function objectFromMaybeMap(raw) {
+  if (raw instanceof Map) return Object.fromEntries(raw);
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw;
+  return {};
+}
 
-function parseComentariosCriterio(it = {}) {
-  const raw =
-    it?.comentariosCriterio ??
-    it?.comentariosPorCriterio ??
-    it?.comentarios ??
-    {};
+function inferirVersionHistorica(base = {}) {
+  const explicit = Number(base?.versionFormulario ?? base?.formularioSnapshot?.version);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
 
+  const key = String(base?.formularioAplicado || base?.tipoInterlocutor || "TITULAR").toUpperCase();
+  if (["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(key)) return 1;
+  return versionFormularioActual(key) || 1;
+}
+
+function formularioSnapshotSalida(base = {}) {
+  if (base?.formularioSnapshot?.criterios?.length) return base.formularioSnapshot;
+  const key = String(base?.formularioAplicado || formularioAplicadoParaTipo(base?.tipoInterlocutor || "TITULAR")).toUpperCase();
+  if (key === "NINGUNO") return null;
+  return crearSnapshotFormulario(key, inferirVersionHistorica(base));
+}
+
+function esAuditoriaHistoricaProtegida(base = {}) {
+  const key = String(base?.formularioAplicado || formularioAplicadoParaTipo(base?.tipoInterlocutor || "TITULAR")).toUpperCase();
+  if (key === "NINGUNO") return false;
+  if (!base?.formularioSnapshot?.criterios?.length) return true;
+  const version = inferirVersionHistorica(base);
+  const actual = versionFormularioActual(key);
+  if (actual == null) return true;
+  return version !== actual;
+}
+
+function parseComentariosCriterio(it = {}, criterios = []) {
+  const raw = it?.comentariosCriterio ?? it?.comentariosPorCriterio ?? it?.comentarios ?? {};
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
 
+  const idsValidos = new Set((criterios || []).map((c) => Number(c.id)));
   const out = {};
-
   for (const [key, value] of Object.entries(raw)) {
     const criterioId = Number(key);
-    if (!Number.isInteger(criterioId) || criterioId < 1 || criterioId > 24) continue;
-
+    if (!Number.isInteger(criterioId) || !idsValidos.has(criterioId)) continue;
     const txt = String(value ?? "").trim();
     if (!txt) continue;
-
     out[String(criterioId)] = txt.slice(0, 1000);
   }
-
   return out;
 }
 
-function calcScoresFromResultados(resultadosCriterios = {}, formulario = "TITULAR") {
-  return calcularScoresAuditoriaItem(resultadosCriterios, formulario);
+function validarResultadosYComentarios(resultadosCriterios = {}, comentariosCriterio = {}, criterios = [], itemIndex = 0) {
+  for (const c of criterios) {
+    const estado = valorResultadoCriterio(resultadosCriterios[String(c.id)] ?? resultadosCriterios[c.id]);
+    if (estado === "SIN_RESPUESTA") {
+      const err = new Error(`Audio #${itemIndex + 1}: falta responder el criterio ${c.id} · ${c.label}.`);
+      err.statusCode = 400;
+      err.fieldError = { itemIndex, criterioId: c.id, tipo: "respuesta", mensaje: "Seleccioná Sí, Parcial, No o No aplica." };
+      throw err;
+    }
+    if (["PARCIAL", "NO"].includes(estado)) {
+      const comentario = String(comentariosCriterio[String(c.id)] ?? comentariosCriterio[c.id] ?? "").trim();
+      if (!comentario) {
+        const err = new Error(`Audio #${itemIndex + 1}: el criterio ${c.id} requiere comentario al marcar ${estado === "PARCIAL" ? "Parcial" : "No"}.`);
+        err.statusCode = 400;
+        err.fieldError = { itemIndex, criterioId: c.id, tipo: "comentario", mensaje: `El comentario es obligatorio cuando el resultado es ${estado === "PARCIAL" ? "Parcial" : "No"}.` };
+        throw err;
+      }
+    }
+  }
+}
+
+function construirEvaluacionSnapshot(resultadosCriterios = {}, comentariosCriterio = {}, criterios = []) {
+  return (criterios || []).map((c) => {
+    const respuesta = valorResultadoCriterio(resultadosCriterios[String(c.id)] ?? resultadosCriterios[c.id]);
+    return {
+      criterioId: Number(c.id),
+      orden: Number(c.orden ?? c.id),
+      bloque: c.grupo,
+      nombre: c.label,
+      respuesta,
+      comentario: String(comentariosCriterio[String(c.id)] ?? comentariosCriterio[c.id] ?? "").trim().slice(0, 1000),
+      valorAplicado: valorAplicadoResultado(respuesta),
+    };
+  });
+}
+
+function construirEvaluacionHistoricaSalida(it = {}, criterios = []) {
+  if (Array.isArray(it?.evaluacionSnapshot) && it.evaluacionSnapshot.length) return it.evaluacionSnapshot;
+  const resultados = normalizarResultadosItem(it, criterios).resultadosCriterios;
+  const comentarios = objectFromMaybeMap(it?.comentariosCriterio);
+  return (criterios || []).map((c) => ({
+    criterioId: Number(c.id),
+    orden: Number(c.orden ?? c.id),
+    bloque: c.grupo,
+    nombre: c.label,
+    respuesta: valorResultadoCriterio(resultados[String(c.id)]),
+    comentario: String(comentarios[String(c.id)] ?? "").trim(),
+    valorAplicado: valorAplicadoResultado(resultados[String(c.id)]),
+  }));
+}
+
+function calcScoresFromResultados(resultadosCriterios = {}, criterios = []) {
+  return calcularScoresAuditoriaItem(resultadosCriterios, criterios, null, PESOS_AUDITORIA);
 }
 
 function semaforo(scoreFinal) {
   return semaforoAuditoria(scoreFinal);
 }
 
-function construirItemsAuditoria(itemsIn = [], { tipoInterlocutor, formularioAplicado }) {
+function construirItemsAuditoria(itemsIn = [], { tipoInterlocutor, criterios = [] }) {
   const noAuditable = tipoInterlocutor === "NO_AUDITABLE";
 
   return itemsIn.map((it, idx) => {
@@ -207,32 +289,55 @@ function construirItemsAuditoria(itemsIn = [], { tipoInterlocutor, formularioApl
       throw new Error(`Falta duración (minutos) para llamada en item #${idx + 1}.`);
     }
 
-    const comentariosCriterio = noAuditable ? {} : parseComentariosCriterio(it);
-
     if (noAuditable) {
       return {
         telefono, dni, cartera, fechaAudio, horaAprox, tipoInteraccion, referencia,
-        duracionMinutos, duracionSegundos, comentariosCriterio,
-        resultadosCriterios: {}, fallosIds: [], parcialesIds: [], criteriosNoAplica: [],
+        duracionMinutos, duracionSegundos, comentariosCriterio: {},
+        resultadosCriterios: {}, fallosIds: [], parcialesIds: [], criteriosNoAplica: [], evaluacionSnapshot: [],
         scoreAudio: null,
         scoreBloques: { presentacion: null, negociacion: null, cierre: null, calidad: null },
       };
     }
 
-    const resultados = normalizarResultadosItem(it, formularioAplicado);
-    const { scoreBloques, scoreAudio } = calcScoresFromResultados(
-      resultados.resultadosCriterios,
-      formularioAplicado
-    );
+    const comentariosCriterio = parseComentariosCriterio(it, criterios);
+    const resultados = normalizarResultadosItem(it, criterios);
+    validarResultadosYComentarios(resultados.resultadosCriterios, comentariosCriterio, criterios, idx);
+    const { scoreBloques, scoreAudio } = calcScoresFromResultados(resultados.resultadosCriterios, criterios);
 
     return {
       telefono, dni, cartera, fechaAudio, horaAprox, tipoInteraccion, referencia,
       duracionMinutos, duracionSegundos, comentariosCriterio,
       ...resultados,
+      evaluacionSnapshot: construirEvaluacionSnapshot(resultados.resultadosCriterios, comentariosCriterio, criterios),
       scoreAudio,
       scoreBloques,
     };
   });
+}
+
+function validarDiagnosticosGlobales(body = {}, tipoInterlocutor = "TITULAR") {
+  if (tipoInterlocutor === "NO_AUDITABLE") return { quienCondujo: "", justificacionConduccion: "", resultadoComercial: "" };
+
+  const quienCondujo = String(body?.quienCondujo || "").trim().toUpperCase();
+  if (!QUIEN_CONDUJO_OPCIONES.includes(quienCondujo)) {
+    const err = new Error("Seleccioná quién condujo la llamada.");
+    err.statusCode = 400;
+    err.fieldError = { tipo: "global", campo: "quienCondujo", mensaje: "Este campo es obligatorio." };
+    throw err;
+  }
+
+  const resultadoComercial = String(body?.resultadoComercial || "").trim().toUpperCase();
+  if (resultadoComercial && !RESULTADO_COMERCIAL_OPCIONES.includes(resultadoComercial)) {
+    const err = new Error("Resultado comercial inválido.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  return {
+    quienCondujo,
+    justificacionConduccion: String(body?.justificacionConduccion || "").trim().slice(0, 1500),
+    resultadoComercial,
+  };
 }
 
 function calcularResumenItems(items = [], tipoInterlocutor = "TITULAR") {
@@ -266,44 +371,47 @@ function calcularResumenItems(items = [], tipoInterlocutor = "TITULAR") {
   return { scoreFinal, scoreBloques, semaforo: semaforo(scoreFinal) };
 }
 
-function normalizarItemSalida(it = {}) {
-  const comentarios =
-    it?.comentariosCriterio instanceof Map
-      ? Object.fromEntries(it.comentariosCriterio)
-      : it?.comentariosCriterio || {};
-  const resultados =
-    it?.resultadosCriterios instanceof Map
-      ? Object.fromEntries(it.resultadosCriterios)
-      : it?.resultadosCriterios || {};
-
+function normalizarItemSalida(it = {}, criteriosSnapshot = []) {
+  const base = typeof it?.toObject === "function" ? it.toObject() : { ...it };
+  const comentarios = objectFromMaybeMap(base?.comentariosCriterio);
+  const normalizados = normalizarResultadosItem(base, criteriosSnapshot);
   return {
-    ...it,
-    duracionMinutos: getDuracionMinutosSalida(it),
+    ...base,
+    duracionMinutos: getDuracionMinutosSalida(base),
     comentariosCriterio: comentarios,
-    resultadosCriterios: resultados,
-    criteriosNoAplica: Array.isArray(it?.criteriosNoAplica) ? it.criteriosNoAplica : [],
+    resultadosCriterios: normalizados.resultadosCriterios,
+    fallosIds: Array.isArray(base?.fallosIds) ? base.fallosIds : normalizados.fallosIds,
+    parcialesIds: Array.isArray(base?.parcialesIds) ? base.parcialesIds : normalizados.parcialesIds,
+    criteriosNoAplica: Array.isArray(base?.criteriosNoAplica) ? base.criteriosNoAplica : normalizados.criteriosNoAplica,
+    evaluacionSnapshot: construirEvaluacionHistoricaSalida(base, criteriosSnapshot),
   };
 }
 
 function normalizarAuditoriaSalida(doc) {
   if (!doc) return doc;
-
-  const base =
-    typeof doc?.toObject === "function" ? doc.toObject() : { ...doc };
-
+  const base = typeof doc?.toObject === "function" ? doc.toObject() : { ...doc };
   const tipoInterlocutor = normalizarTipoInterlocutor(base.tipoInterlocutor || "TITULAR");
-  const formularioAplicado =
-    base.formularioAplicado || formularioAplicadoParaTipo(tipoInterlocutor);
+  const formularioAplicado = base.formularioAplicado || formularioAplicadoParaTipo(tipoInterlocutor);
+  const versionFormulario = formularioAplicado === "NINGUNO"
+    ? null
+    : inferirVersionHistorica({ ...base, formularioAplicado, tipoInterlocutor });
+  const formularioSnapshot = formularioSnapshotSalida({ ...base, formularioAplicado, tipoInterlocutor, versionFormulario });
+  const criteriosSnapshot = formularioSnapshot?.criterios || [];
 
   return {
     ...base,
     tipoInterlocutor,
     formularioAplicado,
+    tipoFormulario: base.tipoFormulario || formularioAplicado,
+    versionFormulario,
+    formularioSnapshot,
+    historicaProtegida: esAuditoriaHistoricaProtegida({ ...base, formularioAplicado, tipoInterlocutor, versionFormulario }),
     motivoNoAuditable: base.motivoNoAuditable || "",
     detalleMotivoNoAuditable: base.detalleMotivoNoAuditable || "",
-    items: Array.isArray(base.items)
-      ? base.items.map(normalizarItemSalida)
-      : [],
+    quienCondujo: base.quienCondujo || "",
+    justificacionConduccion: base.justificacionConduccion || "",
+    resultadoComercial: base.resultadoComercial || "",
+    items: Array.isArray(base.items) ? base.items.map((it) => normalizarItemSalida(it, criteriosSnapshot)) : [],
   };
 }
 
@@ -356,20 +464,39 @@ export async function catalogos(req, res) {
       operadores,
       motivos,
       tiposInteraccion,
+      // Sólo formularios vigentes para auditorías nuevas. Las versiones viejas quedan internas.
       tiposInterlocutor: [
         { value: "TITULAR", label: "Titular" },
-        { value: "TERCERO", label: "Tercero / Familiar / Referencia" },
+        { value: "FAMILIAR_DIRECTO", label: "Familiar directo / Pareja" },
+        { value: "REFERENCIA", label: "Referencia / Tercero no directo" },
         { value: "TERCERO_PAGADOR", label: "Tercero pagador" },
         { value: "NO_AUDITABLE", label: "No auditable" },
       ],
       motivosNoAuditable: MOTIVOS_NO_AUDITABLE,
+      diagnosticos: {
+        quienCondujo: [
+          { value: "OPERADOR", label: "Operador" },
+          { value: "COMPARTIDA", label: "Compartida" },
+          { value: "INTERLOCUTOR", label: "Titular / interlocutor" },
+        ],
+        resultadoComercial: [
+          { value: "PAGO_REALIZADO", label: "Pago realizado" },
+          { value: "ACUERDO_CERRADO", label: "Acuerdo cerrado" },
+          { value: "PROMESA_FIRME", label: "Promesa firme" },
+          { value: "CONTRAOFERTA_CONCRETA", label: "Contraoferta concreta" },
+          { value: "PENDIENTE_DOCUMENTACION", label: "Pendiente de documentación" },
+          { value: "PROXIMA_ACCION_CONCRETA", label: "Próxima acción concreta" },
+          { value: "CONTACTO_UTIL_SIN_COMPROMISO", label: "Contacto útil sin compromiso económico" },
+          { value: "SIN_DEFINICION", label: "Sin definición" },
+          { value: "NO_APLICA", label: "No aplica" },
+        ],
+      },
       formularios: Object.fromEntries(
         Object.entries(FORMULARIOS_AUDITORIA).map(([key, value]) => [
           key,
-          { key, label: value.label, lista: value.criterios },
+          { key, label: value.label, version: value.version, lista: value.criterios },
         ])
       ),
-      // Compatibilidad con el frontend/reportes históricos: criterios = TITULAR.
       criterios: {
         pesos: PESOS,
         umbrales: { bajo: UMBRAL_BAJO, alto: UMBRAL_ALTO },
@@ -387,78 +514,58 @@ export async function crear(req, res) {
     attachAbortFlag(req, res);
 
     const usuarioId = getUsuarioId(req);
-    const auditorUsername = String(getUsuarioUsername(req) || "")
-      .toLowerCase()
-      .trim();
-
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token inválido o ausente." });
+    const auditorUsername = String(getUsuarioUsername(req) || "").toLowerCase().trim();
+    if (!usuarioId) return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
     const body = req.body || {};
-    const operadorUsername = String(body.operadorUsername || "")
-      .toLowerCase()
-      .trim();
+    const operadorUsername = String(body.operadorUsername || "").toLowerCase().trim();
+    if (!operadorUsername) return res.status(400).json({ error: "operadorUsername es obligatorio." });
+    if (!auditorUsername) return res.status(400).json({ error: "No se pudo determinar auditorUsername desde el token." });
 
-    if (!operadorUsername)
-      return res
-        .status(400)
-        .json({ error: "operadorUsername es obligatorio." });
-    if (!auditorUsername)
-      return res.status(400).json({
-        error: "No se pudo determinar auditorUsername desde el token.",
-      });
-
-    const op = await Empleado.findOne({ username: operadorUsername })
-      .select("isActive role username")
-      .lean();
+    const op = await Empleado.findOne({ username: operadorUsername }).select("isActive role username").lean();
     if (!op) return res.status(400).json({ error: "Operador no existe." });
-    if (op.isActive === false)
-      return res.status(400).json({ error: "Operador inactivo." });
+    if (op.isActive === false) return res.status(400).json({ error: "Operador inactivo." });
 
     const itemsIn = Array.isArray(body.items) ? body.items : [];
-    if (itemsIn.length < 1)
-      return res
-        .status(400)
-        .json({ error: "Debe incluir al menos 1 audio/item." });
-    if (itemsIn.length > 5)
-      return res
-        .status(400)
-        .json({ error: "Máximo 5 audios/items por auditoría." });
+    if (itemsIn.length < 1) return res.status(400).json({ error: "Debe incluir al menos 1 audio/item." });
+    if (itemsIn.length > 5) return res.status(400).json({ error: "Máximo 5 audios/items por auditoría." });
 
     const tipoInterlocutor = normalizarTipoInterlocutor(body.tipoInterlocutor || "TITULAR");
+    if (!esTipoInterlocutorVigente(tipoInterlocutor)) {
+      return res.status(400).json({ error: "Ese formulario es histórico y ya no puede usarse para una auditoría nueva." });
+    }
+
     const formularioAplicado = formularioAplicadoParaTipo(tipoInterlocutor);
     const motivoNoAuditable = String(body.motivoNoAuditable || "").trim();
     const detalleMotivoNoAuditable = String(body.detalleMotivoNoAuditable || "").trim();
-
     if (tipoInterlocutor === "NO_AUDITABLE" && !motivoNoAuditable) {
       return res.status(400).json({ error: "Seleccioná un motivo para marcar la auditoría como No auditable." });
     }
 
-    const items = construirItemsAuditoria(itemsIn, { tipoInterlocutor, formularioAplicado });
+    const formularioSnapshot = formularioAplicado === "NINGUNO" ? null : crearSnapshotFormulario(formularioAplicado);
+    const criterios = formularioSnapshot?.criterios || [];
+    const diagnosticos = validarDiagnosticosGlobales(body, tipoInterlocutor);
+    const items = construirItemsAuditoria(itemsIn, { tipoInterlocutor, criterios });
     const resumenScores = calcularResumenItems(items, tipoInterlocutor);
 
     const doc = await AuditoriaContactoDirecto.create({
       propietario: new mongoose.Types.ObjectId(usuarioId),
       operadorUsername,
       auditorUsername,
-      fechaAuditoria: body.fechaAuditoria
-        ? toDateOnly(body.fechaAuditoria)
-        : new Date(),
+      fechaAuditoria: body.fechaAuditoria ? toDateOnly(body.fechaAuditoria) : new Date(),
       tipoInterlocutor,
       formularioAplicado,
+      tipoFormulario: formularioAplicado,
+      versionFormulario: formularioSnapshot?.version || null,
+      formularioSnapshot,
       motivoNoAuditable: tipoInterlocutor === "NO_AUDITABLE" ? motivoNoAuditable : "",
-      detalleMotivoNoAuditable:
-        tipoInterlocutor === "NO_AUDITABLE" ? detalleMotivoNoAuditable : "",
-      motivosSeleccion: Array.isArray(body.motivosSeleccion)
-        ? body.motivosSeleccion
-        : [],
-      // ❌ feedbackInformado / requiereCoaching removidos
+      detalleMotivoNoAuditable: tipoInterlocutor === "NO_AUDITABLE" ? detalleMotivoNoAuditable : "",
+      motivosSeleccion: Array.isArray(body.motivosSeleccion) ? body.motivosSeleccion : [],
       observacionesGenerales: String(body.observacionesGenerales || "").trim(),
-      puntosPositivos:
-        tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosPositivos || "").trim(),
-      puntosAMejorar:
-        tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosAMejorar || "").trim(),
+      puntosPositivos: tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosPositivos || "").trim(),
+      puntosAMejorar: tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosAMejorar || "").trim(),
+      ...diagnosticos,
       items,
       scoreFinal: resumenScores.scoreFinal,
       scoreBloques: resumenScores.scoreBloques,
@@ -466,12 +573,11 @@ export async function crear(req, res) {
       borrado: false,
     });
 
-    return res
-      .status(201)
-      .json({ ok: true, item: normalizarAuditoriaSalida(doc) });
+    return res.status(201).json({ ok: true, item: normalizarAuditoriaSalida(doc) });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
-    return res.status(500).json({ error: e.message });
+    const status = Number(e?.statusCode) || 500;
+    return res.status(status).json({ error: e.message, fieldError: e?.fieldError || null });
   }
 }
 
@@ -583,100 +689,89 @@ export async function detalle(req, res) {
 export async function editar(req, res) {
   try {
     attachAbortFlag(req, res);
-
     const usuarioId = getUsuarioId(req);
-    if (!usuarioId)
-      return res.status(401).json({ error: "Token inválido o ausente." });
+    if (!usuarioId) return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
     const { id } = req.params;
     const body = req.body || {};
-
     const existing = await AuditoriaContactoDirecto.findOne({
       _id: id,
       ...ownerScope(req),
       borrado: { $ne: true },
     });
+    if (!existing) return res.status(404).json({ error: "Auditoría no encontrada." });
 
-    if (!existing)
-      return res.status(404).json({ error: "Auditoría no encontrada." });
+    // Las auditorías hechas con formularios anteriores se consultan/PDF, pero no se recalculan ni reescriben.
+    if (esAuditoriaHistoricaProtegida(existing.toObject())) {
+      return res.status(409).json({
+        error: "Esta auditoría pertenece a una versión histórica y está protegida para no modificar ni recalcular su evaluación.",
+        historicaProtegida: true,
+      });
+    }
 
     if (body.operadorUsername) {
-      const operadorUsername = String(body.operadorUsername)
-        .toLowerCase()
-        .trim();
-
-      const op = await Empleado.findOne({ username: operadorUsername })
-        .select("isActive role username")
-        .lean();
-
+      const operadorUsername = String(body.operadorUsername).toLowerCase().trim();
+      const op = await Empleado.findOne({ username: operadorUsername }).select("isActive role username").lean();
       if (!op) return res.status(400).json({ error: "Operador no existe." });
-      if (op.isActive === false)
-        return res.status(400).json({ error: "Operador inactivo." });
-
+      if (op.isActive === false) return res.status(400).json({ error: "Operador inactivo." });
       existing.operadorUsername = operadorUsername;
     }
+    if (body.fechaAuditoria) existing.fechaAuditoria = toDateOnly(body.fechaAuditoria) || existing.fechaAuditoria;
 
-    if (body.fechaAuditoria) {
-      existing.fechaAuditoria =
-        toDateOnly(body.fechaAuditoria) || existing.fechaAuditoria;
+    const tipoInterlocutor = normalizarTipoInterlocutor(body.tipoInterlocutor || existing.tipoInterlocutor || "TITULAR");
+    if (!esTipoInterlocutorVigente(tipoInterlocutor)) {
+      return res.status(400).json({ error: "No se puede cambiar una auditoría vigente a un formulario histórico." });
     }
 
-    const tipoInterlocutor = normalizarTipoInterlocutor(
-      body.tipoInterlocutor || existing.tipoInterlocutor || "TITULAR"
-    );
     const formularioAplicado = formularioAplicadoParaTipo(tipoInterlocutor);
     const motivoNoAuditable = String(body.motivoNoAuditable || "").trim();
     const detalleMotivoNoAuditable = String(body.detalleMotivoNoAuditable || "").trim();
-
     if (tipoInterlocutor === "NO_AUDITABLE" && !motivoNoAuditable) {
       return res.status(400).json({ error: "Seleccioná un motivo para marcar la auditoría como No auditable." });
     }
 
+    const tipoCambio = formularioAplicado !== String(existing.formularioAplicado || "");
+    const formularioSnapshot = formularioAplicado === "NINGUNO"
+      ? null
+      : tipoCambio
+        ? crearSnapshotFormulario(formularioAplicado)
+        : (existing.formularioSnapshot?.criterios?.length ? existing.formularioSnapshot.toObject?.() || existing.formularioSnapshot : crearSnapshotFormulario(formularioAplicado));
+    const criterios = formularioSnapshot?.criterios || [];
+    const diagnosticos = validarDiagnosticosGlobales(body, tipoInterlocutor);
+
     existing.tipoInterlocutor = tipoInterlocutor;
     existing.formularioAplicado = formularioAplicado;
+    existing.tipoFormulario = formularioAplicado;
+    existing.versionFormulario = formularioSnapshot?.version || null;
+    existing.formularioSnapshot = formularioSnapshot;
     existing.motivoNoAuditable = tipoInterlocutor === "NO_AUDITABLE" ? motivoNoAuditable : "";
-    existing.detalleMotivoNoAuditable =
-      tipoInterlocutor === "NO_AUDITABLE" ? detalleMotivoNoAuditable : "";
-
-    existing.motivosSeleccion = Array.isArray(body.motivosSeleccion)
-      ? body.motivosSeleccion
-      : existing.motivosSeleccion;
-
-    // ❌ feedbackInformado / requiereCoaching removidos
-
-    existing.observacionesGenerales = String(
-      body.observacionesGenerales || ""
-    ).trim();
-    existing.puntosPositivos =
-      tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosPositivos || "").trim();
-    existing.puntosAMejorar =
-      tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosAMejorar || "").trim();
+    existing.detalleMotivoNoAuditable = tipoInterlocutor === "NO_AUDITABLE" ? detalleMotivoNoAuditable : "";
+    existing.motivosSeleccion = Array.isArray(body.motivosSeleccion) ? body.motivosSeleccion : existing.motivosSeleccion;
+    existing.observacionesGenerales = String(body.observacionesGenerales || "").trim();
+    existing.puntosPositivos = tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosPositivos || "").trim();
+    existing.puntosAMejorar = tipoInterlocutor === "NO_AUDITABLE" ? "" : String(body.puntosAMejorar || "").trim();
+    existing.quienCondujo = diagnosticos.quienCondujo;
+    existing.justificacionConduccion = diagnosticos.justificacionConduccion;
+    existing.resultadoComercial = diagnosticos.resultadoComercial;
 
     const itemsIn = Array.isArray(body.items) ? body.items : [];
-    if (itemsIn.length < 1)
-      return res
-        .status(400)
-        .json({ error: "Debe incluir al menos 1 audio/item." });
-    if (itemsIn.length > 5)
-      return res
-        .status(400)
-        .json({ error: "Máximo 5 audios/items por auditoría." });
+    if (itemsIn.length < 1) return res.status(400).json({ error: "Debe incluir al menos 1 audio/item." });
+    if (itemsIn.length > 5) return res.status(400).json({ error: "Máximo 5 audios/items por auditoría." });
 
-    const items = construirItemsAuditoria(itemsIn, { tipoInterlocutor, formularioAplicado });
+    const items = construirItemsAuditoria(itemsIn, { tipoInterlocutor, criterios });
     const resumenScores = calcularResumenItems(items, tipoInterlocutor);
-
     existing.items = items;
     existing.scoreFinal = resumenScores.scoreFinal;
     existing.scoreBloques = resumenScores.scoreBloques;
     existing.semaforo = resumenScores.semaforo;
 
     await existing.save();
-
     return res.json({ ok: true, item: normalizarAuditoriaSalida(existing) });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
-    return res.status(500).json({ error: e.message });
+    const status = Number(e?.statusCode) || 500;
+    return res.status(status).json({ error: e.message, fieldError: e?.fieldError || null });
   }
 }
 
@@ -805,28 +900,26 @@ export async function analyticsResumen(req, res) {
         $group: {
           _id: {
             formulario: {
-              $ifNull: [
-                "$formularioAplicado",
-                { $ifNull: ["$tipoInterlocutor", "TITULAR"] },
-              ],
+              $ifNull: ["$formularioAplicado", { $ifNull: ["$tipoInterlocutor", "TITULAR"] }],
             },
+            version: "$versionFormulario",
             criterio: "$items.fallosIds",
           },
           count: { $sum: 1 },
         },
       },
       { $sort: { count: -1 } },
-      { $limit: 10 },
+      { $limit: 15 },
     ]);
 
-    const topFallos = topFallosRaw.map((x) => {
-      const formulario = ["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(x?._id?.formulario)
-        ? x._id.formulario
-        : "TITULAR";
-      const criterio = criterioPorId(formulario, x?._id?.criterio);
+    const topFallos = topFallosRaw.slice(0, 10).map((x) => {
+      const formulario = String(x?._id?.formulario || "TITULAR").toUpperCase();
+      const version = Number(x?._id?.version) || (["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(formulario) ? 1 : versionFormularioActual(formulario));
+      const criterio = criterioPorId(formulario, x?._id?.criterio, version);
       return {
         id: x?._id?.criterio,
         formulario,
+        version,
         label: criterio?.label || `Criterio ${x?._id?.criterio}`,
         grupo: criterio?.grupo || "",
         count: x.count,

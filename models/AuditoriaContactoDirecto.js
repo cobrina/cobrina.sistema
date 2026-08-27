@@ -3,6 +3,58 @@ import mongoose from "mongoose";
 
 const { Schema } = mongoose;
 
+const AyudaCriterioSchema = new Schema(
+  {
+    descripcion: { type: String, default: "" },
+    si: { type: String, default: "" },
+    parcial: { type: String, default: "" },
+    no: { type: String, default: "" },
+    noAplica: { type: String, default: "" },
+    ejemplos: { type: [String], default: [] },
+  },
+  { _id: false }
+);
+
+const CriterioSnapshotSchema = new Schema(
+  {
+    id: { type: Number, required: true },
+    orden: { type: Number, required: true },
+    grupo: { type: String, required: true, enum: ["presentacion", "negociacion", "cierre", "calidad"] },
+    label: { type: String, required: true, trim: true },
+    ayuda: { type: AyudaCriterioSchema, default: () => ({}) },
+  },
+  { _id: false }
+);
+
+const FormularioSnapshotSchema = new Schema(
+  {
+    key: { type: String, required: true, trim: true },
+    label: { type: String, required: true, trim: true },
+    version: { type: Number, required: true, min: 1 },
+    pesos: {
+      presentacion: { type: Number, default: 0.1 },
+      negociacion: { type: Number, default: 0.4 },
+      cierre: { type: Number, default: 0.3 },
+      calidad: { type: Number, default: 0.2 },
+    },
+    criterios: { type: [CriterioSnapshotSchema], default: [] },
+  },
+  { _id: false }
+);
+
+const EvaluacionCriterioSnapshotSchema = new Schema(
+  {
+    criterioId: { type: Number, required: true },
+    orden: { type: Number, required: true },
+    bloque: { type: String, required: true, enum: ["presentacion", "negociacion", "cierre", "calidad"] },
+    nombre: { type: String, required: true, trim: true },
+    respuesta: { type: String, required: true, enum: ["SI", "PARCIAL", "NO", "NO_APLICA"] },
+    comentario: { type: String, default: "", trim: true, maxlength: 1000 },
+    valorAplicado: { type: Number, default: null, min: 0, max: 1 },
+  },
+  { _id: false }
+);
+
 /**
  * Auditoría manual basada en la planilla "Auditoría de Contactos Directos".
  * - Guarda SOLO datos y resultados (para KPIs).
@@ -66,6 +118,9 @@ const ItemAudioSchema = new Schema(
     parcialesIds: { type: [Number], default: [] },
     criteriosNoAplica: { type: [Number], default: [] },
 
+    // Snapshot de cada respuesta: permite reconstruir exactamente la matriz usada.
+    evaluacionSnapshot: { type: [EvaluacionCriterioSnapshotSchema], default: [] },
+
     scoreAudio: { type: Number, default: null, min: 0, max: 10 },
     scoreBloques: {
       presentacion: { type: Number, default: null, min: 0, max: 10 },
@@ -105,16 +160,21 @@ const AuditoriaContactoDirectoSchema = new Schema(
     // se interpretan como TITULAR desde el controlador, sin recalcular su score.
     tipoInterlocutor: {
       type: String,
-      enum: ["TITULAR", "TERCERO", "TERCERO_PAGADOR", "NO_AUDITABLE"],
+      enum: ["TITULAR", "FAMILIAR_DIRECTO", "REFERENCIA", "TERCERO", "TERCERO_PAGADOR", "NO_AUDITABLE"],
       default: "TITULAR",
       index: true,
     },
     formularioAplicado: {
       type: String,
-      enum: ["TITULAR", "TERCERO", "TERCERO_PAGADOR", "NINGUNO"],
+      enum: ["TITULAR", "FAMILIAR_DIRECTO", "REFERENCIA", "TERCERO", "TERCERO_PAGADOR", "NINGUNO"],
       default: "TITULAR",
       index: true,
     },
+    // Versionado interno. No se muestra como opción al crear nuevas auditorías.
+    tipoFormulario: { type: String, default: "", trim: true, index: true },
+    versionFormulario: { type: Number, default: null, min: 1, index: true },
+    formularioSnapshot: { type: FormularioSnapshotSchema, default: null },
+
     motivoNoAuditable: { type: String, default: "", trim: true, maxlength: 200 },
     detalleMotivoNoAuditable: { type: String, default: "", trim: true, maxlength: 1000 },
 
@@ -131,6 +191,32 @@ const AuditoriaContactoDirectoSchema = new Schema(
     observacionesGenerales: { type: String, default: "", trim: true, maxlength: 6000 },
     puntosPositivos: { type: String, default: "", trim: true, maxlength: 6000 },
     puntosAMejorar: { type: String, default: "", trim: true, maxlength: 6000 },
+
+    // Diagnóstico global: se guarda pero no modifica matemáticamente el score.
+    quienCondujo: {
+      type: String,
+      enum: ["OPERADOR", "COMPARTIDA", "INTERLOCUTOR", ""],
+      default: "",
+      index: true,
+    },
+    justificacionConduccion: { type: String, default: "", trim: true, maxlength: 1500 },
+    resultadoComercial: {
+      type: String,
+      enum: [
+        "PAGO_REALIZADO",
+        "ACUERDO_CERRADO",
+        "PROMESA_FIRME",
+        "CONTRAOFERTA_CONCRETA",
+        "PENDIENTE_DOCUMENTACION",
+        "PROXIMA_ACCION_CONCRETA",
+        "CONTACTO_UTIL_SIN_COMPROMISO",
+        "SIN_DEFINICION",
+        "NO_APLICA",
+        "",
+      ],
+      default: "",
+      index: true,
+    },
 
     // Items (máximo 5 audios ideal)
     items: {

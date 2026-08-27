@@ -19,6 +19,22 @@ const TemaSchema = new Schema(
   { _id: false }
 );
 
+const DevolucionOperadorSchema = new Schema(
+  {
+    username: { type: String, required: true, trim: true, lowercase: true, maxlength: 120 },
+    recepcion: {
+      type: String,
+      enum: ["", "MUY_RECEPTIVO", "RECEPTIVO", "NEUTRAL", "RESISTENCIA", "NO_ACUERDO"],
+      default: "",
+    },
+    participacion: { type: String, enum: ["", "ALTA", "MEDIA", "BAJA"], default: "" },
+    comprension: { type: String, enum: ["", "COMPRENDIO", "PARCIAL", "REQUIERE_REFUERZO"], default: "" },
+    reconocePuntos: { type: String, enum: ["", "SI", "PARCIAL", "NO"], default: "" },
+    observacion: { type: String, default: "", trim: true, maxlength: 6000 },
+  },
+  { _id: false }
+);
+
 const AuditoriaRefSchema = new Schema(
   {
     auditoriaId: { type: Schema.Types.ObjectId, ref: "AuditoriaContactoDirecto", required: true },
@@ -151,9 +167,25 @@ const CapacitacionSchema = new Schema(
       actualizadaPorUsername: { type: String, default: "", trim: true, lowercase: true, maxlength: 120 },
     },
 
+    // Permite incorporar auditorías/capacitaciones anteriores a Cobrina aunque
+    // solo se conozca el nombre. Quedan identificadas como históricas e
+    // incompletas hasta que la capacitadora agregue usuario/fecha/detalle.
+    registroHistorico: {
+      esHistorico: { type: Boolean, default: false, index: true },
+      datosIncompletos: { type: Boolean, default: false, index: true },
+      nombreOriginal: { type: String, default: "", trim: true, maxlength: 180 },
+      fechaPendiente: { type: Boolean, default: false },
+      completadoAt: { type: Date, default: null },
+    },
+
     temasGestion: { type: [TemaSchema], default: [] },
     herramientas: { type: [TemaSchema], default: [] },
     materiales: { type: [String], default: [] },
+
+    // En capacitaciones grupales permite registrar cómo recibió la devolución
+    // cada operador por separado. Los campos generales se mantienen para
+    // compatibilidad con capacitaciones individuales e históricas.
+    devolucionesOperadores: { type: [DevolucionOperadorSchema], default: [] },
 
     recepcion: {
       type: String,

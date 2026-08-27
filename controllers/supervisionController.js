@@ -16,7 +16,7 @@ import {
   novedadCubreFecha,
   rangoMesLocal,
   minutosActividadSegunHorario,
-  intervalosLaboralesSinDescanso,
+  intervalosAjustadosPorDescanso,
   aplicarBreakFlexible,
   minutosBreakFlexiblePermitido,
   minutosHoraHHMM,
@@ -557,8 +557,9 @@ export async function resumenSupervision(req, res) {
       // Misma regla que Reportes > Seguimiento: los cortes cerrados salen de las
       // gestiones cargadas y el corte abierto llega únicamente hasta la última carga
       // manual disponible. Solo se llama "actual" si esa carga coincide con el minuto
-      // de la consulta. Los espacios fuera de los bloques laborales quedan excluidos.
-      const intervalosLaboralesHoy = intervalosLaboralesSinDescanso(actividadDelDia.intervalos || [], horarioHoy)
+      // de la consulta. Los cortes fuera del horario también se conservan: una gestión
+      // aislada posterior a la salida no puede convertir todo el hueco en trabajo extra.
+      const intervalosLaboralesHoy = intervalosAjustadosPorDescanso(actividadDelDia.intervalos || [], horarioHoy)
         .map((intervalo) => ({ ...intervalo, actual: false, abiertoAlCorte: false, origen: "cerrado" }));
       const desdeCorteAbiertoMin = Number.isFinite(ultimaMinHoy)
         ? ultimaMinHoy
@@ -566,7 +567,7 @@ export async function resumenSupervision(req, res) {
           ? entradaHoyMin
           : null;
       const intervalosAbiertosHoy = esFechaActual && fuenteGestionesActualizadaHoy && Number.isFinite(desdeCorteAbiertoMin) && Number.isFinite(corteGestionesMin) && corteGestionesMin > desdeCorteAbiertoMin
-        ? intervalosLaboralesSinDescanso([{ desdeMin: desdeCorteAbiertoMin, hastaMin: corteGestionesMin }], horarioHoy)
+        ? intervalosAjustadosPorDescanso([{ desdeMin: desdeCorteAbiertoMin, hastaMin: corteGestionesMin }], horarioHoy)
             .map((intervalo) => ({
               ...intervalo,
               actual: Boolean(fuenteGestionesReciente && !jornadaFinalizadaHoy),
@@ -611,6 +612,14 @@ export async function resumenSupervision(req, res) {
       const breakDescontadoHoyMin = Math.round(Number(breakConsideradoHoy?.breakConsideradoMin || 0));
       const cortesDescontadosHoyMin = Math.round(bachesDetalleHoy.reduce((sum, intervalo) => sum + Number(intervalo.duracionMin || 0), 0));
       const minutosTrabajoEfectivoHoy = Math.max(0, Math.round(minutosTrabajadosHoy - breakDescontadoHoyMin - cortesDescontadosHoyMin));
+      // El break permitido puede completar la jornada, pero nunca crear horas extra.
+      const breakAplicadoCumplimientoHoyMin = minutosExigiblesHoy > 0
+        ? Math.min(breakDescontadoHoyMin, Math.max(0, minutosExigiblesHoy - minutosTrabajoEfectivoHoy))
+        : 0;
+      const minutosTrabajoComputableHoy = Math.max(0, Math.round(minutosTrabajoEfectivoHoy + breakAplicadoCumplimientoHoyMin));
+      const diferenciaTrabajoEfectivoHoyMin = minutosExigiblesHoy > 0 ? minutosTrabajoComputableHoy - minutosExigiblesHoy : null;
+      const faltanTrabajoEfectivoHoyMin = minutosExigiblesHoy > 0 ? Math.max(0, minutosExigiblesHoy - minutosTrabajoComputableHoy) : 0;
+      const extraTrabajoEfectivoHoyMin = minutosExigiblesHoy > 0 ? Math.max(0, minutosTrabajoEfectivoHoy - minutosExigiblesHoy) : 0;
       const baches20Hoy = bachesDetalleHoy.length;
       // Se conserva el campo histórico +30 para no romper consumidores anteriores.
       const baches30Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > 30 && !intervalo.abiertoAlCorte).length;
@@ -644,7 +653,7 @@ export async function resumenSupervision(req, res) {
         estadoJornadaHoy = novedadDia.tipo === "falta" ? "falta" : "novedad";
         estadoJornadaHoyLabel = etiquetaNovedadDia(novedadDia);
       } else if (horarioHoy.horarioLibre) {
-        if (minutosTrabajadosHoy >= 240) {
+        if (minutosTrabajoEfectivoHoy >= 240) {
           estadoJornadaHoy = "completa";
           estadoJornadaHoyLabel = "Horario libre · 4 h cumplidas";
         } else if (fuenteSinActualizarHoy) {
@@ -652,7 +661,7 @@ export async function resumenSupervision(req, res) {
           estadoJornadaHoyLabel = esFechaActual ? "Horario libre · Gestiones sin actualización de hoy" : "Horario libre · Sin gestiones importadas para la fecha";
         } else {
           estadoJornadaHoy = "en-curso";
-          estadoJornadaHoyLabel = `Horario libre · ${Math.floor(minutosTrabajadosHoy / 60)}h ${minutosTrabajadosHoy % 60}m de 4 h`;
+          estadoJornadaHoyLabel = `Horario libre · ${Math.floor(minutosTrabajoEfectivoHoy / 60)}h ${minutosTrabajoEfectivoHoy % 60}m efectivos de 4 h`;
         }
       } else if (horarioHoy.programado) {
         if (fuenteSinActualizarHoy) {
@@ -671,12 +680,12 @@ export async function resumenSupervision(req, res) {
           if (!Number(actividadDelDia.gestiones || 0)) {
             estadoJornadaHoy = "sin-actividad";
             estadoJornadaHoyLabel = "Ausente · sin gestiones";
-          } else if (faltanHoyMin > 15) {
+          } else if (faltanTrabajoEfectivoHoyMin > 15) {
             estadoJornadaHoy = "incompleta";
-            estadoJornadaHoyLabel = `Terminó · faltan ${Math.floor(faltanHoyMin / 60)}h ${faltanHoyMin % 60}m`;
-          } else if (extraHoyMin > 15) {
+            estadoJornadaHoyLabel = `Terminó · faltan ${Math.floor(faltanTrabajoEfectivoHoyMin / 60)}h ${faltanTrabajoEfectivoHoyMin % 60}m efectivos`;
+          } else if (extraTrabajoEfectivoHoyMin > 15) {
             estadoJornadaHoy = "extra";
-            estadoJornadaHoyLabel = `Completa · +${Math.floor(extraHoyMin / 60)}h ${extraHoyMin % 60}m extra voluntaria`;
+            estadoJornadaHoyLabel = `Trabajo efectivo +${Math.floor(extraTrabajoEfectivoHoyMin / 60)}h ${extraTrabajoEfectivoHoyMin % 60}m sobre RRHH`;
           } else {
             estadoJornadaHoy = "completa";
             estadoJornadaHoyLabel = "Jornada completa";
@@ -730,13 +739,15 @@ export async function resumenSupervision(req, res) {
         gestionesHoy: Number(actividadDelDia.gestiones || 0),
         minutosTrabajadosHoy,
         minutosTrabajoEfectivoHoy,
+        minutosTrabajoComputableHoy,
+        breakAplicadoCumplimientoHoyMin,
         breakDescontadoHoyMin,
         cortesDescontadosHoyMin,
         minutosProgramadosHoy,
         minutosExigiblesHoy,
-        diferenciaHoyMin,
-        faltanHoyMin,
-        extraHoyMin,
+        diferenciaHoyMin: diferenciaTrabajoEfectivoHoyMin,
+        faltanHoyMin: faltanTrabajoEfectivoHoyMin,
+        extraHoyMin: extraTrabajoEfectivoHoyMin,
         baches20Hoy,
         baches30Hoy,
         baches60Hoy,
@@ -1393,9 +1404,10 @@ export async function resumenSupervision(req, res) {
 /**
  * Gestiones del día + casos nuevos contra los 90 días previos.
  *
- * Está separado del resumen principal a propósito: en RDC el universo de
- * gestiones es sensiblemente mayor que en PROCOB. Si este análisis tarda, sólo
- * espera el bloque "Gestiones" y el resto de Supervisión permanece disponible.
+ * Está separado del resumen principal a propósito: a medida que crece el universo
+ * de operadores y gestiones, el cruce histórico puede volverse más pesado. Si
+ * este análisis tarda, sólo espera el bloque "Gestiones" y el resto de
+ * Supervisión permanece disponible.
  *
  * La consulta histórica NO agrupa todo el universo de 90 días. Primero toma los
  * DNIs efectivamente trabajados en el día seleccionado y luego busca historia

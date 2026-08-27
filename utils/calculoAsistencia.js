@@ -146,9 +146,15 @@ export function aplicarBreakFlexible(intervalos = [], horario = {}) {
     .map((intervalo, index) => {
       const desdeMin = Number(intervalo?.desdeMin);
       const hastaMin = Number(intervalo?.hastaMin);
-      const duracionOriginalMin = Number.isFinite(desdeMin) && Number.isFinite(hastaMin)
-        ? Math.max(0, Math.round(hastaMin - desdeMin))
-        : Math.max(0, Math.round(Number(intervalo?.duracionMin || 0)));
+      // Si el intervalo ya fue ajustado (por ejemplo, quitando un descanso
+      // programado de jornada partida), respetamos esa duración. Recalcular desde
+      // las horas volvería a introducir el descanso que acabamos de excluir.
+      const duracionAjustada = Number(intervalo?.duracionMin);
+      const duracionOriginalMin = Number.isFinite(duracionAjustada)
+        ? Math.max(0, Math.round(duracionAjustada))
+        : Number.isFinite(desdeMin) && Number.isFinite(hastaMin)
+          ? Math.max(0, Math.round(hastaMin - desdeMin))
+          : 0;
       return {
         ...intervalo,
         __breakIndex: index,

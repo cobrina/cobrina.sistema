@@ -25,6 +25,10 @@ import {
 
 const router = Router();
 const acceso = [verifyToken, permitirModulos("rrhh")];
+const gestionPersonal = [
+  verifyToken,
+  permitirRoles(ROLES.CAPACITADORA, ROLES.ADMINISTRACION, ROLES.SUPERVISOR, ROLES.SUPER_ADMIN),
+];
 const gestion = [
   verifyToken,
   permitirRoles(ROLES.ADMINISTRACION, ROLES.SUPERVISOR, ROLES.SUPER_ADMIN),
@@ -34,22 +38,22 @@ const gestionCompleta = [verifyToken, permitirRoles(ROLES.SUPERVISOR, ROLES.SUPE
 router.get("/resumen-empleados", ...acceso, resumenEmpleados);
 
 router.get("/novedades", ...acceso, listarNovedades);
-router.post("/novedades", ...gestion, crearNovedad);
-router.put("/novedades/:id", ...gestion, actualizarNovedad);
+router.post("/novedades", ...gestionPersonal, crearNovedad);
+router.put("/novedades/:id", ...gestionPersonal, actualizarNovedad);
 router.delete("/novedades/:id", ...gestionCompleta, eliminarNovedad);
 
 router.get("/adelantos", ...gestion, listarAdelantos);
 router.post("/adelantos", ...gestion, crearAdelanto);
 router.put("/adelantos/:id", ...gestion, actualizarAdelanto);
 
-router.get("/plantillas/horarios", ...gestion, descargarPlantillaHorarios);
-router.post("/importar/horarios", ...gestion, uploadSingle("file"), importarHorariosMasivos);
-router.get("/plantillas/objetivos", ...gestion, descargarPlantillaObjetivos);
-router.post("/importar/objetivos", ...gestion, uploadSingle("file"), importarObjetivosMasivos);
+router.get("/plantillas/horarios", ...gestionPersonal, descargarPlantillaHorarios);
+router.post("/importar/horarios", ...gestionPersonal, uploadSingle("file"), importarHorariosMasivos);
+router.get("/plantillas/objetivos", ...gestionPersonal, descargarPlantillaObjetivos);
+router.post("/importar/objetivos", ...gestionPersonal, uploadSingle("file"), importarObjetivosMasivos);
 
 router.get("/objetivos", ...acceso, listarObjetivos);
-router.post("/objetivos", ...gestion, guardarObjetivo);
-router.put("/objetivos/:id", ...gestion, actualizarObjetivo);
+router.post("/objetivos", ...gestionPersonal, guardarObjetivo);
+router.put("/objetivos/:id", ...gestionPersonal, actualizarObjetivo);
 router.delete("/objetivos/:id", ...gestionCompleta, eliminarObjetivo);
 
 export default router;
