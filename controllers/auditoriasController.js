@@ -816,7 +816,6 @@ export async function analyticsResumen(req, res) {
     if (!ensureNoOperador(req, res)) return;
 
     const { desde, hasta, operador, tipoInterlocutor } = req.query || {};
-
     const match = { ...ownerScope(req), borrado: { $ne: true } };
 
     if (desde || hasta) {
@@ -829,9 +828,7 @@ export async function analyticsResumen(req, res) {
       }
     }
 
-    if (operador) {
-      match.operadorUsername = String(operador).toLowerCase().trim();
-    }
+    if (operador) match.operadorUsername = String(operador).toLowerCase().trim();
     if (tipoInterlocutor) {
       const tipo = normalizarTipoInterlocutor(tipoInterlocutor);
       if (tipo === "TITULAR") {
@@ -847,122 +844,421 @@ export async function analyticsResumen(req, res) {
 
     throwIfAborted(req);
 
-    const [resumen] = await AuditoriaContactoDirecto.aggregate([
-      { $match: match },
-      {
-        $group: {
-          _id: null,
-          auditorias: { $sum: 1 },
-          auditables: { $sum: { $cond: [{ $ne: ["$scoreFinal", null] }, 1, 0] } },
-          noAuditables: { $sum: { $cond: [{ $eq: ["$tipoInterlocutor", "NO_AUDITABLE"] }, 1, 0] } },
-          audios: { $sum: { $size: { $ifNull: ["$items", []] } } },
-          avgFinal: { $avg: "$scoreFinal" },
-          avgPres: { $avg: "$scoreBloques.presentacion" },
-          avgNeg: { $avg: "$scoreBloques.negociacion" },
-          avgCie: { $avg: "$scoreBloques.cierre" },
-          avgCal: { $avg: "$scoreBloques.calidad" },
-        },
-      },
-    ]);
+    // Los promedios/evolución se calculan sólo contra la versión vigente de
+    // cada formulario. Así no comparamos un score del formulario viejo con uno
+    // del nuevo, que tienen criterios distintos. El histórico sigue disponible
+    // aparte para trazabilidad.
+    const formulariosVigentesMatch = {
+      $or: Object.entries(FORMULARIOS_AUDITORIA).map(([formulario, def]) => ({
+        formularioAplicado: formulario,
+        versionFormulario: Number(def.version),
+      })),
+    };
 
-    const semaforos = await AuditoriaContactoDirecto.aggregate([
-      { $match: match },
-      { $match: { semaforo: { $in: ["bajo", "medio", "alto"] } } },
-      { $group: { _id: "$semaforo", count: { $sum: 1 } } },
-      { $project: { _id: 0, semaforo: "$_id", count: 1 } },
-    ]);
-
-    const porOperador = await AuditoriaContactoDirecto.aggregate([
-      { $match: match },
-      {
-        $group: {
-          _id: "$operadorUsername",
-          auditorias: { $sum: 1 },
-          avgFinal: { $avg: "$scoreFinal" },
-        },
-      },
-      {
-        $project: {
-          _id: 0,
-          operadorUsername: "$_id",
-          auditorias: 1,
-          avgFinal: 1,
-        },
-      },
-      { $sort: { avgFinal: -1, auditorias: -1, operadorUsername: 1 } },
-    ]);
-
-    const topFallosRaw = await AuditoriaContactoDirecto.aggregate([
-      { $match: match },
-      { $unwind: "$items" },
-      { $unwind: "$items.fallosIds" },
-      {
-        $group: {
-          _id: {
-            formulario: {
-              $ifNull: ["$formularioAplicado", { $ifNull: ["$tipoInterlocutor", "TITULAR"] }],
-            },
-            version: "$versionFormulario",
-            criterio: "$items.fallosIds",
+    // Un solo recorrido de auditorías para todos los KPIs. Además de ser más
+    // completo que el tablero anterior, evita sumar varias consultas pesadas.
+    const [aggRows, empleadosActivos] = await Promise.all([
+      AuditoriaContactoDirecto.aggregate([
+        { $match: match },
+        {
+          $facet: {
+            resumen: [
+              {
+                $group: {
+                  _id: null,
+                  auditorias: { $sum: 1 },
+                  auditables: { $sum: { $cond: [{ $ne: ["$scoreFinal", null] }, 1, 0] } },
+                  noAuditables: { $sum: { $cond: [{ $eq: ["$tipoInterlocutor", "NO_AUDITABLE"] }, 1, 0] } },
+                  audios: { $sum: { $size: { $ifNull: ["$items", []] } } },
+                },
+              },
+            ],
+            resumenVigente: [
+              { $match: formulariosVigentesMatch },
+              {
+                $group: {
+                  _id: null,
+                  auditorias: { $sum: 1 },
+                  auditables: { $sum: { $cond: [{ $ne: ["$scoreFinal", null] }, 1, 0] } },
+                  avgFinal: { $avg: "$scoreFinal" },
+                  avgPres: { $avg: "$scoreBloques.presentacion" },
+                  avgNeg: { $avg: "$scoreBloques.negociacion" },
+                  avgCie: { $avg: "$scoreBloques.cierre" },
+                  avgCal: { $avg: "$scoreBloques.calidad" },
+                },
+              },
+            ],
+            semaforos: [
+              { $match: formulariosVigentesMatch },
+              { $match: { semaforo: { $in: ["bajo", "medio", "alto"] } } },
+              { $group: { _id: "$semaforo", count: { $sum: 1 } } },
+              { $project: { _id: 0, semaforo: "$_id", count: 1 } },
+            ],
+            porOperador: [
+              { $sort: { operadorUsername: 1, fechaAuditoria: 1, _id: 1 } },
+              {
+                $group: {
+                  _id: "$operadorUsername",
+                  auditorias: { $sum: 1 },
+                  auditables: { $sum: { $cond: [{ $ne: ["$scoreFinal", null] }, 1, 0] } },
+                  avgFinal: { $avg: "$scoreFinal" },
+                  ultimaAuditoria: { $last: "$fechaAuditoria" },
+                  scores: {
+                    $push: {
+                      score: "$scoreFinal",
+                      fecha: "$fechaAuditoria",
+                      semaforo: "$semaforo",
+                      formulario: { $ifNull: ["$formularioAplicado", { $ifNull: ["$tipoInterlocutor", "TITULAR"] }] },
+                      version: "$versionFormulario",
+                    },
+                  },
+                },
+              },
+              { $project: { _id: 0, operadorUsername: "$_id", auditorias: 1, auditables: 1, avgFinal: 1, ultimaAuditoria: 1, scores: 1 } },
+            ],
+            topFallosRaw: [
+              { $unwind: "$items" },
+              { $unwind: "$items.fallosIds" },
+              {
+                $group: {
+                  _id: {
+                    formulario: { $ifNull: ["$formularioAplicado", { $ifNull: ["$tipoInterlocutor", "TITULAR"] }] },
+                    version: "$versionFormulario",
+                    criterio: "$items.fallosIds",
+                  },
+                  count: { $sum: 1 },
+                },
+              },
+              { $sort: { count: -1 } },
+              { $limit: 40 },
+            ],
+            fallosPorOperadorRaw: [
+              { $unwind: "$items" },
+              { $unwind: "$items.fallosIds" },
+              {
+                $group: {
+                  _id: {
+                    operador: "$operadorUsername",
+                    formulario: { $ifNull: ["$formularioAplicado", { $ifNull: ["$tipoInterlocutor", "TITULAR"] }] },
+                    version: "$versionFormulario",
+                    criterio: "$items.fallosIds",
+                  },
+                  count: { $sum: 1 },
+                },
+              },
+              { $sort: { "_id.operador": 1, count: -1 } },
+              { $limit: 1500 },
+            ],
+            porTipoInterlocutor: [
+              {
+                $group: {
+                  _id: { $ifNull: ["$tipoInterlocutor", "TITULAR"] },
+                  auditorias: { $sum: 1 },
+                  avgFinal: { $avg: "$scoreFinal" },
+                },
+              },
+              { $project: { _id: 0, tipoInterlocutor: "$_id", auditorias: 1, avgFinal: 1 } },
+              { $sort: { auditorias: -1, tipoInterlocutor: 1 } },
+            ],
+            porFormulario: [
+              {
+                $group: {
+                  _id: {
+                    formulario: { $ifNull: ["$formularioAplicado", { $ifNull: ["$tipoInterlocutor", "TITULAR"] }] },
+                    version: "$versionFormulario",
+                  },
+                  auditorias: { $sum: 1 },
+                  auditables: { $sum: { $cond: [{ $ne: ["$scoreFinal", null] }, 1, 0] } },
+                  avgFinal: { $avg: "$scoreFinal" },
+                },
+              },
+              { $sort: { "_id.formulario": 1, "_id.version": 1 } },
+            ],
+            conduccion: [
+              { $match: { quienCondujo: { $in: ["OPERADOR", "COMPARTIDA", "INTERLOCUTOR"] } } },
+              { $group: { _id: "$quienCondujo", count: { $sum: 1 } } },
+              { $project: { _id: 0, value: "$_id", count: 1 } },
+              { $sort: { count: -1 } },
+            ],
+            resultadosComerciales: [
+              { $match: { resultadoComercial: { $nin: ["", null, "NO_APLICA"] } } },
+              { $group: { _id: "$resultadoComercial", count: { $sum: 1 } } },
+              { $project: { _id: 0, value: "$_id", count: 1 } },
+              { $sort: { count: -1 } },
+              { $limit: 10 },
+            ],
           },
-          count: { $sum: 1 },
         },
-      },
-      { $sort: { count: -1 } },
-      { $limit: 15 },
+      ]).allowDiskUse(true),
+      Empleado.find({ isActive: true, role: { $in: ["operador", "operador-vip"] } })
+        .select("username nombre")
+        .sort({ username: 1 })
+        .lean(),
     ]);
 
-    const topFallos = topFallosRaw.slice(0, 10).map((x) => {
-      const formulario = String(x?._id?.formulario || "TITULAR").toUpperCase();
-      const version = Number(x?._id?.version) || (["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(formulario) ? 1 : versionFormularioActual(formulario));
-      const criterio = criterioPorId(formulario, x?._id?.criterio, version);
+    throwIfAborted(req);
+
+    const root = aggRows?.[0] || {};
+    const resumen = root.resumen?.[0] || {};
+    const resumenVigente = root.resumenVigente?.[0] || {};
+
+    const esFormularioVigente = (scoreRow = {}) => {
+      const formulario = String(scoreRow?.formulario || "TITULAR").toUpperCase();
+      const version = Number(scoreRow?.version) || (["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(formulario) ? 1 : versionFormularioActual(formulario));
+      return Boolean(FORMULARIOS_AUDITORIA[formulario])
+        && Number(FORMULARIOS_AUDITORIA[formulario].version) === Number(version);
+    };
+
+    const criterioInfo = (raw = {}) => {
+      const formulario = String(raw?.formulario || "TITULAR").toUpperCase();
+      const fallbackVersion = ["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(formulario)
+        ? 1
+        : versionFormularioActual(formulario);
+      const version = Number(raw?.version) || fallbackVersion;
+      const criterio = criterioPorId(formulario, raw?.criterio, version);
+      const vigente = Boolean(FORMULARIOS_AUDITORIA[formulario])
+        && Number(FORMULARIOS_AUDITORIA[formulario].version) === Number(version);
       return {
-        id: x?._id?.criterio,
+        id: raw?.criterio,
         formulario,
         version,
-        label: criterio?.label || `Criterio ${x?._id?.criterio}`,
+        vigente,
+        label: criterio?.label || `Criterio ${raw?.criterio}`,
         grupo: criterio?.grupo || "",
-        count: x.count,
+        count: Number(raw?.count || 0),
+      };
+    };
+
+    const allFallos = (root.topFallosRaw || []).map((x) => criterioInfo({
+      formulario: x?._id?.formulario,
+      version: x?._id?.version,
+      criterio: x?._id?.criterio,
+      count: x?.count,
+    }));
+    const topFallos = allFallos.filter((x) => x.vigente).slice(0, 10);
+    const topFallosHistoricos = allFallos.filter((x) => !x.vigente).slice(0, 8);
+
+    const fallosByOperator = new Map();
+    for (const raw of root.fallosPorOperadorRaw || []) {
+      const username = String(raw?._id?.operador || "").toLowerCase();
+      if (!username) continue;
+      const info = criterioInfo({
+        formulario: raw?._id?.formulario,
+        version: raw?._id?.version,
+        criterio: raw?._id?.criterio,
+        count: raw?.count,
+      });
+      if (!fallosByOperator.has(username)) fallosByOperator.set(username, []);
+      fallosByOperator.get(username).push(info);
+    }
+    for (const [username, items] of fallosByOperator.entries()) {
+      fallosByOperator.set(username, items.sort((a, b) => Number(b.vigente) - Number(a.vigente) || b.count - a.count).slice(0, 3));
+    }
+
+    const porOperador = (root.porOperador || []).map((row) => {
+      const allScores = Array.isArray(row.scores) ? row.scores : [];
+      const currentRows = allScores.filter(esFormularioVigente);
+      const currentValidScores = currentRows
+        .filter((x) => x?.score != null && Number.isFinite(Number(x.score)))
+        .map((x) => ({ ...x, score: Number(x.score) }));
+      const allValidScores = allScores
+        .filter((x) => x?.score != null && Number.isFinite(Number(x.score)))
+        .map((x) => ({ ...x, score: Number(x.score) }));
+
+      // Evolución válida = últimas dos muestras comparables del formulario
+      // vigente. Los scores históricos se conservan, pero no se mezclan.
+      const ultimo = currentValidScores.at(-1) || null;
+      const anterior = currentValidScores.length >= 2 ? currentValidScores.at(-2) : null;
+      const delta = ultimo && anterior ? Number((ultimo.score - anterior.score).toFixed(2)) : null;
+      const username = String(row.operadorUsername || "").toLowerCase();
+      const avgVigente = currentValidScores.length
+        ? currentValidScores.reduce((acc, x) => acc + Number(x.score || 0), 0) / currentValidScores.length
+        : null;
+
+      return {
+        operadorUsername: username,
+        auditorias: Number(row.auditorias || 0),
+        auditables: Number(row.auditables || 0),
+        auditoriasVigentes: currentRows.length,
+        auditablesVigentes: currentValidScores.length,
+        avgFinal: avgVigente == null ? null : Number(avgVigente.toFixed(4)),
+        avgFinalHistoricoMixto: row.avgFinal == null ? null : Number(Number(row.avgFinal).toFixed(4)),
+        ultimaAuditoria: row.ultimaAuditoria || null,
+        ultimoScore: ultimo?.score ?? null,
+        ultimoScoreFecha: ultimo?.fecha || null,
+        ultimoSemaforo: ultimo?.semaforo || null,
+        scoreAnterior: anterior?.score ?? null,
+        deltaUltimas: delta,
+        muestrasHistoricas: Math.max(0, allValidScores.length - currentValidScores.length),
+        fallosRecurrentes: (fallosByOperator.get(username) || []).filter((x) => x.vigente),
       };
     });
+    const porOperadorMap = new Map(porOperador.map((x) => [x.operadorUsername, x]));
 
-    const porTipoInterlocutor = await AuditoriaContactoDirecto.aggregate([
-      { $match: match },
-      {
-        $group: {
-          _id: { $ifNull: ["$tipoInterlocutor", "TITULAR"] },
-          auditorias: { $sum: 1 },
-          avgFinal: { $avg: "$scoreFinal" },
-        },
-      },
-      { $project: { _id: 0, tipoInterlocutor: "$_id", auditorias: 1, avgFinal: 1 } },
-      { $sort: { auditorias: -1, tipoInterlocutor: 1 } },
-    ]);
+    let objetivos = empleadosActivos
+      .map((x) => ({ username: String(x.username || "").toLowerCase(), nombre: String(x.nombre || "") }))
+      .filter((x) => x.username);
+    if (operador) {
+      const selected = String(operador).toLowerCase().trim();
+      objetivos = objetivos.filter((x) => x.username === selected);
+    }
+
+    const planRefuerzo = objetivos.map((op) => {
+      const row = porOperadorMap.get(op.username);
+      const auditorias = Number(row?.auditorias || 0);
+      const auditablesTotales = Number(row?.auditables || 0);
+      const auditoriasVigentes = Number(row?.auditoriasVigentes || 0);
+      const auditables = Number(row?.auditablesVigentes || 0);
+      const ultimo = row?.ultimoScore;
+      const avg = row?.avgFinal;
+      const delta = row?.deltaUltimas;
+      const recurrentes = row?.fallosRecurrentes || [];
+
+      let prioridad = "NORMAL";
+      let prioridadOrden = 20;
+      let necesidad = "Control normal";
+      let motivo = "Resultado estable dentro de parámetros.";
+
+      if (!auditorias) {
+        prioridad = "PENDIENTE";
+        prioridadOrden = 100;
+        necesidad = "Auditar";
+        motivo = "Todavía no tiene auditoría en el período.";
+      } else if (!auditables && auditablesTotales > 0) {
+        prioridad = "PENDIENTE";
+        prioridadOrden = 98;
+        necesidad = "Auditar con formulario vigente";
+        motivo = "Tiene auditorías históricas/anteriores, pero todavía no una muestra comparable con el formulario nuevo.";
+      } else if (!auditables) {
+        prioridad = "ALTA";
+        prioridadOrden = 95;
+        necesidad = "Buscar audio auditable";
+        motivo = "Tiene registros, pero ninguno permite medir calidad con el formulario vigente.";
+      } else if (ultimo != null && ultimo < UMBRALES_AUDITORIA.bajo) {
+        prioridad = "ALTA";
+        prioridadOrden = 90;
+        necesidad = "Refuerzo + nueva auditoría";
+        motivo = `Último score bajo (${ultimo.toFixed(2)}).`;
+      } else if (delta != null && delta <= -0.75) {
+        prioridad = "ALTA";
+        prioridadOrden = 86;
+        necesidad = "Nueva auditoría pronta";
+        motivo = `Empeoró ${Math.abs(delta).toFixed(2)} puntos respecto de la auditoría anterior.`;
+      } else if (avg != null && avg < UMBRALES_AUDITORIA.bajo) {
+        prioridad = "ALTA";
+        prioridadOrden = 82;
+        necesidad = "Refuerzo";
+        motivo = `Promedio del período bajo (${avg.toFixed(2)}).`;
+      } else if ((ultimo != null && ultimo < UMBRALES_AUDITORIA.alto) || (delta != null && delta < -0.25)) {
+        prioridad = "MEDIA";
+        prioridadOrden = 65;
+        necesidad = "Seguimiento / refuerzo puntual";
+        motivo = delta != null && delta < -0.25
+          ? `Tendencia en baja (${delta.toFixed(2)} puntos).`
+          : `Último score medio (${Number(ultimo || 0).toFixed(2)}).`;
+      } else if (auditables < 2) {
+        prioridad = "SEGUIMIENTO";
+        prioridadOrden = 48;
+        necesidad = "Segunda muestra";
+        motivo = "Tiene una sola auditoría con score; falta otra muestra para medir evolución.";
+      }
+
+      if (recurrentes[0]?.count >= 2 && prioridadOrden < 80) {
+        prioridadOrden += 6;
+        if (prioridad === "NORMAL") prioridad = "SEGUIMIENTO";
+        if (necesidad === "Control normal") necesidad = "Refuerzo puntual";
+        motivo = `${motivo} Repite fallas en ${recurrentes[0].label}.`;
+      }
+
+      return {
+        ...op,
+        prioridad,
+        prioridadOrden,
+        necesidad,
+        motivo,
+        auditorias,
+        auditables,
+        auditoriasVigentes,
+        auditablesTotales,
+        avgFinal: avg ?? null,
+        ultimoScore: ultimo ?? null,
+        scoreAnterior: row?.scoreAnterior ?? null,
+        deltaUltimas: delta ?? null,
+        ultimaAuditoria: row?.ultimoScoreFecha || row?.ultimaAuditoria || null,
+        fallosRecurrentes: recurrentes,
+      };
+    }).sort((a, b) => b.prioridadOrden - a.prioridadOrden || a.username.localeCompare(b.username, "es"));
+
+    const faltantes = planRefuerzo.filter((x) => x.auditorias === 0).map((x) => ({ username: x.username, nombre: x.nombre }));
+    const faltanVigente = planRefuerzo.filter((x) => x.auditables === 0).map((x) => ({
+      username: x.username,
+      nombre: x.nombre,
+      auditorias: x.auditorias,
+      auditablesTotales: x.auditablesTotales,
+    }));
+    const faltanConScore = faltanVigente;
+    const mejoraron = porOperador.filter((x) => x.deltaUltimas != null && x.deltaUltimas >= 0.5).sort((a, b) => b.deltaUltimas - a.deltaUltimas);
+    const empeoraron = porOperador.filter((x) => x.deltaUltimas != null && x.deltaUltimas <= -0.5).sort((a, b) => a.deltaUltimas - b.deltaUltimas);
+
+    const porFormulario = (root.porFormulario || []).map((x) => {
+      const formulario = String(x?._id?.formulario || "TITULAR").toUpperCase();
+      const version = Number(x?._id?.version) || (["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(formulario) ? 1 : versionFormularioActual(formulario));
+      return {
+        formulario,
+        version,
+        vigente: Boolean(FORMULARIOS_AUDITORIA[formulario]) && Number(FORMULARIOS_AUDITORIA[formulario].version) === version,
+        label: FORMULARIOS_AUDITORIA[formulario]?.label || (formulario === "TERCERO" ? "Tercero / Familiar / Referencia (histórico)" : formulario.replaceAll("_", " ")),
+        auditorias: Number(x.auditorias || 0),
+        auditables: Number(x.auditables || 0),
+        avgFinal: x.avgFinal == null ? null : Number(Number(x.avgFinal).toFixed(4)),
+      };
+    });
+    const formulariosVigentesCount = porFormulario.filter((x) => x.vigente).reduce((acc, x) => acc + x.auditorias, 0);
+    const formulariosHistoricosCount = porFormulario.filter((x) => !x.vigente).reduce((acc, x) => acc + x.auditorias, 0);
 
     return res.json({
       ok: true,
       resumen: {
         auditorias: resumen?.auditorias || 0,
         auditables: resumen?.auditables || 0,
+        auditablesVigentes: resumenVigente?.auditables || 0,
         noAuditables: resumen?.noAuditables || 0,
         audios: resumen?.audios || 0,
-        scorePromedio:
-          resumen?.avgFinal == null ? null : Number(Number(resumen.avgFinal).toFixed(4)),
+        scorePromedio: resumenVigente?.avgFinal == null ? null : Number(Number(resumenVigente.avgFinal).toFixed(4)),
         bloquesPromedio: {
-          presentacion:
-            resumen?.avgPres == null ? null : Number(Number(resumen.avgPres).toFixed(4)),
-          negociacion:
-            resumen?.avgNeg == null ? null : Number(Number(resumen.avgNeg).toFixed(4)),
-          cierre:
-            resumen?.avgCie == null ? null : Number(Number(resumen.avgCie).toFixed(4)),
-          calidad:
-            resumen?.avgCal == null ? null : Number(Number(resumen.avgCal).toFixed(4)),
+          presentacion: resumenVigente?.avgPres == null ? null : Number(Number(resumenVigente.avgPres).toFixed(4)),
+          negociacion: resumenVigente?.avgNeg == null ? null : Number(Number(resumenVigente.avgNeg).toFixed(4)),
+          cierre: resumenVigente?.avgCie == null ? null : Number(Number(resumenVigente.avgCie).toFixed(4)),
+          calidad: resumenVigente?.avgCal == null ? null : Number(Number(resumenVigente.avgCal).toFixed(4)),
         },
+        formulariosVigentes: formulariosVigentesCount,
+        formulariosHistoricos: formulariosHistoricosCount,
       },
-      semaforos,
+      cobertura: {
+        totalObjetivo: planRefuerzo.length,
+        conAuditoria: planRefuerzo.filter((x) => x.auditorias > 0).length,
+        conFormularioVigente: planRefuerzo.filter((x) => x.auditoriasVigentes > 0).length,
+        conScore: planRefuerzo.filter((x) => x.auditables > 0).length,
+        faltantes,
+        faltanVigente,
+        faltanConScore,
+      },
+      evolucion: {
+        mejoraron,
+        empeoraron,
+        comparables: porOperador.filter((x) => x.deltaUltimas != null).length,
+      },
+      planRefuerzo,
+      semaforos: root.semaforos || [],
       porOperador,
-      porTipoInterlocutor,
+      porTipoInterlocutor: root.porTipoInterlocutor || [],
+      porFormulario,
       topFallos,
+      topFallosHistoricos,
+      diagnosticos: {
+        conduccion: root.conduccion || [],
+        resultadosComerciales: root.resultadosComerciales || [],
+      },
     });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();

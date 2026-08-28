@@ -109,7 +109,7 @@ const CapacitacionSchema = new Schema(
     },
     capacitadoraUsername: {
       type: String,
-      required: true,
+      default: "",
       trim: true,
       lowercase: true,
       index: true,
@@ -174,6 +174,10 @@ const CapacitacionSchema = new Schema(
       esHistorico: { type: Boolean, default: false, index: true },
       datosIncompletos: { type: Boolean, default: false, index: true },
       nombreOriginal: { type: String, default: "", trim: true, maxlength: 180 },
+      // Quién realizó realmente el registro anterior a Cobrina. Se conserva
+      // separado de creadaPorUsername para que una persona pueda cargar hoy
+      // una capacitación/auditoría que históricamente hizo otra persona.
+      realizadoPorOriginal: { type: String, default: "", trim: true, maxlength: 180 },
       fechaPendiente: { type: Boolean, default: false },
       completadoAt: { type: Date, default: null },
     },

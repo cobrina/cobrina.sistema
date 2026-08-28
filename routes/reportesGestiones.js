@@ -23,6 +23,7 @@ import {
   casosNuevos,               // NUEVO
   ultimaActualizacion,       // NUEVO
   analyticsAcuerdos,
+  analyticsAcuerdosReacuerdos90d,
   exportarAcuerdosExcel,
   exportarAcuerdosEstadisticasExcel,
   exportarAcuerdosGestionesExcel,
@@ -72,6 +73,7 @@ router.get("/analytics/asistencia-mes", guard, asistenciaMes);
 router.get("/analytics/casos-nuevos", guard, casosNuevos);
 router.get("/analytics/ultima-actualizacion", guard, ultimaActualizacion);
 router.get("/analytics/acuerdos", guard, analyticsAcuerdos);
+router.get("/analytics/acuerdos/reacuerdos-90d", guard, analyticsAcuerdosReacuerdos90d);
 router.get("/analytics/acuerdos/excel", guard, exportarAcuerdosExcel);
 router.get("/analytics/acuerdos/estadisticas-excel", guard, exportarAcuerdosEstadisticasExcel);
 router.get("/analytics/acuerdos/gestiones-excel", guard, exportarAcuerdosGestionesExcel);

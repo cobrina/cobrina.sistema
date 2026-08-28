@@ -331,7 +331,13 @@ function ultimaNovedad(novedades, tipo, fechaClave) {
  */
 export function horarioEfectivoParaFecha(empleado, fechaClave, novedades = []) {
   const base = empleado?.horarioLaboral || {};
-  const diasBase = Array.isArray(base.dias) && base.dias.length ? base.dias : [1, 2, 3, 4, 5];
+  // Los horarios legacy/importados pueden haber guardado los días como strings
+  // ("1", "2", etc.). En consultas .lean() esos valores pueden llegar sin casteo
+  // y `includes(weekday)` fallaba aunque la ficha mostrara 5 días/semana.
+  const diasNormalizados = Array.isArray(base.dias)
+    ? [...new Set(base.dias.map(Number).filter((dia) => Number.isInteger(dia) && dia >= 0 && dia <= 6))]
+    : [];
+  const diasBase = diasNormalizados.length ? diasNormalizados : [1, 2, 3, 4, 5];
   const date = fechaClaveADateUTC(fechaClave);
   const weekday = date?.getUTCDay();
   const modalidad = String(base.modalidad || "fijo").trim().toLowerCase() === "libre" ? "libre" : "fijo";
@@ -375,10 +381,16 @@ export function horarioEfectivoParaFecha(empleado, fechaClave, novedades = []) {
   const bloquesCambio = cambio ? bloquesHorarioDesdeNovedad(cambio, {}) : [];
   const tieneCambioValido = bloquesCambio.length > 0;
   const bloquesBase = bloquesHorarioDesdeNovedad(null, base);
-  const bloquesHorario = tieneCambioValido ? bloquesCambio : bloquesBase;
+  const bloquesConfigurados = tieneCambioValido ? bloquesCambio : bloquesBase;
+  const programado = tieneCambioValido || diasBase.includes(weekday);
+
+  // Si ese día no está incluido en los días laborales, no enviamos al frontend
+  // una barra de RRHH ficticia. Antes se conservaban los bloques 10–16 aunque
+  // `minutosEsperados` fuera 0, y la pantalla podía mostrar a la vez
+  // “Sin horario” y una línea “RRHH 10:00–16:00”.
+  const bloquesHorario = programado ? bloquesConfigurados : [];
   const entrada = bloquesHorario[0]?.entrada || "";
   const salida = bloquesHorario.at(-1)?.salida || "";
-  const programado = tieneCambioValido || diasBase.includes(weekday);
   const minutosEsperados = programado ? minutosEsperadosBloques(bloquesHorario) : 0;
   const toleranciaMinutos = tieneCambioValido
     ? Number(cambio?.toleranciaMinutosNueva ?? base.toleranciaMinutos ?? 10)

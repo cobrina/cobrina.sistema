@@ -423,7 +423,13 @@ async function applyPayload(doc, body, req, { mode = "save", preserveAssignment 
   if (body.fechaSeguimiento !== undefined) doc.fechaSeguimiento = safeDate(body.fechaSeguimiento);
   if (!doc.requiereSeguimiento) doc.fechaSeguimiento = null;
 
-  if (mode === "draft" || mode === "final" || !preserveAssignment || !doc.capacitadoraUsername) {
+  const historicoSinResponsable = Boolean(
+    doc.registroHistorico?.esHistorico &&
+    preserveAssignment &&
+    !doc.capacitadoraUsername &&
+    !body.capacitadoraUsername
+  );
+  if (!historicoSinResponsable && (mode === "draft" || mode === "final" || !preserveAssignment || !doc.capacitadoraUsername)) {
     doc.capacitadoraUsername = await resolveResponsableCapacitacion(
       body.capacitadoraUsername,
       req.user.username
@@ -693,10 +699,16 @@ export async function crearHistoricos(req, res) {
     const nombres = cleanArray(req.body?.nombres || [], 200, 180);
     if (!nombres.length) return res.status(400).json({ error: "Pegá al menos un nombre para incorporar al histórico." });
 
-    const responsableUsername = await resolveResponsableCapacitacion(
-      req.body?.capacitadoraUsername,
-      req.user.username
-    );
+    // En los registros anteriores a Cobrina distinguimos quién los carga hoy
+    // (creadaPorUsername) de quién los realizó en su momento. La fecha y el
+    // responsable histórico son opcionales porque muchas veces no se conocen.
+    const fechaHistoricaRaw = cleanText(req.body?.fechaCapacitacion || req.body?.fechaHistorica || "", 20);
+    const fechaHistorica = fechaHistoricaRaw ? safeDate(fechaHistoricaRaw) : null;
+    if (fechaHistoricaRaw && !fechaHistorica) {
+      return res.status(400).json({ error: "La fecha histórica indicada no es válida." });
+    }
+    const realizadoPorOriginal = cleanText(req.body?.realizadoPor || req.body?.responsableHistorico || "", 180);
+
     const empleados = await Empleado.find({ isActive: { $ne: false } })
       .select("username nombre role")
       .lean();
@@ -708,6 +720,17 @@ export async function crearHistoricos(req, res) {
       if (!porNombre.has(key)) porNombre.set(key, []);
       porNombre.get(key).push(x);
     });
+
+    // Si el nombre/usuario de quien realizó la capacitación coincide con una
+    // persona del sistema, la vinculamos. Si no, guardamos el texto histórico
+    // tal cual, sin atribuírselo falsamente a quien lo está cargando ahora.
+    let responsableHistoricoUsername = "";
+    if (realizadoPorOriginal) {
+      const exact = porUsername.get(realizadoPorOriginal.toLowerCase());
+      const byName = porNombre.get(normalizarNombreHistorico(realizadoPorOriginal)) || [];
+      const matched = exact || (byName.length === 1 ? byName[0] : null);
+      responsableHistoricoUsername = matched?.username ? String(matched.username).toLowerCase() : "";
+    }
 
     const previos = await Capacitacion.find({
       borrado: { $ne: true },
@@ -734,23 +757,26 @@ export async function crearHistoricos(req, res) {
       if (!empleado) sinVincular.push(original);
       docs.push({
         operadores: [{ username, nombre: cleanText(empleado?.nombre || original, 160) }],
-        capacitadoraUsername: responsableUsername,
+        capacitadoraUsername: responsableHistoricoUsername,
         creadaPorUsername: String(req.user.username || "").toLowerCase(),
         asignadaPorUsername: String(req.user.username || "").toLowerCase(),
-        fechaCapacitacion: null,
+        fechaCapacitacion: fechaHistorica,
         duracionMinutos: 0,
         tipoCapacitacion: "INDIVIDUAL",
         modalidad: "OTRA",
         estado: "CERRADA",
         origen: "OTRO",
         motivos: ["OTRO"],
-        notaAsignacion: "Registro histórico anterior a la carga en Cobrina. Falta completar fecha y detalle.",
+        notaAsignacion: fechaHistorica
+          ? "Registro histórico anterior a la carga en Cobrina. Falta completar el detalle."
+          : "Registro histórico anterior a la carga en Cobrina. Falta completar fecha y detalle.",
         cerradaAt: new Date(),
         registroHistorico: {
           esHistorico: true,
           datosIncompletos: true,
           nombreOriginal: original,
-          fechaPendiente: true,
+          realizadoPorOriginal,
+          fechaPendiente: !fechaHistorica,
           completadoAt: null,
         },
       });
@@ -1145,11 +1171,17 @@ function reportHeader(pdf, title, subtitle = "") {
   pdf.y = 74;
 }
 
+function responsableCapacitacionLabel(item = {}) {
+  const historico = cleanText(item?.registroHistorico?.realizadoPorOriginal, 180);
+  return historico || cleanText(item?.capacitadoraUsername, 120);
+}
+
 function writeCapacitacionPDF(pdf, item, index = null) {
   ensurePage(pdf, 165);
 
   const title = item.operadores?.map(displayUsername).join(", ") || "Sin operador";
-  const subtitle = item.capacitadoraUsername ? `Responsable: ${item.capacitadoraUsername}` : "";
+  const responsableLabel = responsableCapacitacionLabel(item);
+  const subtitle = responsableLabel ? `Responsable: ${responsableLabel}` : "";
   const headingY = pdf.y;
   pdf.save();
   pdf.roundedRect(42, headingY, pdf.page.width - 84, 25, 7).fillAndStroke("#ffffff", "#e8dcf8");
@@ -1512,7 +1544,7 @@ export async function exportarExcel(req, res) {
       ws.addRow({
         fecha: formatDateAR(item.fechaCapacitacion),
         operadores: (item.operadores || []).map(displayUsername).join(", "),
-        capacitadora: item.capacitadoraUsername,
+        capacitadora: responsableCapacitacionLabel(item),
         origen: item.origen,
         motivos: (item.motivos || []).map((x) => labelFrom(MOTIVOS, x, x)).join(" | "),
         temas: [...(item.temasGestion || []), ...(item.herramientas || [])].map((x) => x.label || x.clave).join(" | "),

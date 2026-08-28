@@ -325,7 +325,11 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
     const diff = expectedMin > 0 ? Math.round(trabajoComputableMin - expectedMin) : null;
     const extensionFranjaMin = expectedMin > 0 ? Math.max(0, Math.round(workedMin - expectedMin)) : 0;
     let estadoHoras = "sin-horario";
-    let estadoHorasLabel = horarioEfectivo.horarioLibre ? "Horario libre" : "Sin horario esperado";
+    let estadoHorasLabel = horarioEfectivo.horarioLibre
+      ? "Horario libre"
+      : item.events.length && !horarioEfectivo.programado
+        ? "Actividad fuera de días RRHH"
+        : "Sin horario esperado";
     if (novedadDia) {
       estadoHoras = novedadDia.tipo === "falta" ? "falta" : "novedad";
       estadoHorasLabel = etiquetaNovedad(novedadDia);

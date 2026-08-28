@@ -1644,6 +1644,16 @@ function buildResumenPipeline(matchQ, { completo = true, topN = 10 } = {}) {
         },
         { $sort: { _id: 1 } },
       ],
+      porDia: [
+        {
+          $group: {
+            _id: "$diaISO",
+            gestiones: { $sum: 1 },
+            contactos: { $sum: { $cond: ["$isContacto", 1, 0] } },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ],
       pieTipos: [
         { $match: { tipoNormalizado: { $ne: "Proceso" } } },
         { $group: { _id: "$tipoNormalizado", value: { $sum: 1 } } },
@@ -1997,6 +2007,17 @@ export async function analyticsResumen(req, res) {
           };
         });
 
+        const seriesDia = (actRoot.porDia || []).map((row) => {
+          const gestiones = Number(row?.gestiones || 0);
+          const contactos = Number(row?.contactos || 0);
+          return {
+            fecha: String(row?._id || ""),
+            gestiones,
+            contactos,
+            tasaContacto: gestiones ? (contactos * 100) / gestiones : 0,
+          };
+        });
+
         const delta = (act, prev) => {
           const a = Number.isFinite(Number(act)) ? Number(act) : null;
           const p = Number.isFinite(Number(prev)) ? Number(prev) : null;
@@ -2036,6 +2057,7 @@ export async function analyticsResumen(req, res) {
               promIntervaloGestionesMin: Number(ritmo.promedioGestiones || 0),
               promIntervaloCasosMin: Number(ritmo.promedioCasos || 0),
               series,
+              seriesDia,
               pieTipos: (actRoot.pieTipos || []).map((x) => ({
                 label: String(x?._id || "Otros"),
                 value: Number(x?.value || 0),
@@ -4051,7 +4073,9 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
   const appliedSort = ordenarAcuerdos(acuerdos, sortKey, sortDir);
   const summary = resumirAcuerdos(acuerdosEfectivos, totalGestiones, gestionesPorOperador, paymentMeta);
   summary.registrosAnuladosPorNuevo = acuerdosAnulados.length;
-  summary.alertasReacuerdos90d = await detectarReacuerdosRecurrentes90Dias(req, { hasta, operador, entidad, dni });
+  // El control preventivo de reacuerdos de 90 días es una consulta adicional y
+  // costosa (vuelve a cruzar acuerdos + pagos). Ya no bloquea la carga principal:
+  // el frontend lo pide en segundo plano mediante su endpoint específico.
   const acuerdosVisibles = filtrarFilasReportesControl(acuerdos, (row) => row?.usuario);
 
   if (paginate && desde && hasta) {
@@ -4196,6 +4220,29 @@ export async function analyticsAcuerdos(req, res) {
   } catch (error) {
     if (error?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(error?.status || 500).json({ error: error?.message || "No se pudo generar el reporte de acuerdos." });
+  }
+}
+
+/** GET /api/reportes-gestiones/analytics/acuerdos/reacuerdos-90d
+ *  Se ejecuta aparte para que el cruce preventivo de 90 días no retrase la
+ *  tabla, KPIs y vencimientos principales del módulo Acuerdos.
+ */
+export async function analyticsAcuerdosReacuerdos90d(req, res) {
+  try {
+    attachAbortFlag(req, res);
+    if (!getUsuarioId(req)) return res.status(401).json({ error: "Token invalido o ausente." });
+    if (!ensureNoOperador(req, res)) return;
+    const data = await detectarReacuerdosRecurrentes90Dias(req, {
+      hasta: req.query?.hasta || "",
+      operador: req.query?.operador || "",
+      entidad: req.query?.entidad || "",
+      dni: req.query?.dni || "",
+    });
+    if (req?.aborted || req?.__aborted) return res.status(499).end();
+    return res.json({ ok: true, ...data });
+  } catch (error) {
+    if (error?.code === "CLIENT_ABORTED") return res.status(499).end();
+    return res.status(error?.status || 500).json({ error: error?.message || "No se pudo calcular el control de reacuerdos de 90 días." });
   }
 }
 
