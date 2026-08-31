@@ -162,6 +162,21 @@ function validarDatosNovedad(tipo, body, fechaDesde, fechaHasta) {
   if (!fechaFinNoAnterior(fechaDesde, fechaHasta)) {
     return "La fecha hasta no puede ser anterior a la fecha desde";
   }
+  if (tipo === "capacitacion") {
+    const inicio = String(body.horaInicio || "").trim();
+    const fin = String(body.horaFin || "").trim();
+    if (!horaValida(inicio) || !horaValida(fin)) {
+      return "Completá el horario de inicio y fin de la capacitación";
+    }
+    const [ih, im] = inicio.split(":").map(Number);
+    const [fh, fm] = fin.split(":").map(Number);
+    if ((fh * 60 + fm) <= (ih * 60 + im)) {
+      return "La hora de fin de la capacitación debe ser posterior al inicio";
+    }
+    if (fechaHasta && fechaDesde && fechaHasta.getTime() !== fechaDesde.getTime()) {
+      return "La capacitación debe registrarse por día para indicar correctamente su horario";
+    }
+  }
   if (tipo === "cambio-horario") {
     const entrada = String(body.horaEntradaNueva || "").trim();
     const salida = String(body.horaSalidaNueva || "").trim();
@@ -238,7 +253,7 @@ export async function crearNovedad(req, res) {
 
     // Las novedades pueden abarcar uno o varios días. En cambios de horario
     // se admite además fechaHasta=null para reglas recurrentes "desde ahora".
-    if (tipo === "licencia-medica" && !fechaHasta) {
+    if (["licencia-medica", "capacitacion"].includes(tipo) && !fechaHasta) {
       fechaHasta = fechaDesde;
     }
     const errorDatos = validarDatosNovedad(tipo, req.body, fechaDesde, fechaHasta);
@@ -293,7 +308,9 @@ export async function crearNovedad(req, res) {
         : 10,
       ...deudaHorario,
       minutosTarde: Number(req.body.minutosTarde || 0),
-      justificado: Boolean(req.body.justificado || ["falta-justificada", "licencia-medica", "vacaciones"].includes(tipo)),
+      horaInicio: tipo === "capacitacion" ? String(req.body.horaInicio || "").trim() : "",
+      horaFin: tipo === "capacitacion" ? String(req.body.horaFin || "").trim() : "",
+      justificado: Boolean(req.body.justificado || ["falta-justificada", "licencia-medica", "vacaciones", "capacitacion"].includes(tipo)),
       descripcion,
       accionTomada: String(req.body.accionTomada || "").trim(),
       estado: req.body.estado || "vigente",
@@ -301,7 +318,7 @@ export async function crearNovedad(req, res) {
     });
 
     await item.populate("empleadoId", "username nombre role");
-    if (["cambio-horario", "licencia-medica"].includes(tipo)) invalidateSeguimientoCache();
+    if (["cambio-horario", "licencia-medica", "capacitacion"].includes(tipo)) invalidateSeguimientoCache();
     return res.status(201).json(item);
   } catch (error) {
     console.error("RRHH crear novedad:", error);
@@ -332,13 +349,20 @@ export async function actualizarNovedad(req, res) {
     const tipo = String(update.tipo || actual.tipo || "");
     const fechaDesde = update.fechaDesde || actual.fechaDesde;
     let fechaHasta = update.fechaHasta !== undefined ? update.fechaHasta : actual.fechaHasta;
-    if (tipo === "licencia-medica" && !fechaHasta) fechaHasta = fechaDesde;
+    if (["licencia-medica", "capacitacion"].includes(tipo) && !fechaHasta) fechaHasta = fechaDesde;
     update.fechaHasta = fechaHasta;
     const datosCombinados = { ...actual, ...update };
     const errorDatos = validarDatosNovedad(tipo, datosCombinados, fechaDesde, fechaHasta);
     if (errorDatos) return res.status(400).json({ error: errorDatos });
 
-    if (["licencia-medica", "vacaciones"].includes(tipo)) update.justificado = true;
+    if (["licencia-medica", "vacaciones", "capacitacion"].includes(tipo)) update.justificado = true;
+    if (tipo === "capacitacion") {
+      update.horaInicio = String(datosCombinados.horaInicio || "").trim();
+      update.horaFin = String(datosCombinados.horaFin || "").trim();
+    } else {
+      update.horaInicio = "";
+      update.horaFin = "";
+    }
     update.motivoApercibimiento = tipo === "apercibimiento"
       ? String(datosCombinados.motivoApercibimiento || "otro")
       : "";
@@ -366,7 +390,7 @@ export async function actualizarNovedad(req, res) {
       new: true,
       runValidators: true,
     }).populate("empleadoId", "username nombre role");
-    if (["cambio-horario", "licencia-medica"].includes(tipo)) invalidateSeguimientoCache();
+    if (["cambio-horario", "licencia-medica", "capacitacion"].includes(tipo)) invalidateSeguimientoCache();
     return res.json(item);
   } catch (error) {
     return res.status(400).json({ error: error.message || "No se pudo actualizar la novedad" });
@@ -377,7 +401,7 @@ export async function eliminarNovedad(req, res) {
   try {
     const item = await NovedadRRHH.findByIdAndDelete(req.params.id);
     if (!item) return res.status(404).json({ error: "Novedad no encontrada" });
-    if (["cambio-horario", "licencia-medica"].includes(item.tipo)) invalidateSeguimientoCache();
+    if (["cambio-horario", "licencia-medica", "capacitacion"].includes(item.tipo)) invalidateSeguimientoCache();
     return res.json({ ok: true });
   } catch (error) {
     return res.status(400).json({ error: "No se pudo eliminar la novedad" });

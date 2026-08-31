@@ -19,6 +19,7 @@ const NovedadRRHHSchema = new mongoose.Schema(
         "vacaciones",
         "dia-estudio",
         "permiso",
+        "capacitacion",
         "apercibimiento",
         "error-grave-gestion",
         "otro",
@@ -94,6 +95,20 @@ const NovedadRRHHSchema = new mongoose.Schema(
     minutosNuevaJornada: { type: Number, default: 0, min: 0 },
     minutosDeudaPorDia: { type: Number, default: 0, min: 0 },
     minutosTarde: { type: Number, default: 0, min: 0 },
+    // Para bloques de capacitación: este intervalo se excluye de los baches
+    // y puede computarse como tiempo justificado dentro de la jornada.
+    horaInicio: {
+      type: String,
+      default: "",
+      trim: true,
+      match: [/^$|^([01]\d|2[0-3]):[0-5]\d$/, "Hora de inicio inválida"],
+    },
+    horaFin: {
+      type: String,
+      default: "",
+      trim: true,
+      match: [/^$|^([01]\d|2[0-3]):[0-5]\d$/, "Hora de fin inválida"],
+    },
     justificado: { type: Boolean, default: false },
     descripcion: { type: String, required: true, trim: true, maxlength: 3000 },
     accionTomada: { type: String, default: "", trim: true, maxlength: 2000 },

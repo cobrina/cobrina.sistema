@@ -123,20 +123,90 @@ export function intervalosAjustadosPorDescanso(intervalos = [], horario = {}) {
   });
 }
 
+/**
+ * Quita de una lista de intervalos los bloques justificados (por ejemplo,
+ * capacitaciones registradas en RRHH). Si un bloque justificado cae en medio
+ * de un corte, el corte se divide en dos tramos y el tiempo justificado no se
+ * computa como bache.
+ */
+export function intervalosExcluyendoBloques(intervalos = [], bloquesExcluidos = []) {
+  const exclusiones = (Array.isArray(bloquesExcluidos) ? bloquesExcluidos : [])
+    .map((bloque) => {
+      const inicio = Number.isFinite(Number(bloque?.desdeMin))
+        ? Number(bloque.desdeMin)
+        : minutosHoraHHMM(bloque?.desde || bloque?.horaInicio);
+      const fin = Number.isFinite(Number(bloque?.hastaMin))
+        ? Number(bloque.hastaMin)
+        : minutosHoraHHMM(bloque?.hasta || bloque?.horaFin);
+      return { inicio, fin };
+    })
+    .filter((bloque) => Number.isFinite(bloque.inicio) && Number.isFinite(bloque.fin) && bloque.fin > bloque.inicio)
+    .sort((a, b) => a.inicio - b.inicio);
+
+  const fuente = (Array.isArray(intervalos) ? intervalos : [])
+    .map((intervalo) => ({
+      ...intervalo,
+      desdeMin: Number(intervalo?.desdeMin),
+      hastaMin: Number(intervalo?.hastaMin),
+    }))
+    .filter((intervalo) => Number.isFinite(intervalo.desdeMin) && Number.isFinite(intervalo.hastaMin) && intervalo.hastaMin > intervalo.desdeMin);
+
+  if (!exclusiones.length) {
+    return fuente.map((intervalo) => ({
+      ...intervalo,
+      duracionMin: Math.max(0, Math.round(intervalo.hastaMin - intervalo.desdeMin)),
+    }));
+  }
+
+  const resultado = [];
+  for (const intervalo of fuente) {
+    let segmentos = [{ ...intervalo }];
+    for (const exclusion of exclusiones) {
+      const siguientes = [];
+      for (const segmento of segmentos) {
+        if (exclusion.fin <= segmento.desdeMin || exclusion.inicio >= segmento.hastaMin) {
+          siguientes.push(segmento);
+          continue;
+        }
+        if (exclusion.inicio > segmento.desdeMin) {
+          siguientes.push({ ...segmento, hastaMin: Math.min(segmento.hastaMin, exclusion.inicio) });
+        }
+        if (exclusion.fin < segmento.hastaMin) {
+          siguientes.push({ ...segmento, desdeMin: Math.max(segmento.desdeMin, exclusion.fin) });
+        }
+      }
+      segmentos = siguientes;
+      if (!segmentos.length) break;
+    }
+    for (const segmento of segmentos) {
+      if (segmento.hastaMin <= segmento.desdeMin) continue;
+      resultado.push({
+        ...segmento,
+        duracionMin: Math.max(0, Math.round(segmento.hastaMin - segmento.desdeMin)),
+        recortadoPorBloqueJustificado: true,
+      });
+    }
+  }
+
+  return resultado.sort((a, b) => a.desdeMin - b.desdeMin || a.hastaMin - b.hastaMin);
+}
+
 // Convierte los huecos entre gestiones en tramos que realmente caen dentro de
 // horas laborales. Si hay jornada partida, el descanso entre bloques se corta
 // por completo: nunca se suma ni se presenta como bache. En horario libre, al
 // no existir una franja fija, se conservan los intervalos reales entre gestiones.
 // Break flexible por jornada (sin horario fijo):
-// - jornada de 4 h: hasta 20 min continuos
-// - jornada de 6 h: hasta 30 min continuos
+// - jornada corta de 3 a 4 h: hasta 20 min continuos
+// - jornada mayor a 4 h: hasta 30 min continuos
 // - horario libre: conserva la referencia operativa de 4 h => 20 min
+// Esto también contempla cambios puntuales de horario: una jornada reducida a
+// 3 h no pierde el break por dejar de coincidir exactamente con 4 h.
 // El beneficio se aplica una sola vez por día al corte continuo más largo.
 export function minutosBreakFlexiblePermitido(horario = {}) {
   if (horario?.horarioLibre) return 20;
   const esperados = Math.max(0, Math.round(Number(horario?.minutosEsperados || 0)));
-  if (esperados === 240) return 20;
-  if (esperados === 360) return 30;
+  if (esperados >= 180 && esperados <= 240) return 20;
+  if (esperados > 240) return 30;
   return 0;
 }
 

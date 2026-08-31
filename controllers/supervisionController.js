@@ -17,6 +17,8 @@ import {
   rangoMesLocal,
   minutosActividadSegunHorario,
   intervalosAjustadosPorDescanso,
+  intervalosExcluyendoBloques,
+  intervalosLaboralesSinDescanso,
   aplicarBreakFlexible,
   minutosBreakFlexiblePermitido,
   minutosHoraHHMM,
@@ -142,6 +144,23 @@ function etiquetaNovedadDia(novedad) {
   return "";
 }
 
+function bloquesCapacitacionDelDia(novedades = [], fechaClave = "") {
+  return (Array.isArray(novedades) ? novedades : [])
+    .filter((novedad) => novedad?.tipo === "capacitacion" && novedadCubreFecha(novedad, fechaClave))
+    .map((novedad) => ({
+      desdeMin: minutosHoraHHMM(novedad?.horaInicio),
+      hastaMin: minutosHoraHHMM(novedad?.horaFin),
+      descripcion: novedad?.descripcion || "Capacitación",
+    }))
+    .filter((bloque) => Number.isFinite(bloque.desdeMin) && Number.isFinite(bloque.hastaMin) && bloque.hastaMin > bloque.desdeMin)
+    .sort((a, b) => a.desdeMin - b.desdeMin);
+}
+
+function minutosCapacitacionDentroHorario(bloques = [], horario = {}) {
+  return intervalosLaboralesSinDescanso(bloques, horario)
+    .reduce((sum, bloque) => sum + Number(bloque?.duracionMin || 0), 0);
+}
+
 function bloquesActividadDia(actividad = {}) {
   const primera = minutosHoraHHMM(actividad?.primeraGestion);
   const ultima = minutosHoraHHMM(actividad?.ultimaGestion);
@@ -263,7 +282,7 @@ export async function resumenSupervision(req, res) {
         .lean(),
       NovedadRRHH.find({
         empleadoId: { $in: idsControlados },
-        tipo: { $in: ["cambio-horario", "licencia-medica", "vacaciones", "falta", "falta-justificada", "dia-estudio", "permiso"] },
+        tipo: { $in: ["cambio-horario", "licencia-medica", "vacaciones", "falta", "falta-justificada", "dia-estudio", "permiso", "capacitacion"] },
         estado: { $ne: "anulado" },
         fechaDesde: { $lte: hastaNovedades },
         $or: [{ fechaHasta: null }, { fechaHasta: { $gte: desdeNovedades } }],
@@ -548,35 +567,30 @@ export async function resumenSupervision(req, res) {
       const extraHoyMin = minutosExigiblesHoy > 0 ? Math.max(0, minutosTrabajadosHoy - minutosExigiblesHoy) : 0;
       const salidaHoyMin = minutosHoraHHMM(horarioHoy.salida);
       const entradaHoyMin = minutosHoraHHMM(horarioHoy.entrada);
-      const estadoAhoraMin = fuenteGestionesActualizadaHoy && Number.isFinite(corteGestionesMin)
-        ? Number(corteGestionesMin)
-        : ahoraMinArgentina;
+      // La hora de importación del Excel no forma parte del cálculo de jornada.
+      // El estado usa la hora real de la consulta y los baches sólo horas reales de
+      // gestión/franja RRHH. Durante la jornada no se inventa un corte abierto.
+      const estadoAhoraMin = ahoraMinArgentina;
       const jornadaFinalizadaHoy = horarioHoy.programado && Number.isFinite(salidaHoyMin) && estadoAhoraMin >= salidaHoyMin;
       const enDescansoProgramadoHoy = minutoEnDescansoProgramado(estadoAhoraMin, horarioHoy.bloquesHorario);
+      const capacitacionesHoy = bloquesCapacitacionDelDia(novedadesEmpleado, hoyClave);
 
-      // Misma regla que Reportes > Seguimiento: los cortes cerrados salen de las
-      // gestiones cargadas y el corte abierto llega únicamente hasta la última carga
-      // manual disponible. Solo se llama "actual" si esa carga coincide con el minuto
-      // de la consulta. Los cortes fuera del horario también se conservan: una gestión
-      // aislada posterior a la salida no puede convertir todo el hueco en trabajo extra.
-      const intervalosLaboralesHoy = intervalosAjustadosPorDescanso(actividadDelDia.intervalos || [], horarioHoy)
-        .map((intervalo) => ({ ...intervalo, actual: false, abiertoAlCorte: false, origen: "cerrado" }));
-      const desdeCorteAbiertoMin = Number.isFinite(ultimaMinHoy)
-        ? ultimaMinHoy
-        : Number.isFinite(entradaHoyMin)
-          ? entradaHoyMin
-          : null;
-      const intervalosAbiertosHoy = esFechaActual && fuenteGestionesActualizadaHoy && Number.isFinite(desdeCorteAbiertoMin) && Number.isFinite(corteGestionesMin) && corteGestionesMin > desdeCorteAbiertoMin
-        ? intervalosAjustadosPorDescanso([{ desdeMin: desdeCorteAbiertoMin, hastaMin: corteGestionesMin }], horarioHoy)
-            .map((intervalo) => ({
-              ...intervalo,
-              actual: Boolean(fuenteGestionesReciente && !jornadaFinalizadaHoy),
-              abiertoAlCorte: Boolean(!fuenteGestionesReciente && !jornadaFinalizadaHoy),
-              corteDatosHora: corteGestionesHora,
-              origen: "abierto",
-            }))
+      const intervalosLaboralesHoy = intervalosAjustadosPorDescanso(
+        intervalosExcluyendoBloques(actividadDelDia.intervalos || [], capacitacionesHoy),
+        horarioHoy
+      ).map((intervalo) => ({ ...intervalo, actual: false, abiertoAlCorte: false, origen: "cerrado" }));
+
+      // Cuando la franja ya terminó, si hubo gestiones pero la última quedó antes
+      // de la salida, se evalúa ese único tramo final como máximo hasta RRHH. La
+      // línea de tiempo seguirá terminando visualmente en la última gestión real.
+      const tramoFinalHoy = jornadaFinalizadaHoy && Number.isFinite(ultimaMinHoy) && Number.isFinite(salidaHoyMin) && salidaHoyMin > ultimaMinHoy
+        ? intervalosAjustadosPorDescanso(
+            intervalosExcluyendoBloques([{ desdeMin: ultimaMinHoy, hastaMin: salidaHoyMin }], capacitacionesHoy),
+            horarioHoy
+          ).map((intervalo) => ({ ...intervalo, actual: false, abiertoAlCorte: false, origen: "cerrado" }))
         : [];
-      const ajusteBreakHoy = aplicarBreakFlexible([...intervalosLaboralesHoy, ...intervalosAbiertosHoy], horarioHoy);
+
+      const ajusteBreakHoy = aplicarBreakFlexible([...intervalosLaboralesHoy, ...tramoFinalHoy], horarioHoy);
       const intervalosConBreakHoy = ajusteBreakHoy.intervalos;
       const breakPermitidoHoyMin = ajusteBreakHoy.permitidoMin || minutosBreakFlexiblePermitido(horarioHoy);
       const breakConsideradoHoyRaw = ajusteBreakHoy.breakDetalle;
@@ -589,9 +603,9 @@ export async function resumenSupervision(req, res) {
           duracionOriginalMin: Math.round(Number(intervalo.duracionOriginalMin ?? intervalo.duracionMin ?? 0)),
           breakConsideradoMin: Math.round(Number(intervalo.breakConsideradoMin || 0)),
           breakPermitidoMin: Math.round(Number(intervalo.breakPermitidoMin || breakPermitidoHoyMin || 0)),
-          actual: Boolean(intervalo.actual),
-          abiertoAlCorte: Boolean(intervalo.abiertoAlCorte),
-          corteDatosHora: intervalo.corteDatosHora || "",
+          actual: false,
+          abiertoAlCorte: false,
+          corteDatosHora: "",
         }))
         .sort((a, b) => minutosHoraHHMM(a.desde) - minutosHoraHHMM(b.desde));
       const breakConsideradoHoy = breakConsideradoHoyRaw ? {
@@ -601,43 +615,50 @@ export async function resumenSupervision(req, res) {
         breakConsideradoMin: Math.round(Number(breakConsideradoHoyRaw.breakConsideradoMin || 0)),
         breakPermitidoMin: Math.round(Number(breakConsideradoHoyRaw.breakPermitidoMin || 0)),
         excedenteMin: Math.round(Number(breakConsideradoHoyRaw.excedenteMin || 0)),
-        actual: Boolean(breakConsideradoHoyRaw.actual),
-        abiertoAlCorte: Boolean(breakConsideradoHoyRaw.abiertoAlCorte),
-        corteDatosHora: breakConsideradoHoyRaw.corteDatosHora || "",
+        actual: false,
+        abiertoAlCorte: false,
+        corteDatosHora: "",
       } : null;
-      // "Trabajo efectivo" es una estimación operativa: parte de la franja entre
-      // primera y última gestión dentro del horario RRHH y descuenta el break flexible
-      // reconocido + los cortes visibles (>20 min) restantes. Las pausas de hasta
-      // 20 min se mantienen como continuidad normal, por eso no se presenta como reloj exacto.
+      // "Trabajo efectivo" parte de la franja entre primera y última gestión y
+      // descuenta el break flexible reconocido + cortes visibles. Capacitación se
+      // reconoce aparte para cumplimiento, nunca para fabricar horas extra.
       const breakDescontadoHoyMin = Math.round(Number(breakConsideradoHoy?.breakConsideradoMin || 0));
       const cortesDescontadosHoyMin = Math.round(bachesDetalleHoy.reduce((sum, intervalo) => sum + Number(intervalo.duracionMin || 0), 0));
-      const minutosTrabajoEfectivoHoy = Math.max(0, Math.round(minutosTrabajadosHoy - breakDescontadoHoyMin - cortesDescontadosHoyMin));
-      // El break permitido puede completar la jornada, pero nunca crear horas extra.
+      const capacitacionHoyMin = Math.round(minutosCapacitacionDentroHorario(capacitacionesHoy, horarioHoy));
+      // La franja primera→última gestión puede atravesar una capacitación. Ese
+      // tiempo no es actividad Mango: se resta del trabajo efectivo y se acredita
+      // después como tiempo justificado, evitando contarlo dos veces.
+      const capacitacionDentroFranjaHoyMin = Number.isFinite(primeraMinHoy) && Number.isFinite(ultimaMinHoy) && ultimaMinHoy > primeraMinHoy
+        ? Math.round(intervalosLaboralesSinDescanso(capacitacionesHoy, horarioHoy).reduce((total, bloque) => {
+            const desde = Math.max(Number(bloque?.desdeMin || 0), primeraMinHoy);
+            const hasta = Math.min(Number(bloque?.hastaMin || 0), ultimaMinHoy);
+            return total + Math.max(0, hasta - desde);
+          }, 0))
+        : 0;
+      const minutosTrabajoEfectivoHoy = Math.max(0, Math.round(minutosTrabajadosHoy - breakDescontadoHoyMin - cortesDescontadosHoyMin - capacitacionDentroFranjaHoyMin));
       const breakAplicadoCumplimientoHoyMin = minutosExigiblesHoy > 0
         ? Math.min(breakDescontadoHoyMin, Math.max(0, minutosExigiblesHoy - minutosTrabajoEfectivoHoy))
         : 0;
-      const minutosTrabajoComputableHoy = Math.max(0, Math.round(minutosTrabajoEfectivoHoy + breakAplicadoCumplimientoHoyMin));
+      const capacitacionAplicadaCumplimientoHoyMin = minutosExigiblesHoy > 0
+        ? Math.min(capacitacionHoyMin, Math.max(0, minutosExigiblesHoy - minutosTrabajoEfectivoHoy - breakAplicadoCumplimientoHoyMin))
+        : 0;
+      const minutosTrabajoComputableHoy = Math.max(0, Math.round(minutosTrabajoEfectivoHoy + breakAplicadoCumplimientoHoyMin + capacitacionAplicadaCumplimientoHoyMin));
       const diferenciaTrabajoEfectivoHoyMin = minutosExigiblesHoy > 0 ? minutosTrabajoComputableHoy - minutosExigiblesHoy : null;
       const faltanTrabajoEfectivoHoyMin = minutosExigiblesHoy > 0 ? Math.max(0, minutosExigiblesHoy - minutosTrabajoComputableHoy) : 0;
       const extraTrabajoEfectivoHoyMin = minutosExigiblesHoy > 0 ? Math.max(0, minutosTrabajoEfectivoHoy - minutosExigiblesHoy) : 0;
+      // Los cortes se auditan completos, pero sólo se transforma en tiempo a
+      // recuperar la porción que todavía falta para cumplir la jornada RRHH.
+      const recuperarHoyMin = minutosExigiblesHoy > 0
+        ? Math.min(cortesDescontadosHoyMin, faltanTrabajoEfectivoHoyMin)
+        : null;
       const baches20Hoy = bachesDetalleHoy.length;
-      // Se conserva el campo histórico +30 para no romper consumidores anteriores.
-      const baches30Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > 30 && !intervalo.abiertoAlCorte).length;
-      const baches60Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > BACHE_CRITICO_MIN && !intervalo.abiertoAlCorte).length;
+      const baches30Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > 30).length;
+      const baches60Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > BACHE_CRITICO_MIN).length;
       const bacheMaximoHoyMin = bachesDetalleHoy.reduce((maximo, intervalo) => Math.max(maximo, Number(intervalo.duracionMin || 0)), 0);
+      const minutosAbiertosAlCorteHoy = 0;
+      const minutosSinGestionHoy = 0;
+      const minutosSinGestionAlCorteHoy = 0;
 
-      const minutosAbiertosAlCorteHoy = intervalosConBreakHoy.some((intervalo) => intervalo.origen === "abierto")
-        ? Math.round(intervalosConBreakHoy
-            .filter((intervalo) => intervalo.origen === "abierto")
-            .reduce((sum, intervalo) => sum + Number(intervalo.duracionMin || 0), 0))
-        : 0;
-      const breakActualCubriendoPausaHoy = Boolean(
-        breakConsideradoHoy?.actual && Number(breakConsideradoHoy?.breakConsideradoMin || 0) > 0 && minutosAbiertosAlCorteHoy <= BACHE_VISIBLE_MIN
-      );
-      const minutosSinGestionHoy = fuenteGestionesReciente ? minutosAbiertosAlCorteHoy : 0;
-      const minutosSinGestionAlCorteHoy = fuenteGestionesActualizadaHoy && !fuenteGestionesReciente
-        ? minutosAbiertosAlCorteHoy
-        : 0;
       const tardanzaInicioHoyMin = Number.isFinite(primeraMinHoy) && Number.isFinite(entradaHoyMin)
         ? Math.max(0, Math.round(primeraMinHoy - entradaHoyMin))
         : 0;
@@ -647,8 +668,6 @@ export async function resumenSupervision(req, res) {
 
       let estadoJornadaHoy = "sin-jornada";
       let estadoJornadaHoyLabel = horarioHoy.horarioLibre ? "Horario libre" : "Sin jornada hoy";
-      const fuenteSinActualizarHoy = !fuenteGestionesActualizadaHoy;
-      const fuenteDesactualizada = fuenteGestionesActualizadaHoy && !fuenteGestionesReciente;
       if (novedadDia) {
         estadoJornadaHoy = novedadDia.tipo === "falta" ? "falta" : "novedad";
         estadoJornadaHoyLabel = etiquetaNovedadDia(novedadDia);
@@ -656,18 +675,12 @@ export async function resumenSupervision(req, res) {
         if (minutosTrabajoEfectivoHoy >= 240) {
           estadoJornadaHoy = "completa";
           estadoJornadaHoyLabel = "Horario libre · 4 h cumplidas";
-        } else if (fuenteSinActualizarHoy) {
-          estadoJornadaHoy = "pendiente";
-          estadoJornadaHoyLabel = esFechaActual ? "Horario libre · Gestiones sin actualización de hoy" : "Horario libre · Sin gestiones importadas para la fecha";
         } else {
           estadoJornadaHoy = "en-curso";
           estadoJornadaHoyLabel = `Horario libre · ${Math.floor(minutosTrabajoEfectivoHoy / 60)}h ${minutosTrabajoEfectivoHoy % 60}m efectivos de 4 h`;
         }
       } else if (horarioHoy.programado) {
-        if (fuenteSinActualizarHoy) {
-          estadoJornadaHoy = "pendiente";
-          estadoJornadaHoyLabel = esFechaActual ? "Gestiones sin actualización de hoy" : "Sin gestiones importadas para la fecha";
-        } else if (Number.isFinite(entradaHoyMin) && estadoAhoraMin < entradaHoyMin && !Number(actividadDelDia.gestiones || 0)) {
+        if (Number.isFinite(entradaHoyMin) && estadoAhoraMin < entradaHoyMin && !Number(actividadDelDia.gestiones || 0)) {
           estadoJornadaHoy = "pendiente";
           estadoJornadaHoyLabel = "Todavía no inicia";
         } else if (Number.isFinite(entradaHoyMin) && estadoAhoraMin < entradaHoyMin && Number(actividadDelDia.gestiones || 0) > 0) {
@@ -690,25 +703,9 @@ export async function resumenSupervision(req, res) {
             estadoJornadaHoy = "completa";
             estadoJornadaHoyLabel = "Jornada completa";
           }
-        } else if (fuenteDesactualizada) {
-          estadoJornadaHoy = "en-curso";
-          estadoJornadaHoyLabel = `En curso · datos al corte ${corteGestionesHora || "disponible"}`;
         } else if (!Number(actividadDelDia.gestiones || 0)) {
           estadoJornadaHoy = "sin-actividad";
           estadoJornadaHoyLabel = "No inició · sin gestiones";
-        } else if (fuenteGestionesReciente && breakActualCubriendoPausaHoy) {
-          estadoJornadaHoy = "descanso";
-          const totalPausa = Number(breakConsideradoHoy?.duracionOriginalMin || 0);
-          const considerado = Number(breakConsideradoHoy?.breakConsideradoMin || 0);
-          estadoJornadaHoyLabel = totalPausa <= considerado
-            ? `Break considerado · ${Math.round(totalPausa)} de ${Math.round(breakPermitidoHoyMin)} min`
-            : `Break considerado · ${Math.round(considerado)} min + ${Math.round(minutosSinGestionHoy)} min de excedente`;
-        } else if (Number(minutosSinGestionHoy || 0) > BACHE_CRITICO_MIN) {
-          estadoJornadaHoy = "alerta";
-          estadoJornadaHoyLabel = `Bache actual ${Math.round(minutosSinGestionHoy)} min`;
-        } else if (Number(minutosSinGestionHoy || 0) > BACHE_VISIBLE_MIN) {
-          estadoJornadaHoy = "atencion";
-          estadoJornadaHoyLabel = `Corte actual ${Math.round(minutosSinGestionHoy)} min`;
         } else if (tardanzaInicioHoyMin > TARDANZA_INICIO_VISIBLE_MIN) {
           estadoJornadaHoy = "atencion";
           estadoJornadaHoyLabel = `En curso · inició ${tardanzaInicioHoyMin} min tarde`;
@@ -741,12 +738,17 @@ export async function resumenSupervision(req, res) {
         minutosTrabajoEfectivoHoy,
         minutosTrabajoComputableHoy,
         breakAplicadoCumplimientoHoyMin,
+        capacitacionHoyMin,
+        capacitacionDentroFranjaHoyMin,
+        capacitacionAplicadaCumplimientoHoyMin,
+        capacitacionesHoy: capacitacionesHoy.map((bloque) => ({ desde: horaGestionHHMM(bloque.desdeMin), hasta: horaGestionHHMM(bloque.hastaMin), descripcion: bloque.descripcion })),
         breakDescontadoHoyMin,
         cortesDescontadosHoyMin,
         minutosProgramadosHoy,
         minutosExigiblesHoy,
         diferenciaHoyMin: diferenciaTrabajoEfectivoHoyMin,
         faltanHoyMin: faltanTrabajoEfectivoHoyMin,
+        recuperarHoyMin,
         extraHoyMin: extraTrabajoEfectivoHoyMin,
         baches20Hoy,
         baches30Hoy,
@@ -759,7 +761,7 @@ export async function resumenSupervision(req, res) {
         inicioAnticipadoHoyMin,
         minutosSinGestionHoy,
         minutosSinGestionAlCorteHoy,
-        corteDatosHora: corteGestionesHora,
+        corteDatosHora: "",
         fuenteGestionesActualizadaHoy,
         fuenteGestionesReciente,
         jornadaFinalizadaHoy,
