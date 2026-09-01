@@ -107,8 +107,28 @@ function filtroVencimientoMes(mes) {
 }
 
 async function asegurarUniversoPorVencimiento(mes) {
-  // Un vencimiento de septiembre puede provenir de una gestión de agosto.
-  // Por eso, antes de consultar un mes, garantizamos tanto ese mes como el anterior.
+  const actual = mesActualArgentina();
+
+  // IMPORTANTE DE PERFORMANCE:
+  // La pantalla de Contactados dispara varias lecturas en paralelo (catálogos,
+  // tabla, alerta y, cuando se abre, estadísticas). Antes cada una esperaba la
+  // sincronización completa de Reporte de Gestiones. Con el arrastre entre meses
+  // eso hacía que toda la pantalla quedara bloqueada aunque ya existieran datos
+  // materializados en contactados_ventanas.
+  //
+  // Para el mes vigente leemos SIEMPRE la colección materializada y dejamos la
+  // sincronización incremental en segundo plano. El servidor ya la ejecuta al
+  // iniciar, cada 5 minutos y después de importar gestiones. Así una ventana de
+  // agosto que vence en septiembre sigue entrando, pero abrir la pantalla no
+  // vuelve a procesar el universo completo.
+  if (mes === actual) {
+    sincronizarContactadosEnSegundoPlano();
+    return { mes, background: true };
+  }
+
+  // Los meses históricos sí se preparan bajo demanda una única vez porque no
+  // tienen un job periódico propio. Para respetar arrastres garantizamos el mes
+  // anterior y luego el solicitado.
   const anterior = mesAnteriorClave(mes);
   await asegurarMesContactados(anterior);
   await asegurarMesContactados(mes);
@@ -116,6 +136,7 @@ async function asegurarUniversoPorVencimiento(mes) {
     asegurarLimpiezaEstadosTerminalesMes(anterior),
     asegurarLimpiezaEstadosTerminalesMes(mes),
   ]);
+  return { mes, background: false };
 }
 
 function filtroScope(req, query = {}) {

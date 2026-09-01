@@ -24,6 +24,7 @@ const BACKGROUND_SYNC_MIN_INTERVAL_MS = 45_000;
 let syncEnCurso = null;
 let ultimoDisparoBackgroundAt = 0;
 const syncHistoricoEnCurso = new Map();
+const mesesHistoricosConfirmados = new Set();
 const limpiezaTerminalMesConfirmada = new Set();
 
 function txt(value) {
@@ -562,9 +563,18 @@ function enBloques(items = [], size = 700) {
 }
 
 async function obtenerParesArrastre(mesClave, primerDia) {
+  // Sólo son arrastre las ventanas que NACIERON antes del primer día del mes y
+  // seguían vivas (o fueron resueltas) dentro del mes nuevo. La versión anterior
+  // miraba cualquier ventana histórica cuyo venceAt fuera posterior al corte,
+  // incluso si ya se había cerrado antes de comenzar el mes. Eso podía inflar
+  // muchísimo el universo de pares y obligar a releer gestiones innecesarias.
   const rows = await ContactadoVentana.find({
-    mesOrigen: { $ne: mesClave },
+    iniciaAt: { $lt: primerDia },
     venceAt: { $gte: primerDia },
+    $or: [
+      { cerradaAt: null },
+      { cerradaAt: { $gte: primerDia } },
+    ],
   })
     .select("operador dni")
     .lean();
@@ -580,19 +590,34 @@ async function obtenerParesArrastre(mesClave, primerDia) {
 
 async function obtenerGestionesDeParesEnRango(pares, primerDia, ultimoDia) {
   if (!pares?.size) return [];
-  const dnis = [...new Set([...pares].map((par) => par.split("|")[1]).filter(Boolean))];
+
+  // Agrupar por operador evita leer todas las gestiones de un DNI que pudieron
+  // haber sido hechas por otras personas. ReporteGestion normaliza usuario a
+  // minúsculas al importar, así que podemos filtrar de forma exacta y aprovechar
+  // los índices existentes de usuario/fecha.
+  const dnisPorOperador = new Map();
+  for (const par of pares) {
+    const corte = par.indexOf("|");
+    if (corte <= 0) continue;
+    const operador = par.slice(0, corte);
+    const dni = par.slice(corte + 1);
+    if (!operador || !dni) continue;
+    if (!dnisPorOperador.has(operador)) dnisPorOperador.set(operador, new Set());
+    dnisPorOperador.get(operador).add(dni);
+  }
+
   const eventos = [];
-  for (const bloqueDnis of enBloques(dnis, 700)) {
-    const rows = await ReporteGestion.find({
-      borrado: { $ne: true },
-      fecha: { $gte: primerDia, $lte: ultimoDia },
-      dni: { $in: bloqueDnis },
-    })
-      .select(GESTION_SELECT)
-      .lean();
-    for (const row of rows) {
-      const par = `${normalizarUsername(row.usuario)}|${txt(row.dni).replace(/\D/g, "")}`;
-      if (pares.has(par)) eventos.push(row);
+  for (const [operador, dnisSet] of dnisPorOperador.entries()) {
+    for (const bloqueDnis of enBloques([...dnisSet], 700)) {
+      const rows = await ReporteGestion.find({
+        borrado: { $ne: true },
+        usuario: operador,
+        fecha: { $gte: primerDia, $lte: ultimoDia },
+        dni: { $in: bloqueDnis },
+      })
+        .select(GESTION_SELECT)
+        .lean();
+      eventos.push(...rows);
     }
   }
   return eventos;
@@ -722,7 +747,6 @@ async function reconstruirMesRapido({ mesClave, primerDia, ultimoDia, now, pares
   // PASO 2: sólo necesitamos las gestiones de DNI+operador que tuvieron por lo
   // menos un Contactado. Todo el resto de reportegestions queda fuera del cálculo.
   const pares = new Set();
-  const dnis = new Set();
   for (const g of contactados) {
     const operador = normalizarUsername(g.usuario);
     const dni = txt(g.dni).replace(/\D/g, "");
@@ -734,7 +758,6 @@ async function reconstruirMesRapido({ mesClave, primerDia, ultimoDia, now, pares
     // y dejar el seguimiento de agosto en el limbo.
     if (paresExcluir?.has?.(par)) continue;
     pares.add(par);
-    dnis.add(dni);
   }
 
   if (!pares.size) {
@@ -742,20 +765,7 @@ async function reconstruirMesRapido({ mesClave, primerDia, ultimoDia, now, pares
     return { leidos: 0, contactadosDetectados: 0, procesados: 0, origenes: 0 };
   }
 
-  const eventos = [];
-  for (const bloqueDnis of enBloques([...dnis], 700)) {
-    const rows = await ReporteGestion.find({
-      borrado: { $ne: true },
-      fecha: { $gte: primerDia, $lte: ultimoDia },
-      dni: { $in: bloqueDnis },
-    })
-      .select(GESTION_SELECT)
-      .lean();
-    for (const row of rows) {
-      const par = `${normalizarUsername(row.usuario)}|${txt(row.dni).replace(/\D/g, "")}`;
-      if (pares.has(par)) eventos.push(row);
-    }
-  }
+  const eventos = await obtenerGestionesDeParesEnRango(pares, primerDia, ultimoDia);
 
   const { ventanas, origenes } = construirVentanasEnMemoria(eventos, { now, mesClave });
   const insertadas = await insertarVentanasPorBloques(ventanas);
@@ -807,8 +817,13 @@ async function ejecutarSincronizacion() {
     : null;
   const { primerDia, ultimoDia } = rangoDiasReporteMesActual(mesClave, now);
   const arrastreStateKey = `contactados:${ARRASTRE_SYNC_VERSION}:${mesClave}`;
-  const arrastreYaReprocesado = await ContactadoSyncState.findOne({ key: arrastreStateKey }).lean();
-  const paresArrastre = await obtenerParesArrastre(mesClave, primerDia);
+  const arrastreYaReprocesado = await ContactadoSyncState.findOne({ key: arrastreStateKey }).select("_id").lean();
+  // El cálculo de arrastres es una migración del corte mensual. Una vez marcada
+  // no volvemos a recorrer ventanas históricas cada cinco minutos. Si por cambio
+  // de versión hay reconstrucción mensual, sí lo recalculamos para no romper la serie.
+  const paresArrastre = (esPrimeraCarga || !arrastreYaReprocesado)
+    ? await obtenerParesArrastre(mesClave, primerDia)
+    : new Set();
 
   let procesadosNuevos = 0;
   let leidos = 0;
@@ -988,38 +1003,42 @@ async function limpiarContinuacionesEstadosTerminales(mesClave) {
   });
   if (!series.length) return 0;
 
-  let eliminadas = 0;
-  for (const serieId of series) {
-    const rows = await ContactadoVentana.find({ mesOrigen: mesClave, serieId })
-      .select("_id iniciaAt calificacionInicio estadoCuentaInicio esOrigenContactado")
-      .sort({ iniciaAt: 1 })
-      .lean();
+  // Antes se hacía un find por cada serie y, cuando correspondía, un update por
+  // cada fila. En meses grandes eso generaba cientos/miles de viajes a Mongo.
+  // Leemos todas las series afectadas de una sola vez y resolvemos la limpieza
+  // en memoria; después aplicamos los cambios por bloques.
+  const rows = await ContactadoVentana.find({ mesOrigen: mesClave, serieId: { $in: series } })
+    .select("_id serieId iniciaAt calificacionInicio estadoCuentaInicio esOrigenContactado")
+    .sort({ serieId: 1, iniciaAt: 1 })
+    .lean();
 
-    const borrar = [];
-    for (let i = 0; i < rows.length; i += 1) {
-      const row = rows[i];
+  const porSerie = new Map();
+  for (const row of rows) {
+    if (!porSerie.has(row.serieId)) porSerie.set(row.serieId, []);
+    porSerie.get(row.serieId).push(row);
+  }
+
+  const borrar = [];
+  const promoverOrigen = [];
+  for (const serieRows of porSerie.values()) {
+    for (let i = 0; i < serieRows.length; i += 1) {
+      const row = serieRows[i];
       const pseudoGestion = {
         resultadoGestion: row.calificacionInicio,
         estadoCuenta: row.estadoCuentaInicio,
       };
       if (!esGestionTerminalContactados(pseudoGestion)) continue;
 
-      // Pago a imputar, Acuerdo de pago y Acuerdo de pago cumplido sacan el caso
-      // del circuito vivo de Contactados. Se borra la ventana artificial que esas
-      // gestiones pudieron haber iniciado en versiones anteriores y toda su
-      // continuación hasta que aparezca un Contactado real nuevo.
       let j = i;
-      while (j < rows.length) {
-        const candidata = rows[j];
+      while (j < serieRows.length) {
+        const candidata = serieRows[j];
         const candidataGestion = {
           resultadoGestion: candidata.calificacionInicio,
           estadoCuenta: candidata.estadoCuentaInicio,
         };
         const esNuevoContactado = j > i && esGestionContactado(candidataGestion);
         if (esNuevoContactado) {
-          if (!candidata.esOrigenContactado) {
-            await ContactadoVentana.updateOne({ _id: candidata._id }, { $set: { esOrigenContactado: true } });
-          }
+          if (!candidata.esOrigenContactado) promoverOrigen.push(candidata._id);
           break;
         }
         borrar.push(candidata._id);
@@ -1027,11 +1046,22 @@ async function limpiarContinuacionesEstadosTerminales(mesClave) {
       }
       i = Math.max(i, j - 1);
     }
+  }
 
-    if (borrar.length) {
-      const r = await ContactadoVentana.deleteMany({ _id: { $in: borrar } });
-      eliminadas += Number(r?.deletedCount || 0);
+  for (const bloque of enBloques(promoverOrigen, 1000)) {
+    if (bloque.length) {
+      await ContactadoVentana.updateMany(
+        { _id: { $in: bloque } },
+        { $set: { esOrigenContactado: true } }
+      );
     }
+  }
+
+  let eliminadas = 0;
+  for (const bloque of enBloques(borrar, 2000)) {
+    if (!bloque.length) continue;
+    const r = await ContactadoVentana.deleteMany({ _id: { $in: bloque } });
+    eliminadas += Number(r?.deletedCount || 0);
   }
   return eliminadas;
 }
@@ -1059,15 +1089,24 @@ export async function asegurarMesContactados(mesSolicitado) {
     ? String(mesSolicitado)
     : mesClaveArgentina();
 
-  // El mes vigente mantiene su sincronización incremental normal.
+  // El mes vigente mantiene su sincronización incremental normal. Esta función
+  // conserva el comportamiento bloqueante para jobs/migraciones explícitas; las
+  // lecturas HTTP del mes actual usan el disparo en segundo plano del controller.
   if (mesClave === mesClaveArgentina()) {
     await sincronizarContactados();
     return { mes: mesClave, actual: true };
   }
 
+  if (mesesHistoricosConfirmados.has(mesClave)) {
+    return { mes: mesClave, preparado: true, desdeCacheMemoria: true };
+  }
+
   const stateKey = `contactados:historico-v3-terminales:${mesClave}`;
-  const yaPreparado = await ContactadoSyncState.findOne({ key: stateKey }).lean();
-  if (yaPreparado) return { mes: mesClave, preparado: true, desdeCache: true };
+  const yaPreparado = await ContactadoSyncState.findOne({ key: stateKey }).select("_id").lean();
+  if (yaPreparado) {
+    mesesHistoricosConfirmados.add(mesClave);
+    return { mes: mesClave, preparado: true, desdeCache: true };
+  }
 
   if (syncHistoricoEnCurso.has(mesClave)) return syncHistoricoEnCurso.get(mesClave);
 
@@ -1079,7 +1118,7 @@ export async function asegurarMesContactados(mesSolicitado) {
     // podían crear una nueva ventana desde un estado terminal (Pago a imputar o
     // Acuerdo de pago). Eliminamos esa continuación artificial, preservando el
     // ciclo Contactado anterior, sus checks y las observaciones de la serie.
-    const eliminadasTerminales = existentes ? await limpiarContinuacionesEstadosTerminales(mesClave) : 0;
+    const eliminadasTerminales = existentes ? await asegurarLimpiezaEstadosTerminalesMes(mesClave) : 0;
 
     // Los históricos se generan bajo demanda. Si el mes todavía no existe, se
     // reconstruye desde Reporte de Gestiones con la regla nueva.
@@ -1109,6 +1148,7 @@ export async function asegurarMesContactados(mesSolicitado) {
       { upsert: true }
     );
 
+    mesesHistoricosConfirmados.add(mesClave);
     return { mes: mesClave, preparado: true, existentes, eliminadasTerminales, ...resultado };
   })().finally(() => {
     syncHistoricoEnCurso.delete(mesClave);
