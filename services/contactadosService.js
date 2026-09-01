@@ -18,6 +18,7 @@ const ACUERDO_PAGO_RX = /^\s*acuerdo\s+de\s+pago(?:\s*[-–—:]?\s*cumplido)?\s
 const DIA_MS = 86_400_000;
 const SOLAPE_SYNC_MS = 5 * 60 * 1000;
 const SYNC_VERSION = "mensual-v3-fast";
+const ARRASTRE_SYNC_VERSION = "arrastre-v1";
 const GESTION_SELECT = "_id dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero createdAt";
 const BACKGROUND_SYNC_MIN_INTERVAL_MS = 45_000;
 let syncEnCurso = null;
@@ -35,6 +36,13 @@ function normalizarUsername(value) {
 
 function mesClaveArgentina(date = new Date()) {
   return claveFechaArgentina(date).slice(0, 7);
+}
+
+function mesAnteriorClave(mesClave = mesClaveArgentina()) {
+  const [year, month] = String(mesClave || "").split("-").map(Number);
+  const d = new Date(Date.UTC(year, (month || 1) - 1, 1));
+  d.setUTCMonth(d.getUTCMonth() - 1);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
 function mesClaveGestion(gestion = {}) {
@@ -178,7 +186,6 @@ async function reconciliarEventoHistorico(gestion, eventAt, operador, dni, activ
   // cargas tardías del Reporte de Gestiones.
   const key = gestion.__key || eventoKey(gestion);
   const previa = await ContactadoVentana.findOne({
-    mesOrigen: mesClave,
     operador,
     dni,
     iniciaAt: { $lt: eventAt },
@@ -229,7 +236,6 @@ async function reconciliarEventoHistorico(gestion, eventAt, operador, dni, activ
   // tardía, esa siguiente gestión funciona como resolución de la ventana que
   // acabamos de reconstruir.
   const siguiente = await ContactadoVentana.findOne({
-    mesOrigen: mesClave,
     operador,
     dni,
     iniciaAt: { $gt: eventAt },
@@ -271,7 +277,6 @@ async function crearContactadoHistoricoAntesDeVentana(gestion, eventAt, operador
   if (!esGestionContactado(gestion)) return false;
 
   const siguiente = await ContactadoVentana.findOne({
-    mesOrigen: mesClave,
     operador,
     dni,
     iniciaAt: { $gt: eventAt },
@@ -337,13 +342,16 @@ function compararEventos(a, b) {
   return String(a._id).localeCompare(String(b._id));
 }
 
-async function clavesYaProcesadas(keys = [], mesClave = "") {
+async function clavesYaProcesadas(keys = []) {
   const out = new Set();
   // Evita construir un $in gigantesco si una jornada tiene muchísimas gestiones.
   const TAMANIO = 5000;
   for (let i = 0; i < keys.length; i += TAMANIO) {
     const bloque = keys.slice(i, i + TAMANIO);
-    const rows = await ContactadoVentana.find({ gestionInicioKey: { $in: bloque }, ...(mesClave ? { mesOrigen: mesClave } : {}) })
+    // gestionInicioKey es único globalmente. No se debe limitar por mesOrigen:
+    // una gestión de septiembre puede ser la continuación real de un Contactado
+    // iniciado en agosto y conservar el mesOrigen de esa serie.
+    const rows = await ContactadoVentana.find({ gestionInicioKey: { $in: bloque } })
       .select("gestionInicioKey")
       .lean();
     rows.forEach((row) => {
@@ -362,7 +370,7 @@ async function procesarLoteGestiones(gestiones, { activeByPair, now, mesClave, r
     if (!unicos.has(key)) unicos.set(key, { ...gestion, __key: key });
   }
   const eventos = [...unicos.values()].sort(compararEventos);
-  const procesadas = await clavesYaProcesadas(eventos.map((e) => e.__key), mesClave);
+  const procesadas = await clavesYaProcesadas(eventos.map((e) => e.__key));
 
   let procesadosNuevos = 0;
   let contactadosDetectados = 0;
@@ -553,6 +561,43 @@ function enBloques(items = [], size = 700) {
   return out;
 }
 
+async function obtenerParesArrastre(mesClave, primerDia) {
+  const rows = await ContactadoVentana.find({
+    mesOrigen: { $ne: mesClave },
+    venceAt: { $gte: primerDia },
+  })
+    .select("operador dni")
+    .lean();
+
+  const pares = new Set();
+  for (const row of rows) {
+    const operador = normalizarUsername(row.operador);
+    const dni = txt(row.dni).replace(/\D/g, "");
+    if (operador && dni) pares.add(`${operador}|${dni}`);
+  }
+  return pares;
+}
+
+async function obtenerGestionesDeParesEnRango(pares, primerDia, ultimoDia) {
+  if (!pares?.size) return [];
+  const dnis = [...new Set([...pares].map((par) => par.split("|")[1]).filter(Boolean))];
+  const eventos = [];
+  for (const bloqueDnis of enBloques(dnis, 700)) {
+    const rows = await ReporteGestion.find({
+      borrado: { $ne: true },
+      fecha: { $gte: primerDia, $lte: ultimoDia },
+      dni: { $in: bloqueDnis },
+    })
+      .select(GESTION_SELECT)
+      .lean();
+    for (const row of rows) {
+      const par = `${normalizarUsername(row.usuario)}|${txt(row.dni).replace(/\D/g, "")}`;
+      if (pares.has(par)) eventos.push(row);
+    }
+  }
+  return eventos;
+}
+
 function construirVentanasEnMemoria(eventos = [], { now, mesClave }) {
   const unicos = new Map();
   for (const gestion of eventos) {
@@ -653,7 +698,7 @@ async function insertarVentanasPorBloques(ventanas = []) {
   return insertadas;
 }
 
-async function reconstruirMesRapido({ mesClave, primerDia, ultimoDia, now }) {
+async function reconstruirMesRapido({ mesClave, primerDia, ultimoDia, now, paresExcluir = new Set() }) {
   const inicio = Date.now();
 
   // PASO 1: localizar únicamente las gestiones que realmente califican como
@@ -682,8 +727,19 @@ async function reconstruirMesRapido({ mesClave, primerDia, ultimoDia, now }) {
     const operador = normalizarUsername(g.usuario);
     const dni = txt(g.dni).replace(/\D/g, "");
     if (!operador || !dni) continue;
-    pares.add(`${operador}|${dni}`);
+    const par = `${operador}|${dni}`;
+    // Los pares que llegan arrastrados desde el mes anterior se procesan contra
+    // la ventana REAL ya existente. Si los reconstruyéramos como un mes aislado,
+    // una gestión de septiembre podría convertirse erróneamente en un nuevo origen
+    // y dejar el seguimiento de agosto en el limbo.
+    if (paresExcluir?.has?.(par)) continue;
+    pares.add(par);
     dnis.add(dni);
+  }
+
+  if (!pares.size) {
+    console.log(`✅ Contactados ${mesClave}: todos los Contactados del corte pertenecen a pares con arrastre; se procesarán sobre la serie previa.`);
+    return { leidos: 0, contactadosDetectados: 0, procesados: 0, origenes: 0 };
   }
 
   const eventos = [];
@@ -735,7 +791,14 @@ async function ejecutarSincronizacion() {
   const syncStartedAt = new Date();
   const now = syncStartedAt;
   const mesClave = mesClaveArgentina(now);
+  const mesAnterior = mesAnteriorClave(mesClave);
   const stateKey = `contactados:${SYNC_VERSION}:${mesClave}`;
+
+  // Antes de construir el mes vigente garantizamos que exista el mes anterior.
+  // Es indispensable en los primeros días del mes: una ventana iniciada el 31/08
+  // puede vencer o recibir seguimiento el 01/09, 02/09, etc.
+  await asegurarMesContactados(mesAnterior);
+
   const prep = await prepararReconstruccionRapidaDelMes(mesClave);
   const state = prep.state || await ContactadoSyncState.findOne({ key: stateKey }).lean();
   const esPrimeraCarga = prep.reconstruir || !state?.ultimoCreatedAt;
@@ -743,6 +806,9 @@ async function ejecutarSincronizacion() {
     ? new Date(Math.max(0, new Date(state.ultimoCreatedAt).getTime() - SOLAPE_SYNC_MS))
     : null;
   const { primerDia, ultimoDia } = rangoDiasReporteMesActual(mesClave, now);
+  const arrastreStateKey = `contactados:${ARRASTRE_SYNC_VERSION}:${mesClave}`;
+  const arrastreYaReprocesado = await ContactadoSyncState.findOne({ key: arrastreStateKey }).lean();
+  const paresArrastre = await obtenerParesArrastre(mesClave, primerDia);
 
   let procesadosNuevos = 0;
   let leidos = 0;
@@ -750,25 +816,56 @@ async function ejecutarSincronizacion() {
   let contactadosDetectados = 0;
 
   if (esPrimeraCarga) {
-    const r = await reconstruirMesRapido({ mesClave, primerDia, ultimoDia, now });
+    // Detectamos pares cuyo ciclo nació antes del mes vigente pero todavía puede
+    // tocar este mes. Esos pares NO se reconstruyen como universos nuevos: primero
+    // se conserva su serie anterior y luego se aplican las gestiones del mes actual.
+    const r = await reconstruirMesRapido({ mesClave, primerDia, ultimoDia, now, paresExcluir: paresArrastre });
     procesadosNuevos = r.procesados;
     leidos = r.leidos;
     contactadosDetectados = r.contactadosDetectados;
     diasProcesados = 1;
+
+    if (paresArrastre.size) {
+      const eventosArrastre = await obtenerGestionesDeParesEnRango(paresArrastre, primerDia, ultimoDia);
+      if (eventosArrastre.length) {
+        const abiertas = await ContactadoVentana.find({ estado: "abierta" }).lean();
+        const activeByPair = new Map(abiertas.map((v) => [`${v.operador}|${v.dni}`, v]));
+        const extra = await procesarLoteGestiones(eventosArrastre, {
+          activeByPair,
+          now,
+          mesClave,
+          reconstruirTardias: true,
+        });
+        procesadosNuevos += extra.procesados;
+        leidos += extra.leidos;
+        contactadosDetectados += extra.contactadosDetectados || 0;
+      }
+    }
   } else {
-    const abiertas = await ContactadoVentana.find({ estado: "abierta", mesOrigen: mesClave }).lean();
+    // La cola activa es global, no mensual. Así una ventana iniciada en agosto
+    // puede ser cerrada/renovada correctamente por una gestión de septiembre.
+    const abiertas = await ContactadoVentana.find({ estado: "abierta" }).lean();
     const activeByPair = new Map(abiertas.map((v) => [`${v.operador}|${v.dni}`, v]));
 
     // Las actualizaciones son pequeñas: sólo registros importados desde el último
     // corte y cuya FECHA pertenece al mes vigente. Esto sí puede procesarse en
     // forma incremental sin reconstruir nada.
-    const gestionesNuevas = await ReporteGestion.find({
+    let gestionesNuevas = await ReporteGestion.find({
       borrado: { $ne: true },
       createdAt: { $gte: desdeCreated },
       fecha: { $gte: primerDia, $lte: ultimoDia },
     })
       .select(GESTION_SELECT)
       .lean();
+
+    // Migración no destructiva del corte de mes. Si esta versión se instala con
+    // septiembre ya iniciado, releemos UNA sola vez las gestiones del mes para
+    // pares arrastrados desde agosto. Las claves globales evitan duplicados y se
+    // preservan checks/observaciones existentes.
+    if (!arrastreYaReprocesado && paresArrastre.size) {
+      const replay = await obtenerGestionesDeParesEnRango(paresArrastre, primerDia, ultimoDia);
+      if (replay.length) gestionesNuevas = [...gestionesNuevas, ...replay];
+    }
 
     if (gestionesNuevas.length) {
       const resultado = await procesarLoteGestiones(gestionesNuevas, {
@@ -782,6 +879,21 @@ async function ejecutarSincronizacion() {
       contactadosDetectados = resultado.contactadosDetectados || 0;
       diasProcesados = 1;
     }
+  }
+
+  if (!arrastreYaReprocesado && paresArrastre.size) {
+    await ContactadoSyncState.findOneAndUpdate(
+      { key: arrastreStateKey },
+      {
+        $set: {
+          key: arrastreStateKey,
+          mesClave,
+          ultimaEjecucionAt: new Date(),
+          gestionesLeidas: paresArrastre.size,
+        },
+      },
+      { upsert: true }
+    );
   }
 
   await expirarVencidas(now);

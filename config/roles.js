@@ -211,8 +211,8 @@ export function canAccessModule(role, moduleName) {
 
 export function getProyeccionesScope(role) {
   const normalized = normalizeStoredRole(role);
-  if ([ROLES.SUPERVISOR, ROLES.SUPER_ADMIN].includes(normalized)) return "all";
-  if ([ROLES.OPERADOR, ROLES.OPERADOR_VIP, ROLES.CAPACITADORA, ROLES.ADMINISTRACION].includes(normalized)) return "own";
+  if ([ROLES.ADMINISTRACION, ROLES.SUPERVISOR, ROLES.SUPER_ADMIN].includes(normalized)) return "all";
+  if ([ROLES.OPERADOR, ROLES.OPERADOR_VIP, ROLES.CAPACITADORA].includes(normalized)) return "own";
   return "none";
 }
 

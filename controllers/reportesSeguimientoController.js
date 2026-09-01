@@ -296,12 +296,17 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
     const allGaps = ajusteBreak.intervalos;
     const breakDetalle = ajusteBreak.breakDetalle;
     const breakPermitidoMin = ajusteBreak.permitidoMin || minutosBreakFlexiblePermitido(horarioEfectivo);
-    const brief = allGaps.filter((gap) => gap.duracionMin > PAUSA_NORMAL_MAX && gap.duracionMin <= PAUSA_BREVE_MAX);
-    const long = allGaps.filter((gap) => gap.duracionMin > PAUSA_BREVE_MAX);
-    const critical = long.filter((gap) => gap.duracionMin > PAUSA_CRITICA_MIN && !gap.abiertoAlCorte);
-    const longTotal = long.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
+    const duracionOriginalGap = (gap) => Number(gap?.duracionOriginalMin ?? gap?.duracionMin ?? 0);
+    const brief = allGaps.filter((gap) => duracionOriginalGap(gap) > PAUSA_NORMAL_MAX && duracionOriginalGap(gap) <= PAUSA_BREVE_MAX);
+    // La lista visible conserva el bache BRUTO. El break se descuenta una sola
+    // vez después del total, evitando que el corte elegido como break desaparezca
+    // o aparezca partido de forma confusa.
+    const long = allGaps.filter((gap) => duracionOriginalGap(gap) > PAUSA_BREVE_MAX);
+    const critical = long.filter((gap) => Number(gap.duracionMin || 0) > PAUSA_CRITICA_MIN && !gap.abiertoAlCorte);
+    const longTotalBruto = long.reduce((sum, gap) => sum + duracionOriginalGap(gap), 0);
+    const longTotalNeto = long.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
     const breakDescontadoMin = Math.round(Number(breakDetalle?.breakConsideradoMin || 0));
-    const cortesDescontadosMin = Math.round(longTotal);
+    const cortesDescontadosMin = Math.round(longTotalNeto);
     // Trabajo efectivo = suma de bloques realmente continuos de actividad Mango.
     // Cada bloque se corta ante 20 min o más sin gestiones, incluso si el corte
     // ocurre fuera del horario RRHH. Así una gestión aislada a las 17:52 no hace
@@ -436,9 +441,13 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
       pausasBreves: brief.length,
       pausasLargas: long.length,
       pausasCriticas: critical.length,
-      pausaLargaTotalMin: Math.round(longTotal),
-      pausaLargaPromedioMin: long.length ? Math.round(longTotal / long.length) : 0,
-      pausaMaximaMin: long.length ? Math.round(Math.max(...long.map((gap) => Number(gap.duracionMin || 0)))) : 0,
+      // Compat: pausaLargaTotalMin sigue siendo el NETO computable. Además se
+      // exponen bruto/neto explícitos para una UI más clara.
+      pausaLargaTotalMin: Math.round(longTotalNeto),
+      pausaLargaTotalBrutoMin: Math.round(longTotalBruto),
+      pausaLargaTotalNetoMin: Math.round(longTotalNeto),
+      pausaLargaPromedioMin: long.length ? Math.round(longTotalBruto / long.length) : 0,
+      pausaMaximaMin: long.length ? Math.round(Math.max(...long.map((gap) => duracionOriginalGap(gap)))) : 0,
       pausasDetalle: long.map((gap) => ({
         desde: hhmm(gap.desdeMin),
         hasta: hhmm(gap.hastaMin),

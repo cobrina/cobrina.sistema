@@ -6,7 +6,8 @@ const ContactadoVentanaSchema = new Schema(
   {
     serieId: { type: String, required: true, index: true, trim: true, maxlength: 80 },
     // Mes calendario argentino en el que nació el Contactado que originó la serie.
-    // Permite que cada mes sea un universo independiente sin arrastrar casos previos.
+    // Es un dato de trazabilidad interna: las vistas operativas/históricas se
+    // atribuyen por venceAt y una misma serie puede continuar al mes siguiente.
     mesOrigen: { type: String, default: "", index: true, trim: true, maxlength: 7 },
     gestionInicioKey: { type: String, required: true, unique: true, index: true, maxlength: 80 },
     gestionResolucionKey: { type: String, default: "", index: true, maxlength: 80 },

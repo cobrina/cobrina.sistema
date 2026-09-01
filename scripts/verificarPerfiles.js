@@ -79,7 +79,7 @@ assert.equal(
 
 assert.equal(getProyeccionesScope(ROLES.OPERADOR), "own");
 assert.equal(getProyeccionesScope(ROLES.CAPACITADORA), "own");
-assert.equal(getProyeccionesScope(ROLES.ADMINISTRACION), "own");
+assert.equal(getProyeccionesScope(ROLES.ADMINISTRACION), "all");
 assert.equal(getProyeccionesScope(ROLES.SUPERVISOR), "all");
 assert.equal(getProyeccionesScope(ROLES.CUOTERO), "none");
 

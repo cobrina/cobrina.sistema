@@ -22,4 +22,13 @@ assert(critico.toISOString() === "2026-08-20T09:00:00.000Z", `Crítico incorrect
 assert(vence.toISOString() === "2026-08-20T21:00:00.000Z", `Vencimiento incorrecto: ${vence.toISOString()}`);
 assert(horasHabilesEntreArgentina(inicio, vence) === 72, "El intervalo hábil no suma 72 horas");
 
+// Regresión de corte de mes: una gestión del 27/08 puede vencer el 01/09.
+// Ese caso debe conservar su serie, pero operativamente pertenece a septiembre.
+const inicioCorteMes = new Date("2026-08-27T19:38:00.000Z"); // 16:38 AR
+const venceCorteMes = agregarHorasHabilesArgentina(inicioCorteMes, 72);
+assert(
+  venceCorteMes.toISOString() === "2026-09-01T19:38:00.000Z",
+  `Corte de mes incorrecto: ${venceCorteMes.toISOString()}`
+);
+
 console.log("✅ Regla Contactados 48/60/72 h hábiles verificada correctamente");

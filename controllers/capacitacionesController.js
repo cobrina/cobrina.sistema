@@ -150,6 +150,24 @@ function displayUsername(op) {
   return op?.username || op?.nombre || "—";
 }
 
+function safeFilenamePart(value, fallback = "operador") {
+  const clean = String(value || fallback)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return clean || fallback;
+}
+
+function operadoresFilename(operadores = []) {
+  const partes = (operadores || [])
+    .map((op) => safeFilenamePart(op?.username || op?.nombre || ""))
+    .filter(Boolean);
+  const joined = partes.length ? partes.join("_y_") : "operador";
+  return joined.slice(0, 120).replace(/_+$/g, "") || "operador";
+}
+
 function calcDuration(horaInicio, horaFin, explicitValue) {
   const hasExplicit = explicitValue !== undefined && explicitValue !== null && String(explicitValue).trim() !== "";
   if (hasExplicit) {
@@ -1498,7 +1516,7 @@ export async function exportarIndividualPDF(req, res) {
     const item = await Capacitacion.findOne({ _id: req.params.id, borrado: { $ne: true } }).lean();
     if (!item) return res.status(404).json({ error: "Capacitación no encontrada." });
     const pdf = new PDFDocument({ size: "A4", margin: 42, bufferPages: true });
-    const filename = `capacitacion_${item.operadores?.[0]?.username || "operador"}_${String(item._id).slice(-6)}.pdf`;
+    const filename = `capacitacion_${operadoresFilename(item.operadores)}_${String(item._id).slice(-6)}.pdf`;
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename=\"${filename}\"`);
     pdf.pipe(res);

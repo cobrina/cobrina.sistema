@@ -64,8 +64,8 @@ const permitirDuenoOAmbitoGlobal = async (req, res, next) => {
   }
 };
 
-// Acceso propio: operador, operador VIP, capacitadora y administración.
-// Acceso global: supervisor y super-admin.
+// Acceso propio: operador, operador VIP y capacitadora.
+// Acceso global: administración, supervisor y super-admin.
 router.post("/", ...accesoProyecciones, crearProyeccion);
 router.get("/mias", ...accesoProyecciones, obtenerProyeccionesPropias);
 router.get("/filtrar", ...accesoProyecciones, obtenerProyeccionesFiltradas);

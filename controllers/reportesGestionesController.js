@@ -13,11 +13,11 @@ import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
 import Pago from "../models/Pago.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
-import { ROLES, getEffectiveRole } from "../config/roles.js";
 import { sincronizarContactados } from "../services/contactadosService.js";
 import {
   filtrarEmpleadosControlados,
   filtrarFilasReportesControl,
+  esUsuarioVisibleEnReportesControl,
   USUARIOS_OCULTOS_REPORTES_CONTROL,
 } from "../utils/controlEquipo.js";
 import {
@@ -121,11 +121,10 @@ function throwIfAborted(req) {
 const escapeRegex = (s = "") =>
   String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 function filtroMongoUsuariosVisiblesControl(campo = "usuario") {
-  return {
-    $nor: [...USUARIOS_OCULTOS_REPORTES_CONTROL].map((username) => ({
-      [campo]: new RegExp(`^${escapeRegex(username)}$`, "i"),
-    })),
-  };
+  const ocultos = [...USUARIOS_OCULTOS_REPORTES_CONTROL].map((username) => ({
+    [campo]: new RegExp(`^${escapeRegex(username)}$`, "i"),
+  }));
+  return ocultos.length ? { $nor: ocultos } : {};
 }
 
 
@@ -161,64 +160,29 @@ const inExactMultiStrings = (raw, mapFn = (x) => x) => {
   return arr.length === 1 ? arr[0] : { $in: arr };
 };
 
-// Usuarios activos para métricas. No modifica ni elimina gestiones históricas:
-// solamente evita que usuarios dados de baja sigan apareciendo en tableros actuales.
-let __activeUsersCache = { exp: 0, names: [] };
-async function getActiveUsernames() {
-  if (Date.now() < __activeUsersCache.exp && __activeUsersCache.names.length) {
-    return __activeUsersCache.names;
-  }
-  const rows = await Empleado.find({ isActive: { $ne: false } })
-    .select("username")
-    .lean();
-  const names = rows
-    .map((row) => String(row.username || "").trim().toLowerCase())
-    .filter(Boolean);
-  __activeUsersCache = { exp: Date.now() + 60_000, names };
-  return names;
-}
-
+// Universo de usuarios para Reportes. La actividad importada desde Mango es la
+// fuente de verdad: NO se descarta una gestión porque el usuario sea mando
+// medio, super-admin, esté fuera de la muestra histórica o no figure como
+// "activo" en Empleados. Sólo se omiten cuentas técnicas/de prueba.
 async function activeUserFilter(rawOperator) {
-  const active = await getActiveUsernames();
-  const activeSet = new Set(active);
   const requested = splitCSV(rawOperator)
     .map((value) => String(value || "").trim().toLowerCase())
     .filter(Boolean);
-  const selected = requested.length
-    ? requested.filter((value) => activeSet.has(value))
-    : active;
-  if (!selected.length) return { $in: ["__cobrina_sin_usuario_activo__"] };
-  return selected.length === 1 ? selected[0] : { $in: selected };
-}
 
-// Control de gestiones: además de usuarios activos, excluye mandos medios y
-// superiores / usuarios expresamente no controlados. A diferencia del filtro
-// general, acá su actividad tampoco integra los totales ni la evolución diaria.
-let __controlledActiveUsersCache = { exp: 0, names: [] };
-async function controlledActiveUserFilter(rawOperator) {
-  let controlled = __controlledActiveUsersCache.names;
-  if (Date.now() >= __controlledActiveUsersCache.exp || !controlled.length) {
-    const rows = await Empleado.find({ isActive: { $ne: false } })
-      .select("username role")
-      .lean();
-    const rolesOperativos = new Set([ROLES.OPERADOR, ROLES.OPERADOR_VIP, ROLES.CUOTERO, ROLES.CAPACITADORA]);
-    controlled = filtrarEmpleadosControlados(rows)
-      .filter((row) => rolesOperativos.has(getEffectiveRole(row?.role, row?.username)))
-      .map((row) => String(row?.username || "").trim().toLowerCase())
-      .filter(Boolean);
-    __controlledActiveUsersCache = { exp: Date.now() + 60_000, names: controlled };
+  if (requested.length) {
+    const selected = requested.filter((value) => esUsuarioVisibleEnReportesControl(value));
+    if (!selected.length) return { $in: ["__cobrina_sin_usuario_visible__"] };
+    return selected.length === 1 ? selected[0] : { $in: selected };
   }
 
-  const controlledSet = new Set(controlled);
-  const requested = splitCSV(rawOperator)
-    .map((value) => String(value || "").trim().toLowerCase())
-    .filter(Boolean);
-  const selected = requested.length
-    ? requested.filter((value) => controlledSet.has(value))
-    : controlled;
+  const ocultos = [...USUARIOS_OCULTOS_REPORTES_CONTROL];
+  return ocultos.length ? { $nin: ocultos } : { $exists: true };
+}
 
-  if (!selected.length) return { $in: ["__cobrina_sin_usuario_controlado__"] };
-  return selected.length === 1 ? selected[0] : { $in: selected };
+// Control individual y totales usan el MISMO universo de usuarios reales.
+// Ya no se excluyen administración, supervisión ni super-admin de la muestra.
+async function controlledActiveUserFilter(rawOperator) {
+  return activeUserFilter(rawOperator);
 }
 
 // Normaliza un string de fecha (dd/mm/yyyy, yyyy-mm-dd, serial Excel)
@@ -300,12 +264,8 @@ export async function cargar(req, res) {
     const normUser = (s) => norm(s).toLowerCase();
     const normEntidad = (s) => norm(s).toUpperCase();
 
-    const [empleados, entidades] = await Promise.all([
-      Empleado.find({ isActive: true }).select("username").lean(),
-      Entidad.find().select("numero nombre").lean(),
-    ]);
+    const entidades = await Entidad.find().select("numero nombre").lean();
 
-    const setUsers = new Set(empleados.map((e) => String(e.username || "").toLowerCase()));
     const entidadesPorNombre = new Map();
     const entidadesPorNumero = new Map();
     entidades.forEach((e) => {
@@ -364,14 +324,9 @@ export async function cargar(req, res) {
       const entidadNumero = Number(entidadCatalogo?.numero);
       if (entidad.length > 120) entidad = entidad.slice(0, 120);
 
-      if (!setUsers.has(usuario)) {
-        errores.push({
-          fila: row,
-          motivo: `Usuario "${usuarioRaw}" no existe como username activo en la tabla Empleados.`,
-          row: { ...f },
-        });
-        return;
-      }
+      // La gestión de Mango se importa aunque el username todavía no esté
+      // dado de alta/activo en Empleados. Esto evita perder producción real por
+      // una diferencia administrativa de padrón.
 
       if (!entidadCatalogo || !Number.isFinite(entidadNumero)) {
         errores.push({
@@ -1204,12 +1159,11 @@ export async function catalogos(req, res) {
 
     throwIfAborted(req);
 
-    const empleadosActivosTodos = await Empleado.find({ isActive: true })
+    const empleadosActivosTodos = await Empleado.find({ isActive: { $ne: false } })
       .select("username nombre role horarioLaboral.modalidad horarioLaboral.entrada horarioLaboral.salida")
       .sort({ username: 1 })
       .lean();
     const empleadosActivos = filtrarEmpleadosControlados(empleadosActivosTodos);
-    const operadores = empleadosActivos.map((e) => String(e.username || ""));
     const operadoresDetalle = empleadosActivos
       .map((empleado) => ({
         username: String(empleado.username || "").trim(),
@@ -1225,10 +1179,26 @@ export async function catalogos(req, res) {
       String(x.nombre || "")
     );
 
-    const [tiposRaw, estadosRaw] = await Promise.all([
+    const [tiposRaw, estadosRaw, usuariosGestionesRaw] = await Promise.all([
       ReporteGestion.distinct("tipoContacto", base).collation({ locale: "es", strength: 1 }),
       ReporteGestion.distinct("estadoCuenta", base).collation({ locale: "es", strength: 1 }),
+      ReporteGestion.distinct("usuario", base).collation({ locale: "es", strength: 1 }),
     ]);
+
+    // Si Mango trae actividad de alguien que todavía no está (o ya no está)
+    // en el padrón activo de Empleados, igual debe poder verse/filtrarse.
+    const detallePorUsername = new Map(
+      operadoresDetalle.map((item) => [String(item.username || "").trim().toLowerCase(), item])
+    );
+    for (const raw of usuariosGestionesRaw || []) {
+      const username = String(raw || "").trim().toLowerCase();
+      if (!esUsuarioVisibleEnReportesControl(username) || detallePorUsername.has(username)) continue;
+      const item = { username, nombre: "", role: "", modalidadHorario: "fijo", entrada: "", salida: "" };
+      operadoresDetalle.push(item);
+      detallePorUsername.set(username, item);
+    }
+    operadoresDetalle.sort((a, b) => String(a.username).localeCompare(String(b.username), "es", { sensitivity: "base" }));
+    const operadores = operadoresDetalle.map((e) => String(e.username || ""));
 
     const normTxt = (x) => String(x || "").trim();
     const ordenar = (arr = []) =>
@@ -1353,6 +1323,7 @@ export async function comparativo(req, res) {
           telMailMarcado: 1,
           isContacto: esContactoExpr,
           isMailEnviado: esMailEnviadoExpr,
+          mailCountGestion: cantidadMailsGestionExpr(),
           horaHH: { $substrBytes: [HORA_SAFE, 0, 2] },
         },
       },
@@ -1370,7 +1341,7 @@ export async function comparativo(req, res) {
           ],
           porDniMailLibre: [
             { $match: { isMailEnviado: true } },
-            { $group: { _id: "$dni", cantidad: { $sum: 1 } } },
+            { $group: { _id: "$dni", cantidad: { $sum: "$mailCountGestion" } } },
           ],
           dnisContactados: [
             { $match: { isContacto: true } },
@@ -1542,6 +1513,28 @@ const CONTACTO_RX = /contactad[oa]/i;
 const MAIL_ENVIADO_RX = /mail|correo|e-?mail/i;
 const MAIL_ENTRANTE_RX = /entrante|recibido|recepci[oó]n/i;
 
+// Una gestión de Mango puede agrupar varios destinatarios de e-mail. Para las
+// métricas contamos la mayor señal disponible entre los mails ya parseados y
+// la cantidad de arrobas escrita en TEL-MAIL MARCADO. Si la gestión está
+// tipificada como envío de mail pero no trae detalle, cuenta como 1.
+function cantidadMailsGestionExpr() {
+  const telMailSafe = {
+    $convert: { input: "$telMailMarcado", to: "string", onError: "", onNull: "" },
+  };
+  const cantidadArrobas = {
+    $subtract: [{ $size: { $split: [telMailSafe, "@"] } }, 1],
+  };
+  const cantidadParseada = {
+    $cond: [{ $isArray: "$mailsDetectados" }, { $size: "$mailsDetectados" }, 0],
+  };
+  const mejorCantidad = {
+    $cond: [{ $gt: [cantidadParseada, cantidadArrobas] }, cantidadParseada, cantidadArrobas],
+  };
+  return {
+    $cond: [{ $gt: [mejorCantidad, 0] }, mejorCantidad, 1],
+  };
+}
+
 function normalizarTipoContactoExpr() {
   const RAW = {
     $toLower: {
@@ -1627,7 +1620,7 @@ function buildResumenPipeline(matchQ, { completo = true, topN = 10 } = {}) {
     ],
     mails: [
       { $match: { isMailEnviado: true } },
-      { $group: { _id: "$dni", cantidad: { $sum: 1 } } },
+      { $group: { _id: "$dni", cantidad: { $sum: "$mailCountGestion" } } },
       { $group: { _id: null, promedio: { $avg: "$cantidad" } } },
     ],
   };
@@ -1701,6 +1694,7 @@ function buildResumenPipeline(matchQ, { completo = true, topN = 10 } = {}) {
             { $not: [{ $regexMatch: { input: MAIL_TEXT_SAFE, regex: MAIL_ENTRANTE_RX } }] },
           ],
         },
+        mailCountGestion: cantidadMailsGestionExpr(),
         horaHH: { $substrBytes: [HORA_SAFE, 0, 2] },
         diaISO: { $dateToString: { date: "$fecha", format: "%Y-%m-%d" } },
         diaSemana: { $isoDayOfWeek: "$fecha" },
@@ -2453,26 +2447,38 @@ export async function actividadRango(req, res) {
     const d2Fin = new Date(d2.getTime() + 86399999);
     const historiaDesde = new Date(d1.getTime() - ventanaDias * 86400000);
 
-    const filtrosComunes = {
+    const filtrosBase = {
       ...ownerScope(req),
       borrado: { $ne: true },
-      usuario: await controlledActiveUserFilter(operador),
     };
     const fEntidad = rxExactMulti(entidad, (value) => value.toUpperCase());
     const fTipo = rxExactMulti(tipoContacto);
     const fEstado = rxExactMulti(estadoCuenta);
     const dniFilter = buildDniFilter(dni);
-    if (fEntidad) filtrosComunes.entidad = fEntidad;
-    if (fTipo) filtrosComunes.tipoContacto = fTipo;
-    if (fEstado) filtrosComunes.estadoCuenta = fEstado;
-    if (dniFilter) filtrosComunes.dni = dniFilter;
+    if (fEntidad) filtrosBase.entidad = fEntidad;
+    if (fTipo) filtrosBase.tipoContacto = fTipo;
+    if (fEstado) filtrosBase.estadoCuenta = fEstado;
+    if (dniFilter) filtrosBase.dni = dniFilter;
+
+    // Totales y detalle individual usan el mismo universo: todos los usuarios
+    // reales activos, incluidos administración, supervisión y super-admin.
+    const filtrosEquipo = { ...filtrosBase, usuario: await activeUserFilter(operador) };
+    const filtrosControl = { ...filtrosBase, usuario: await controlledActiveUserFilter(operador) };
 
     const matchRango = {
-      ...filtrosComunes,
+      ...filtrosEquipo,
       fecha: { $gte: d1, $lte: d2Fin },
     };
     const matchHistoria = {
-      ...filtrosComunes,
+      ...filtrosEquipo,
+      fecha: { $gte: historiaDesde, $lt: d1 },
+    };
+    const matchRangoControl = {
+      ...filtrosControl,
+      fecha: { $gte: d1, $lte: d2Fin },
+    };
+    const matchHistoriaControl = {
+      ...filtrosControl,
       fecha: { $gte: historiaDesde, $lt: d1 },
     };
     const DNI_SAFE = {
@@ -2530,7 +2536,7 @@ export async function actividadRango(req, res) {
         { $sort: { fecha: 1, dni: 1 } },
       ]).allowDiskUse(true).option({ maxTimeMS: 30000 }),
       ReporteGestion.aggregate([
-        { $match: matchRango },
+        { $match: matchRangoControl },
         {
           $project: {
             usuario: 1,
@@ -2562,7 +2568,7 @@ export async function actividadRango(req, res) {
         { $sort: { usuario: 1, fecha: 1 } },
       ]).allowDiskUse(true).option({ maxTimeMS: 30000 }).collation({ locale: "es", strength: 1 }),
       ReporteGestion.aggregate([
-        { $match: matchHistoria },
+        { $match: matchHistoriaControl },
         { $project: { usuario: 1, fecha: 1, dniNormalizado: DNI_SAFE } },
         { $match: { dniNormalizado: { $ne: "" } } },
         {
@@ -2573,7 +2579,7 @@ export async function actividadRango(req, res) {
         },
       ]).allowDiskUse(true).option({ maxTimeMS: 30000 }).collation({ locale: "es", strength: 1 }),
       ReporteGestion.aggregate([
-        { $match: matchRango },
+        { $match: matchRangoControl },
         { $project: { usuario: 1, dniNormalizado: DNI_SAFE, dia: DIA_UTC } },
         { $match: { dniNormalizado: { $ne: "" } } },
         { $group: { _id: { usuario: "$usuario", fecha: "$dia", dni: "$dniNormalizado" } } },
@@ -3693,8 +3699,9 @@ async function calcularDesgloseRecaudacionAcuerdos({
     if (!moduleHasData) return fallback("SIN_PAGOS_CARGADOS");
 
     const paymentMatch = {
+      // El TOTAL EQUIPO incluye todo el dinero del período. Los perfiles ocultos
+      // se eliminan recién del detalle por operador, no de la recaudación global.
       fechaPago: { $gte: desdeDate, $lte: hastaDate },
-      ...filtroMongoUsuariosVisiblesControl("operadorUsername"),
     };
     if (operadorFilter) paymentMatch.operadorUsername = operadorFilter;
     if (dniFilter) paymentMatch.dni = dniFilter;
@@ -3752,16 +3759,25 @@ async function calcularDesgloseRecaudacionAcuerdos({
     let cantidadPeriodo = 0;
     for (const pago of pagos) {
       const monto = Math.max(0, Number(pago?.monto || 0));
-      const item = ensureOperator(pago?.operadorUsername);
       const esDelPeriodo = linkedCurrentIds.has(clavePagoReporte(pago));
+      const operadorPago = String(pago?.operadorUsername || "").trim();
+      const mostrarEnDetalle = !operadorPago || esUsuarioVisibleEnReportesControl(operadorPago);
+      const item = mostrarEnDetalle ? ensureOperator(operadorPago) : null;
+
+      // Totales de equipo: siempre suman.
+      total += monto;
+      if (esDelPeriodo) {
+        totalPeriodo += monto;
+        cantidadPeriodo += 1;
+      }
+
+      // Filas individuales: sólo universo visible/controlable.
+      if (!item) continue;
       item.recaudadoMes += monto;
       item.cantidadPagosMes += 1;
-      total += monto;
       if (esDelPeriodo) {
         item.recaudadoAcuerdosPeriodo += monto;
         item.cantidadPagosAcuerdosPeriodo += 1;
-        totalPeriodo += monto;
-        cantidadPeriodo += 1;
       } else {
         item.recaudadoCarteraAnterior += monto;
         item.cantidadPagosCarteraAnterior += 1;

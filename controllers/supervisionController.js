@@ -267,6 +267,11 @@ export async function resumenSupervision(req, res) {
     const idsControlados = empleadosControlados.map((empleado) => empleado._id);
     const usuariosControlados = usernamesControlados(empleados);
     const listaUsuariosControlados = [...usuariosControlados];
+    // Los perfiles no controlados siguen aportando a métricas de equipo. Sólo se
+    // los excluye de evaluaciones/tablas individuales.
+    const listaUsuariosActivos = empleados
+      .map((empleado) => normalizeUsername(empleado?.username))
+      .filter(Boolean);
 
     const [pagosTres, objetivos, novedadesRRHH, gestionesActividadPeriodo,
       proyeccionesCaidas, proyeccionesManuales, colchonSinGestion, pendientesColchon, pendientesProyecciones, ultimaPago,
@@ -287,10 +292,14 @@ export async function resumenSupervision(req, res) {
         fechaDesde: { $lte: hastaNovedades },
         $or: [{ fechaHasta: null }, { fechaHasta: { $gte: desdeNovedades } }],
       }).lean(),
+      // Actividad base del período: incluye a TODOS los usuarios activos. Más abajo
+      // la tabla/Jornada individual se arma sólo con empleadosControlados, pero
+      // el TOTAL EQUIPO y la frescura de Gestiones no pueden perder aportes de
+      // mandos medios/perfiles ocultos de control.
       ReporteGestion.find({
         fecha: { $gte: selectedDesdeUTC, $lte: selectedHastaUTC },
         borrado: { $ne: true },
-        usuario: { $in: listaUsuariosControlados },
+        usuario: { $in: listaUsuariosActivos },
       }).select("fecha hora usuario").lean().maxTimeMS(SUPERVISION_QUERY_MS),
       Proyeccion.countDocuments({
         fechaPromesa: { $gte: desde, $lte: hasta },
@@ -317,7 +326,7 @@ export async function resumenSupervision(req, res) {
       ReporteGestion.findOne({
         borrado: { $ne: true },
         resultadoGestion: { $in: RESULTADOS_ACUERDO_MANGO },
-        usuario: { $in: listaUsuariosControlados },
+        usuario: { $in: listaUsuariosActivos },
       })
         .sort({ createdAt: -1 })
         .select("createdAt fecha hora usuario resultadoGestion fuenteArchivo")
@@ -327,7 +336,7 @@ export async function resumenSupervision(req, res) {
       ReporteGestion.findOne({
         fecha: { $gte: hoyDesdeUTC, $lte: hoyHastaUTC },
         borrado: { $ne: true },
-        usuario: { $in: listaUsuariosControlados },
+        usuario: { $in: listaUsuariosActivos },
       }).sort({ createdAt: -1 }).select("createdAt fecha hora fuenteArchivo usuario").lean(),
       Asistencia.countDocuments({ empleado: { $in: idsControlados }, fechaClave: hoyClave, estado: "presente" }),
       Asistencia.countDocuments({ empleado: { $in: idsControlados }, fechaClave: { $lt: hoyClave }, estado: "presente" }),
@@ -375,7 +384,7 @@ export async function resumenSupervision(req, res) {
         ReporteGestion.find({
           fecha: { $gte: acuerdosProyeccionDesdeUTC, $lte: finMesSeleccionadoUTC },
           borrado: { $ne: true },
-          usuario: { $in: listaUsuariosControlados },
+          usuario: { $in: listaUsuariosActivos },
           resultadoGestion: { $in: RESULTADOS_ACUERDO_MANGO },
         })
           .select("dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero")
@@ -494,11 +503,13 @@ export async function resumenSupervision(req, res) {
       };
     });
     const resumenGestionesHoy = {
-      totalGestiones: gestionesPorOperadorHoy.reduce((sum, item) => sum + Number(item.gestiones || 0), 0),
+      // El resumen del equipo sale de actividadHoy (todos los activos); las filas
+      // por operador siguen siendo únicamente las personas sujetas a control.
+      totalGestiones: [...actividadHoy.values()].reduce((sum, item) => sum + Number(item?.gestiones || 0), 0),
       cuentasTrabajadas: null,
       casosNuevos: null,
       casosNuevosPendiente: true,
-      operadoresConActividad: gestionesPorOperadorHoy.filter((item) => Number(item.gestiones || 0) > 0).length,
+      operadoresConActividad: actividadHoy.size,
       ventanaCasosNuevosDias: 90,
       porOperador: gestionesPorOperadorHoy
         .filter((item) => Number(item.gestiones || 0) > 0)
@@ -932,13 +943,22 @@ export async function resumenSupervision(req, res) {
 
     const proyeccionPorOperadorMap = new Map();
     let proyeccionPrimerPagoMes = 0;
+    let primerPagoCobradoMesEquipo = 0;
+    let primerosPagosCubiertosMesEquipo = 0;
     for (const acuerdo of acuerdosProyectablesMes) {
       const usuario = String(acuerdo.usuario || "Sin operador").trim() || "Sin operador";
-      if (!usuariosControlados.has(normalizeUsername(usuario))) continue;
+      const usuarioNormalizado = normalizeUsername(usuario);
       const importe = Number(acuerdo.primerPago || 0);
       const cobradoPrimerPago = Number(acuerdo.montoPrimerPagoCobrado || 0);
+
+      // Equipo = todos los usuarios activos, aunque no deban aparecer evaluados.
       proyeccionPrimerPagoMes += importe;
-      const actual = proyeccionPorOperadorMap.get(normalizeUsername(usuario)) || {
+      primerPagoCobradoMesEquipo += cobradoPrimerPago;
+      if (acuerdo.primerPagoCubierto) primerosPagosCubiertosMesEquipo += 1;
+
+      // Tabla por operador = sólo universo controlable/visible.
+      if (!usuariosControlados.has(usuarioNormalizado)) continue;
+      const actual = proyeccionPorOperadorMap.get(usuarioNormalizado) || {
         cantidad: 0,
         importe: 0,
         primerPagoCobrado: 0,
@@ -948,7 +968,7 @@ export async function resumenSupervision(req, res) {
       actual.importe += importe;
       actual.primerPagoCobrado += cobradoPrimerPago;
       if (acuerdo.primerPagoCubierto) actual.primerosPagosCubiertos += 1;
-      proyeccionPorOperadorMap.set(normalizeUsername(usuario), actual);
+      proyeccionPorOperadorMap.set(usuarioNormalizado, actual);
     }
 
     const estadosConPagoValido = new Set([
@@ -1148,10 +1168,6 @@ export async function resumenSupervision(req, res) {
       .map(([tipo, total]) => ({ tipo, total }))
       .sort((a, b) => b.total - a.total);
 
-    const primerPagoCobradoMesEquipo = [...proyeccionPorOperadorMap.values()]
-      .reduce((sum, item) => sum + Number(item.primerPagoCobrado || 0), 0);
-    const primerosPagosCubiertosMesEquipo = [...proyeccionPorOperadorMap.values()]
-      .reduce((sum, item) => sum + Number(item.primerosPagosCubiertos || 0), 0);
     const recaudadoCarteraAnteriorEquipo = Math.max(0, Number(totalActual || 0) - recaudadoAcuerdosPeriodoEquipo);
 
     const horasParaRevisar = operadores
@@ -1315,7 +1331,7 @@ export async function resumenSupervision(req, res) {
         montoTotal: montoTotalAcuerdos,
         primerPagoTotal,
         proyeccionPrimerPagoMes,
-        proyeccionCantidad: acuerdosProyectablesMes.filter((acuerdo) => usuariosControlados.has(normalizeUsername(acuerdo.usuario))).length,
+        proyeccionCantidad: acuerdosProyectablesMes.length,
         primerPagoCobradoMes: primerPagoCobradoMesEquipo,
         primerosPagosCubiertosMes: primerosPagosCubiertosMesEquipo,
         recaudadoAcuerdosPeriodo: recaudadoAcuerdosPeriodoEquipo,
@@ -1430,12 +1446,14 @@ export async function resumenGestionesSupervision(req, res) {
       .sort({ username: 1 })
       .lean();
     const empleadosControlados = filtrarEmpleadosControlados(empleados);
-    const listaUsuariosControlados = [...usernamesControlados(empleados)];
+    const listaUsuariosActivos = empleados
+      .map((empleado) => normalizeUsername(empleado?.username))
+      .filter(Boolean);
 
     const filasDia = await ReporteGestion.find({
       fecha: { $gte: diaDesde, $lte: diaHasta },
       borrado: { $ne: true },
-      usuario: { $in: listaUsuariosControlados },
+      usuario: { $in: listaUsuariosActivos },
     })
       .select("usuario dni hora")
       .lean()
@@ -1467,7 +1485,7 @@ export async function resumenGestionesSupervision(req, res) {
       historial = await ReporteGestion.find({
         fecha: { $gte: historialDesde, $lt: diaDesde },
         borrado: { $ne: true },
-        usuario: { $in: listaUsuariosControlados },
+        usuario: { $in: listaUsuariosActivos },
         dni: { $in: [...dnisHoy] },
       })
         .select("usuario dni")
@@ -1521,11 +1539,11 @@ export async function resumenGestionesSupervision(req, res) {
     return res.json({
       fechaConsulta,
       resumen: {
-        totalGestiones: porOperador.reduce((sum, item) => sum + Number(item.gestiones || 0), 0),
+        totalGestiones: filasDia.length,
         cuentasTrabajadas: paresHoy.size,
         casosNuevos,
         casosNuevosPendiente: false,
-        operadoresConActividad: porOperador.filter((item) => item.gestiones > 0).length,
+        operadoresConActividad: new Set((filasDia || []).map((item) => normalizeUsername(item?.usuario)).filter(Boolean)).size,
         ventanaCasosNuevosDias: 90,
         porOperador,
       },

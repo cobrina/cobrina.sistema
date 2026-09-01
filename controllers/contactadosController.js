@@ -9,6 +9,7 @@ import {
   asegurarLimpiezaEstadosTerminalesMes,
   asegurarMesContactados,
   estadoSincronizacionContactados,
+  expirarContactadosAhora,
   sincronizarContactadosEnSegundoPlano,
 } from "../services/contactadosService.js";
 import {
@@ -98,6 +99,23 @@ function rangoMesCalendarioUTC(mes) {
     desde: new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0)),
     hasta: new Date(Date.UTC(year, month, 1, 0, 0, 0, 0) - 1),
   };
+}
+
+function filtroVencimientoMes(mes) {
+  const { desde, hasta } = rangoMes(mes);
+  return { venceAt: { $gte: desde, $lte: hasta } };
+}
+
+async function asegurarUniversoPorVencimiento(mes) {
+  // Un vencimiento de septiembre puede provenir de una gestión de agosto.
+  // Por eso, antes de consultar un mes, garantizamos tanto ese mes como el anterior.
+  const anterior = mesAnteriorClave(mes);
+  await asegurarMesContactados(anterior);
+  await asegurarMesContactados(mes);
+  await Promise.all([
+    asegurarLimpiezaEstadosTerminalesMes(anterior),
+    asegurarLimpiezaEstadosTerminalesMes(mes),
+  ]);
 }
 
 function filtroScope(req, query = {}) {
@@ -386,12 +404,12 @@ async function obtenerSeguimientoData(req, { exportar = false } = {}) {
   const now = new Date();
   const mesSolicitado = /^\d{4}-\d{2}$/.test(norm(req.query.mes)) ? norm(req.query.mes) : mesActualArgentina();
   const mes = esMandoMedio(req) ? mesSolicitado : mesActualArgentina();
-  if (mes !== mesActualArgentina()) await asegurarMesContactados(mes);
-  else await asegurarLimpiezaEstadosTerminalesMes(mes);
+  await asegurarUniversoPorVencimiento(mes);
+  // Seguimiento es una bandeja VIVA. No se corta por mesOrigen: una gestión del
+  // mes anterior puede seguir abierta y requerir trabajo durante el mes actual.
   const filtroBaseMes = {
     ...filtroScopeTabla(req, req.query),
     ...FILTRO_SIN_ESTADOS_TERMINALES,
-    mesOrigen: mes,
   };
   const filtro = {
     ...filtroBaseMes,
@@ -421,7 +439,12 @@ async function obtenerSeguimientoData(req, { exportar = false } = {}) {
   const limit = exportar ? 10000 : Math.min(250, Math.max(10, Number(req.query.limit || 80)));
   const sort = normalizarOrden(req.query, "venceAt", "asc");
   const totalPromise = ContactadoVentana.countDocuments(filtro);
-  const origenesPromise = ContactadoVentana.countDocuments({ ...filtroBaseMes, esOrigenContactado: true });
+  const origenesPromise = ContactadoVentana.countDocuments({
+    ...filtroBaseMes,
+    estado: "abierta",
+    venceAt: { $gt: now },
+    esOrigenContactado: true,
+  });
   let rows;
   if (["toquesMes", "validacion"].includes(sort.key)) {
     const allRows = await ContactadoVentana.find(filtro).lean();
@@ -470,14 +493,20 @@ async function obtenerVencidosData(req, { hoy = false, exportar = false } = {}) 
   }
 
   sincronizarContactadosEnSegundoPlano();
+  await expirarContactadosAhora();
   const mes = hoy
     ? mesActualArgentina()
     : (/^\d{4}-\d{2}$/.test(norm(req.query.mes)) ? norm(req.query.mes) : mesActualArgentina());
-  if (!hoy && mes !== mesActualArgentina()) await asegurarMesContactados(mes);
-  else await asegurarLimpiezaEstadosTerminalesMes(mes);
+  await asegurarUniversoPorVencimiento(mes);
 
-  const filtro = { ...filtroScopeTabla(req, req.query), ...FILTRO_SIN_ESTADOS_TERMINALES, mesOrigen: mes, estado: "vencida" };
-  if (hoy) filtro.venceAt = { $gte: inicioDiaArgentina(), $lte: finDiaArgentina() };
+  const filtro = {
+    ...filtroScopeTabla(req, req.query),
+    ...FILTRO_SIN_ESTADOS_TERMINALES,
+    estado: "vencida",
+    ...(hoy
+      ? { venceAt: { $gte: inicioDiaArgentina(now), $lte: finDiaArgentina(now) } }
+      : filtroVencimientoMes(mes)),
+  };
 
   const page = exportar ? 1 : Math.max(1, Number(req.query.page || 1));
   const limit = exportar ? 10000 : Math.min(250, Math.max(10, Number(req.query.limit || 80)));
@@ -542,12 +571,12 @@ async function obtenerVencidosData(req, { hoy = false, exportar = false } = {}) 
 export async function resumenAlerta(req, res) {
   try {
     sincronizarContactadosEnSegundoPlano();
-    await asegurarLimpiezaEstadosTerminalesMes(mesActualArgentina());
+    await asegurarUniversoPorVencimiento(mesActualArgentina());
+    await expirarContactadosAhora();
     const now = new Date();
     if (esMandoMedio(req)) {
       const vencidosHoy = await ContactadoVentana.countDocuments({
         ...FILTRO_SIN_ESTADOS_TERMINALES,
-        mesOrigen: mesActualArgentina(),
         estado: "vencida",
         venceAt: { $gte: inicioDiaArgentina(now), $lte: finDiaArgentina(now) },
         operador: { $nin: [...USUARIOS_OCULTOS_REPORTES_CONTROL] },
@@ -556,7 +585,7 @@ export async function resumenAlerta(req, res) {
     }
 
     const operador = usernameActual(req);
-    const base = { ...FILTRO_SIN_ESTADOS_TERMINALES, mesOrigen: mesActualArgentina(), estado: "abierta", operador, alertaAt: { $lte: now }, venceAt: { $gt: now } };
+    const base = { ...FILTRO_SIN_ESTADOS_TERMINALES, estado: "abierta", operador, alertaAt: { $lte: now }, venceAt: { $gt: now } };
     const [pendientes, criticos, realizadosPendientesValidar] = await Promise.all([
       ContactadoVentana.countDocuments({ ...base, clickRealizadoAt: null }),
       ContactadoVentana.countDocuments({ ...base, criticoAt: { $lte: now }, clickRealizadoAt: null }),
@@ -599,7 +628,7 @@ export async function marcarRealizado(req, res) {
     await asegurarLimpiezaEstadosTerminalesMes(mesActualArgentina());
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "Caso inválido" });
     const now = new Date();
-    const row = await ContactadoVentana.findOne({ _id: req.params.id, ...FILTRO_SIN_ESTADOS_TERMINALES, mesOrigen: mesActualArgentina(), estado: "abierta", venceAt: { $gt: now } });
+    const row = await ContactadoVentana.findOne({ _id: req.params.id, ...FILTRO_SIN_ESTADOS_TERMINALES, estado: "abierta", venceAt: { $gt: now } });
     if (!row) return res.status(404).json({ error: "El Contactado ya no está activo" });
     if (normUser(row.operador) !== usernameActual(req)) return res.status(403).json({ error: "Solo el operador asignado puede marcar este caso" });
 
@@ -680,10 +709,11 @@ async function calcularEstadisticasActivos(req) {
   const now = new Date();
   const rangoSolicitado = rangoMes(req.query.mes);
   const mes = esMandoMedio(req) ? rangoSolicitado.mes : mesActualArgentina();
-  if (mes !== mesActualArgentina()) await asegurarMesContactados(mes);
-  else await asegurarLimpiezaEstadosTerminalesMes(mes);
+  await asegurarUniversoPorVencimiento(mes);
   const scope = filtroScope(req, req.query);
-  const filtroStats = { ...scope, ...FILTRO_SIN_ESTADOS_TERMINALES, mesOrigen: mes };
+  // Las estadísticas del período se atribuyen al mes de VENCIMIENTO, no al mes
+  // en que nació la gestión. Así un caso del 31/08 que vence el 02/09 cuenta en septiembre.
+  const filtroStats = { ...scope, ...FILTRO_SIN_ESTADOS_TERMINALES, ...filtroVencimientoMes(mes) };
   const tocado = norm(req.query.tocado).toLowerCase();
   if (tocado === "si") filtroStats.clickRealizadoAt = { $ne: null };
   if (tocado === "no") filtroStats.clickRealizadoAt = null;
@@ -788,11 +818,17 @@ async function calcularEstadisticasVencidos(req, { hoy = false } = {}) {
     };
   }
 
-  if (!hoy && mes !== mesActualArgentina()) await asegurarMesContactados(mes);
-  else await asegurarLimpiezaEstadosTerminalesMes(mes);
+  await asegurarUniversoPorVencimiento(mes);
 
-  const filtro = { ...filtroScopeTabla(req, req.query), ...FILTRO_SIN_ESTADOS_TERMINALES, mesOrigen: mes, estado: "vencida" };
-  if (hoy) filtro.venceAt = { $gte: inicioDiaArgentina(now), $lte: finDiaArgentina(now) };
+  await expirarContactadosAhora();
+  const filtro = {
+    ...filtroScopeTabla(req, req.query),
+    ...FILTRO_SIN_ESTADOS_TERMINALES,
+    estado: "vencida",
+    ...(hoy
+      ? { venceAt: { $gte: inicioDiaArgentina(now), $lte: finDiaArgentina(now) } }
+      : filtroVencimientoMes(mes)),
+  };
 
   let rows = await ContactadoVentana.find(filtro).lean();
   const postMap = await mapaSeguimientoPosterior(rows);
@@ -895,18 +931,16 @@ async function calcularRecuperados(req) {
   const dias = [7, 15, 30, 60].includes(Number(req.query.dias)) ? Number(req.query.dias) : 30;
   const rangoSolicitado = rangoMes(req.query.mes);
   const mes = mesRecuperadosPermitido(req, rangoSolicitado.mes);
-  if (mes !== mesActualArgentina()) await asegurarMesContactados(mes);
-  else await asegurarLimpiezaEstadosTerminalesMes(mes);
+  await asegurarUniversoPorVencimiento(mes);
   const filtroSolicitado = filtroScope(req, req.query);
 
-  // El universo se define por el MES EN QUE NACIÓ el Contactado. No se arrastran
-  // casos originados el mes anterior sólo porque vencieron o cobraron después.
-  // Buscamos globalmente dentro de ese mes para atribuir cada pago al último
-  // vencimiento real y recién después aplicamos el scope del usuario/operador.
+  // El universo se define por el MES DE VENCIMIENTO. Si un Contactado nació en
+  // agosto y vence en septiembre, pertenece a septiembre también para recuperos.
+  // Después atribuimos cada pago al último vencimiento real y aplicamos el scope.
   const todasVencidas = await ContactadoVentana.find({
     ...FILTRO_SIN_ESTADOS_TERMINALES,
-    mesOrigen: mes,
     estado: "vencida",
+    ...filtroVencimientoMes(mes),
   }).sort({ venceAt: 1 }).lean();
   if (!todasVencidas.length) return { mes, dias, resumen: { vencidos: 0, cobradosPorOtro: 0, cobradosPorMismo: 0, sinRecupero: 0, montoPorOtros: 0, montoMismo: 0, pctCobradosPorOtro: 0 }, porOperador: [], casos: [], diagnosticoPagos: { pagosEncontrados: 0, pagosAsignados: 0, vencidosConEntidadCanonica: 0, vencidosSinEntidadCanonica: 0 } };
 
@@ -1042,8 +1076,8 @@ async function calcularRecuperados(req) {
       vencidosSinEntidadCanonica: todasVencidas.filter((r) => !Number(r.__entidadNumero || 0)).length,
     },
     // En Vencidos / recuperados interesa el universo completo que perdió casos.
-    // A diferencia de Reportes/Controles, acá sí deben aparecer residual, cuotería
-    // y cualquier usuario operativo excluido de rankings de control.
+    // El recupero conserva el universo completo, incluida cartera residual/cuotería
+    // y cualquier usuario o categoría operativa con actividad.
     porOperador,
     // El operador puede ver el impacto agregado de sus vencidos, pero nunca
     // recibe el detalle de DNIs que ya perdió. Ese listado es sólo de mando medio.
@@ -1069,10 +1103,19 @@ export async function catalogos(req, res) {
       : esVistaRecuperados
         ? mesRecuperadosPermitido(req, mesSolicitado)
         : mesActualArgentina();
-    if (mes !== mesActualArgentina()) await asegurarMesContactados(mes);
-    const scope = { ...filtroScope(req, {}), mesOrigen: mes };
+    await asegurarUniversoPorVencimiento(mes);
+    const periodo = filtroVencimientoMes(mes);
+    const scopeBase = filtroScope(req, {});
+    // En el mes actual sumamos la cola abierta completa para que un arrastre o
+    // un caso cuyo vencimiento cae más adelante siga disponible en los filtros.
+    const scope = !esVistaRecuperados && mes === mesActualArgentina()
+      ? { ...scopeBase, $or: [periodo, { estado: "abierta" }] }
+      : { ...scopeBase, ...periodo };
+    const scopeOperadores = !esVistaRecuperados && mes === mesActualArgentina()
+      ? { $or: [periodo, { estado: "abierta" }] }
+      : { ...periodo };
     const [operadores, entidades] = await Promise.all([
-      esMandoMedio(req) ? ContactadoVentana.distinct("operador", { mesOrigen: mes }) : Promise.resolve([usernameActual(req)]),
+      esMandoMedio(req) ? ContactadoVentana.distinct("operador", scopeOperadores) : Promise.resolve([usernameActual(req)]),
       ContactadoVentana.distinct("entidad", scope),
     ]);
     return res.json({
