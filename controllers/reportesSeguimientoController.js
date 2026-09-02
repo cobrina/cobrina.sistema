@@ -302,11 +302,14 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
     // vez después del total, evitando que el corte elegido como break desaparezca
     // o aparezca partido de forma confusa.
     const long = allGaps.filter((gap) => duracionOriginalGap(gap) > PAUSA_BREVE_MAX);
-    const critical = long.filter((gap) => Number(gap.duracionMin || 0) > PAUSA_CRITICA_MIN && !gap.abiertoAlCorte);
+    const critical = long.filter((gap) => duracionOriginalGap(gap) > PAUSA_CRITICA_MIN && !gap.abiertoAlCorte);
     const longTotalBruto = long.reduce((sum, gap) => sum + duracionOriginalGap(gap), 0);
-    const longTotalNeto = long.reduce((sum, gap) => sum + Number(gap.duracionMin || 0), 0);
-    const breakDescontadoMin = Math.round(Number(breakDetalle?.breakConsideradoMin || 0));
-    const cortesDescontadosMin = Math.round(longTotalNeto);
+    // El break es una franquicia diaria de la jornada (20 min para 3–4 h,
+    // 30 min para más de 4 h). Se descuenta del TOTAL de baches visibles: no
+    // depende de que exista un único corte de exactamente 20/30 minutos.
+    const breakDescontadoMin = Math.min(Math.round(longTotalBruto), Math.round(Number(breakPermitidoMin || 0)));
+    const cortesDescontadosMin = Math.max(0, Math.round(longTotalBruto - breakDescontadoMin));
+    const longTotalNeto = cortesDescontadosMin;
     // Trabajo efectivo = suma de bloques realmente continuos de actividad Mango.
     // Cada bloque se corta ante 20 min o más sin gestiones, incluso si el corte
     // ocurre fuera del horario RRHH. Así una gestión aislada a las 17:52 no hace
@@ -451,8 +454,10 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
       pausasDetalle: long.map((gap) => ({
         desde: hhmm(gap.desdeMin),
         hasta: hhmm(gap.hastaMin),
-        duracionMin: Math.round(Number(gap.duracionMin || 0)),
-        duracionOriginalMin: Math.round(Number(gap.duracionOriginalMin ?? gap.duracionMin ?? 0)),
+        // La lista muestra el corte bruto. El break se descuenta una sola vez
+        // del total inferior, no deformando/ocultando un bache individual.
+        duracionMin: Math.round(duracionOriginalGap(gap)),
+        duracionOriginalMin: Math.round(duracionOriginalGap(gap)),
         breakConsideradoMin: Math.round(Number(gap.breakConsideradoMin || 0)),
         breakPermitidoMin: Math.round(Number(gap.breakPermitidoMin || breakPermitidoMin || 0)),
         actual: Boolean(gap.actual),
@@ -464,9 +469,9 @@ function groupActivity(rows, employeeByUsername, novedadesByEmployee = new Map()
         desde: hhmm(breakDetalle.desdeMin),
         hasta: hhmm(breakDetalle.hastaMin),
         duracionOriginalMin: Math.round(Number(breakDetalle.duracionOriginalMin || 0)),
-        breakConsideradoMin: Math.round(Number(breakDetalle.breakConsideradoMin || 0)),
-        breakPermitidoMin: Math.round(Number(breakDetalle.breakPermitidoMin || 0)),
-        excedenteMin: Math.round(Number(breakDetalle.excedenteMin || 0)),
+        breakConsideradoMin: Math.round(Number(breakDescontadoMin || 0)),
+        breakPermitidoMin: Math.round(Number(breakPermitidoMin || 0)),
+        excedenteMin: Math.max(0, Math.round(longTotalBruto - breakDescontadoMin)),
         actual: Boolean(breakDetalle.actual),
         abiertoAlCorte: Boolean(breakDetalle.abiertoAlCorte),
         corteDatosHora: breakDetalle.corteDatosHora || "",

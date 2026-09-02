@@ -606,35 +606,41 @@ export async function resumenSupervision(req, res) {
       const breakPermitidoHoyMin = ajusteBreakHoy.permitidoMin || minutosBreakFlexiblePermitido(horarioHoy);
       const breakConsideradoHoyRaw = ajusteBreakHoy.breakDetalle;
       const bachesDetalleHoy = intervalosConBreakHoy
-        .filter((intervalo) => Number(intervalo.duracionMin || 0) > BACHE_VISIBLE_MIN)
-        .map((intervalo) => ({
-          desde: horaGestionHHMM(intervalo.desdeMin),
-          hasta: horaGestionHHMM(intervalo.hastaMin),
-          duracionMin: Math.round(Number(intervalo.duracionMin || 0)),
-          duracionOriginalMin: Math.round(Number(intervalo.duracionOriginalMin ?? intervalo.duracionMin ?? 0)),
-          breakConsideradoMin: Math.round(Number(intervalo.breakConsideradoMin || 0)),
-          breakPermitidoMin: Math.round(Number(intervalo.breakPermitidoMin || breakPermitidoHoyMin || 0)),
-          actual: false,
-          abiertoAlCorte: false,
-          corteDatosHora: "",
-        }))
+        .filter((intervalo) => Number(intervalo.duracionOriginalMin ?? intervalo.duracionMin ?? 0) > BACHE_VISIBLE_MIN)
+        .map((intervalo) => {
+          const bruto = Math.round(Number(intervalo.duracionOriginalMin ?? intervalo.duracionMin ?? 0));
+          return {
+            desde: horaGestionHHMM(intervalo.desdeMin),
+            hasta: horaGestionHHMM(intervalo.hastaMin),
+            // Siempre mostramos el bache real. El break se descuenta globalmente
+            // en el resumen para no hacer desaparecer un corte de 20–30 min.
+            duracionMin: bruto,
+            duracionOriginalMin: bruto,
+            breakConsideradoMin: 0,
+            breakPermitidoMin: Math.round(Number(breakPermitidoHoyMin || 0)),
+            actual: false,
+            abiertoAlCorte: false,
+            corteDatosHora: "",
+          };
+        })
         .sort((a, b) => minutosHoraHHMM(a.desde) - minutosHoraHHMM(b.desde));
-      const breakConsideradoHoy = breakConsideradoHoyRaw ? {
-        desde: horaGestionHHMM(breakConsideradoHoyRaw.desdeMin),
-        hasta: horaGestionHHMM(breakConsideradoHoyRaw.hastaMin),
-        duracionOriginalMin: Math.round(Number(breakConsideradoHoyRaw.duracionOriginalMin || 0)),
-        breakConsideradoMin: Math.round(Number(breakConsideradoHoyRaw.breakConsideradoMin || 0)),
-        breakPermitidoMin: Math.round(Number(breakConsideradoHoyRaw.breakPermitidoMin || 0)),
-        excedenteMin: Math.round(Number(breakConsideradoHoyRaw.excedenteMin || 0)),
+      const totalBachesBrutosHoyMin = Math.round(bachesDetalleHoy.reduce((sum, intervalo) => sum + Number(intervalo.duracionOriginalMin || 0), 0));
+      const breakDescontadoHoyMin = Math.min(totalBachesBrutosHoyMin, Math.round(Number(breakPermitidoHoyMin || 0)));
+      const cortesDescontadosHoyMin = Math.max(0, totalBachesBrutosHoyMin - breakDescontadoHoyMin);
+      const breakConsideradoHoy = totalBachesBrutosHoyMin > 0 && breakDescontadoHoyMin > 0 ? {
+        desde: breakConsideradoHoyRaw ? horaGestionHHMM(breakConsideradoHoyRaw.desdeMin) : "",
+        hasta: breakConsideradoHoyRaw ? horaGestionHHMM(breakConsideradoHoyRaw.hastaMin) : "",
+        duracionOriginalMin: totalBachesBrutosHoyMin,
+        breakConsideradoMin: breakDescontadoHoyMin,
+        breakPermitidoMin: Math.round(Number(breakPermitidoHoyMin || 0)),
+        excedenteMin: cortesDescontadosHoyMin,
         actual: false,
         abiertoAlCorte: false,
         corteDatosHora: "",
       } : null;
       // "Trabajo efectivo" parte de la franja entre primera y última gestión y
-      // descuenta el break flexible reconocido + cortes visibles. Capacitación se
-      // reconoce aparte para cumplimiento, nunca para fabricar horas extra.
-      const breakDescontadoHoyMin = Math.round(Number(breakConsideradoHoy?.breakConsideradoMin || 0));
-      const cortesDescontadosHoyMin = Math.round(bachesDetalleHoy.reduce((sum, intervalo) => sum + Number(intervalo.duracionMin || 0), 0));
+      // descuenta la franquicia diaria de break + los cortes NETOS restantes.
+      // Capacitación se reconoce aparte para cumplimiento, nunca para fabricar horas extra.
       const capacitacionHoyMin = Math.round(minutosCapacitacionDentroHorario(capacitacionesHoy, horarioHoy));
       // La franja primera→última gestión puede atravesar una capacitación. Ese
       // tiempo no es actividad Mango: se resta del trabajo efectivo y se acredita
@@ -663,9 +669,9 @@ export async function resumenSupervision(req, res) {
         ? Math.min(cortesDescontadosHoyMin, faltanTrabajoEfectivoHoyMin)
         : null;
       const baches20Hoy = bachesDetalleHoy.length;
-      const baches30Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > 30).length;
-      const baches60Hoy = bachesDetalleHoy.filter((intervalo) => intervalo.duracionMin > BACHE_CRITICO_MIN).length;
-      const bacheMaximoHoyMin = bachesDetalleHoy.reduce((maximo, intervalo) => Math.max(maximo, Number(intervalo.duracionMin || 0)), 0);
+      const baches30Hoy = bachesDetalleHoy.filter((intervalo) => Number(intervalo.duracionOriginalMin || intervalo.duracionMin || 0) > 30).length;
+      const baches60Hoy = bachesDetalleHoy.filter((intervalo) => Number(intervalo.duracionOriginalMin || intervalo.duracionMin || 0) > BACHE_CRITICO_MIN).length;
+      const bacheMaximoHoyMin = bachesDetalleHoy.reduce((maximo, intervalo) => Math.max(maximo, Number(intervalo.duracionOriginalMin || intervalo.duracionMin || 0)), 0);
       const minutosAbiertosAlCorteHoy = 0;
       const minutosSinGestionHoy = 0;
       const minutosSinGestionAlCorteHoy = 0;

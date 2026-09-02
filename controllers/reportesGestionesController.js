@@ -380,7 +380,11 @@ export async function cargar(req, res) {
         ENTIDAD: entidadRaw,
       });
 
-      const mailsSoloTel = extraerEmails(telMail);
+      // Una gestión puede contener varios destinatarios dentro de la observación.
+      // Guardamos el conjunto único de e-mails encontrados tanto en TEL-MAIL
+      // MARCADO como en OBSERVACION GESTION para que 1 fila de Mango pueda
+      // representar correctamente N envíos sin duplicar una misma dirección.
+      const mailsDetectadosGestion = extraerEmails(`${telMail} ${observacion}`);
 
       docs.push({
         propietario: new mongoose.Types.ObjectId(usuarioId),
@@ -397,7 +401,7 @@ export async function cargar(req, res) {
         observacionGestion: observacion,
         entidad,
         entidadNumero,
-        mailsDetectados: mailsSoloTel,
+        mailsDetectados: mailsDetectadosGestion,
       });
     });
 
@@ -1513,25 +1517,51 @@ const CONTACTO_RX = /contactad[oa]/i;
 const MAIL_ENVIADO_RX = /mail|correo|e-?mail/i;
 const MAIL_ENTRANTE_RX = /entrante|recibido|recepci[oó]n/i;
 
-// Una gestión de Mango puede agrupar varios destinatarios de e-mail. Para las
-// métricas contamos la mayor señal disponible entre los mails ya parseados y
-// la cantidad de arrobas escrita en TEL-MAIL MARCADO. Si la gestión está
-// tipificada como envío de mail pero no trae detalle, cuenta como 1.
+// Una gestión de Mango puede agrupar varios destinatarios de e-mail. La fuente
+// real suele quedar escrita en OBSERVACION GESTION, aunque también puede venir
+// en TEL-MAIL MARCADO. Para no exigir una reimportación de históricos, la
+// métrica extrae los correos directamente de ambos textos en cada consulta.
+//
+// Regla:
+// - si encontramos direcciones válidas, contamos direcciones ÚNICAS;
+// - si no pudimos parsear direcciones pero hay arrobas, usamos la cantidad de @
+//   como fallback operativo;
+// - una gestión tipificada como mail sin detalle cuenta como 1.
 function cantidadMailsGestionExpr() {
-  const telMailSafe = {
-    $convert: { input: "$telMailMarcado", to: "string", onError: "", onNull: "" },
+  const textoCombinado = {
+    $concat: [
+      { $convert: { input: "$telMailMarcado", to: "string", onError: "", onNull: "" } },
+      " ",
+      { $convert: { input: "$observacionGestion", to: "string", onError: "", onNull: "" } },
+    ],
+  };
+  const encontrados = {
+    $map: {
+      input: {
+        $regexFindAll: {
+          input: { $toLower: textoCombinado },
+          regex: /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}/i,
+        },
+      },
+      as: "emailHit",
+      in: "$$emailHit.match",
+    },
+  };
+  const guardados = {
+    $cond: [{ $isArray: "$mailsDetectados" }, "$mailsDetectados", []],
+  };
+  const cantidadUnica = {
+    $size: { $setUnion: [encontrados, guardados] },
   };
   const cantidadArrobas = {
-    $subtract: [{ $size: { $split: [telMailSafe, "@"] } }, 1],
-  };
-  const cantidadParseada = {
-    $cond: [{ $isArray: "$mailsDetectados" }, { $size: "$mailsDetectados" }, 0],
-  };
-  const mejorCantidad = {
-    $cond: [{ $gt: [cantidadParseada, cantidadArrobas] }, cantidadParseada, cantidadArrobas],
+    $subtract: [{ $size: { $split: [textoCombinado, "@"] } }, 1],
   };
   return {
-    $cond: [{ $gt: [mejorCantidad, 0] }, mejorCantidad, 1],
+    $cond: [
+      { $gt: [cantidadUnica, 0] },
+      cantidadUnica,
+      { $cond: [{ $gt: [cantidadArrobas, 0] }, cantidadArrobas, 1] },
+    ],
   };
 }
 
