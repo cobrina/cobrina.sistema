@@ -14,7 +14,7 @@ import {
   minutoEnDescansoProgramado,
 } from "../utils/calculoAsistencia.js";
 import { actividadDeUsuarioEnFecha } from "../utils/actividadGestiones.js";
-import { filtrarEmpleadosControlados } from "../utils/controlEquipo.js";
+import { filtrarEmpleadosOperativosControl } from "../utils/controlEquipo.js";
 import { normalizeUsername } from "../config/roles.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
 
@@ -417,7 +417,7 @@ export async function panel(req, res) {
       .select("username nombre role ultimaActividad horarioLaboral isActive")
       .sort({ username: 1 })
       .lean();
-    const empleados = filtrarEmpleadosControlados(empleadosTodos);
+    const empleados = filtrarEmpleadosOperativosControl(empleadosTodos);
     const ids = empleados.map((empleado) => empleado._id);
     const usernames = empleados.map((empleado) => normalizeUsername(empleado.username)).filter(Boolean);
 

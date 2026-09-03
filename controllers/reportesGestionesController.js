@@ -9,6 +9,7 @@ import crypto from "crypto";
 import ReporteGestion from "../models/ReporteGestion.js";
 import { extraerEmails } from "../utils/email.util.js";
 import { toDateOnly, normalizarHora, fechaClaveArgentina, claveFechaCalendario } from "../utils/fecha.util.js";
+import { getEffectiveRole } from "../config/roles.js";
 import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
 import Pago from "../models/Pago.js";
@@ -16,7 +17,9 @@ import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
 import { sincronizarContactados } from "../services/contactadosService.js";
 import {
   filtrarEmpleadosControlados,
+  filtrarEmpleadosOperativosControl,
   filtrarFilasReportesControl,
+  esUsuarioEspecialReportes,
   esUsuarioVisibleEnReportesControl,
   USUARIOS_OCULTOS_REPORTES_CONTROL,
 } from "../utils/controlEquipo.js";
@@ -160,29 +163,84 @@ const inExactMultiStrings = (raw, mapFn = (x) => x) => {
   return arr.length === 1 ? arr[0] : { $in: arr };
 };
 
-// Universo de usuarios para Reportes. La actividad importada desde Mango es la
-// fuente de verdad: NO se descarta una gestión porque el usuario sea mando
-// medio, super-admin, esté fuera de la muestra histórica o no figure como
-// "activo" en Empleados. Sólo se omiten cuentas técnicas/de prueba.
+// Cache corto del padrón de usuarios. Varios paneles disparan analytics en
+// paralelo; deduplicar esta lectura evita consultar Empleados una vez por KPI.
+let __universoUsuariosCache = { expiresAt: 0, promise: null, activos: [], operativos: [] };
+
+async function universoUsuariosReportes() {
+  const now = Date.now();
+  if (__universoUsuariosCache.expiresAt > now && __universoUsuariosCache.activos.length) {
+    return __universoUsuariosCache;
+  }
+  if (__universoUsuariosCache.promise) return __universoUsuariosCache.promise;
+
+  __universoUsuariosCache.promise = (async () => {
+    const empleados = await Empleado.find({ isActive: { $ne: false } })
+      .select("username role isActive")
+      .lean();
+
+    const activos = filtrarEmpleadosControlados(empleados)
+      .map((empleado) => String(empleado?.username || "").trim().toLowerCase())
+      .filter(Boolean);
+    for (const especial of ["residual"]) {
+      if (esUsuarioEspecialReportes(especial) && !activos.includes(especial)) activos.push(especial);
+    }
+
+    const operativos = filtrarEmpleadosOperativosControl(empleados)
+      .map((empleado) => String(empleado?.username || "").trim().toLowerCase())
+      .filter(Boolean);
+
+    __universoUsuariosCache = {
+      expiresAt: Date.now() + 15_000,
+      promise: null,
+      activos: [...new Set(activos)],
+      operativos: [...new Set(operativos)],
+    };
+    return __universoUsuariosCache;
+  })();
+
+  try {
+    return await __universoUsuariosCache.promise;
+  } finally {
+    if (__universoUsuariosCache.promise) __universoUsuariosCache.promise = null;
+  }
+}
+
+// Universo general de Reportes: sólo empleados activos + `residual` como
+// excepción de negocio. Un usuario dado de baja deja de sumar en totales,
+// rankings, acuerdos y filtros aunque conserve gestiones históricas en Mango.
 async function activeUserFilter(rawOperator) {
   const requested = splitCSV(rawOperator)
     .map((value) => String(value || "").trim().toLowerCase())
     .filter(Boolean);
+  const { activos } = await universoUsuariosReportes();
+  const activosSet = new Set(activos);
 
   if (requested.length) {
-    const selected = requested.filter((value) => esUsuarioVisibleEnReportesControl(value));
-    if (!selected.length) return { $in: ["__cobrina_sin_usuario_visible__"] };
+    const selected = requested.filter((value) => activosSet.has(value));
+    if (!selected.length) return { $in: ["__cobrina_sin_usuario_activo__"] };
     return selected.length === 1 ? selected[0] : { $in: selected };
   }
 
-  const ocultos = [...USUARIOS_OCULTOS_REPORTES_CONTROL];
-  return ocultos.length ? { $nin: ocultos } : { $exists: true };
+  return { $in: activos.length ? activos : ["__cobrina_sin_usuario_activo__"] };
 }
 
-// Control individual y totales usan el MISMO universo de usuarios reales.
-// Ya no se excluyen administración, supervisión ni super-admin de la muestra.
+// Control de gestiones / asistencia: exclusivamente operadores y operadores VIP
+// activos, con las exclusiones de conducción definidas en controlEquipo.js.
 async function controlledActiveUserFilter(rawOperator) {
-  return activeUserFilter(rawOperator);
+  const requested = splitCSV(rawOperator)
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean);
+  const { operativos } = await universoUsuariosReportes();
+  const operativosSet = new Set(operativos);
+
+  if (requested.length) {
+    const selected = requested.filter((value) => operativosSet.has(value));
+    if (!selected.length) return { $in: ["__cobrina_sin_operador_activo__"] };
+    return selected.length === 1 ? selected[0] : { $in: selected };
+  }
+
+  return { $in: operativos.length ? operativos : ["__cobrina_sin_operador_activo__"] };
 }
 
 // Normaliza un string de fecha (dd/mm/yyyy, yyyy-mm-dd, serial Excel)
@@ -1214,6 +1272,7 @@ export async function catalogos(req, res) {
         username: String(empleado.username || "").trim(),
         nombre: String(empleado.nombre || "").trim(),
         role: String(empleado.role || "").trim(),
+        effectiveRole: getEffectiveRole(empleado?.role, empleado?.username),
         modalidadHorario: empleado?.horarioLaboral?.modalidad === "libre" ? "libre" : "fijo",
         entrada: String(empleado?.horarioLaboral?.entrada || "").trim(),
         salida: String(empleado?.horarioLaboral?.salida || "").trim(),
@@ -1230,15 +1289,24 @@ export async function catalogos(req, res) {
       ReporteGestion.distinct("usuario", base).collation({ locale: "es", strength: 1 }),
     ]);
 
-    // Si Mango trae actividad de alguien que todavía no está (o ya no está)
-    // en el padrón activo de Empleados, igual debe poder verse/filtrarse.
+    // No reincorporamos usuarios dados de baja sólo porque tengan historia en
+    // Mango. La única excepción es `residual`, que es una categoría de negocio
+    // y no una persona inactiva.
     const detallePorUsername = new Map(
       operadoresDetalle.map((item) => [String(item.username || "").trim().toLowerCase(), item])
     );
     for (const raw of usuariosGestionesRaw || []) {
       const username = String(raw || "").trim().toLowerCase();
-      if (!esUsuarioVisibleEnReportesControl(username) || detallePorUsername.has(username)) continue;
-      const item = { username, nombre: "", role: "", modalidadHorario: "fijo", entrada: "", salida: "" };
+      if (!esUsuarioEspecialReportes(username) || detallePorUsername.has(username)) continue;
+      const item = {
+        username,
+        nombre: "",
+        role: "especial",
+        effectiveRole: "especial",
+        modalidadHorario: "fijo",
+        entrada: "",
+        salida: "",
+      };
       operadoresDetalle.push(item);
       detallePorUsername.set(username, item);
     }
@@ -2221,7 +2289,7 @@ export async function resumenDia(req, res) {
     const dniFilter = buildDniFilter(dni);
     if (dniFilter) matchDia.dni = dniFilter;
 
-    const activeFilter = await activeUserFilter(operador);
+    const activeFilter = await controlledActiveUserFilter(operador);
     const fEntidad = rxExactMulti(entidad, (s) => s.toUpperCase());
     const fTipo = rxExactMulti(tipoContacto);
     const fEstado = rxExactMulti(estadoCuenta);
@@ -2531,10 +2599,12 @@ export async function actividadRango(req, res) {
     if (fEstado) filtrosBase.estadoCuenta = fEstado;
     if (dniFilter) filtrosBase.dni = dniFilter;
 
-    // Totales y detalle individual usan el mismo universo: todos los usuarios
-    // reales activos, incluidos administración, supervisión y super-admin.
-    const filtrosEquipo = { ...filtrosBase, usuario: await activeUserFilter(operador) };
-    const filtrosControl = { ...filtrosBase, usuario: await controlledActiveUserFilter(operador) };
+    // Control operativo = únicamente operadores activos. Totales y filas usan
+    // el mismo universo para que ninguna cuenta administrativa/inactiva infle
+    // el encabezado del reporte.
+    const usuarioControl = await controlledActiveUserFilter(operador);
+    const filtrosEquipo = { ...filtrosBase, usuario: usuarioControl };
+    const filtrosControl = { ...filtrosBase, usuario: usuarioControl };
 
     const matchRango = {
       ...filtrosEquipo,

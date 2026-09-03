@@ -7,7 +7,10 @@ import { parseRowToAcuerdoPago } from "../utils/acuerdosPagoParser.js";
 import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
 import { fechaClaveArgentina } from "../utils/fecha.util.js";
-import { esUsuarioVisibleEnReportesControl, USUARIOS_OCULTOS_REPORTES_CONTROL } from "../utils/controlEquipo.js";
+import {
+  esUsuarioEspecialReportes,
+  esUsuarioVisibleEnReportesControl,
+} from "../utils/controlEquipo.js";
 
 /** Helpers token (igual estilo Reportes Gestiones) */
 function getUsuarioId(req) {
@@ -34,12 +37,56 @@ function ensureNoOperador(req, res) {
   return true;
 }
 
-function queryUsuariosVisiblesControl(query = {}, campo = "operador") {
-  const ocultos = [...USUARIOS_OCULTOS_REPORTES_CONTROL].map((username) => ({
-    [campo]: new RegExp(`^${String(username).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"),
-  }));
-  return ocultos.length ? { $and: [query, { $nor: ocultos }] } : query;
+let __acuerdosUsuariosActivosCache = { expiresAt: 0, promise: null, usernames: [] };
+
+async function usuariosActivosAcuerdos() {
+  const now = Date.now();
+  if (__acuerdosUsuariosActivosCache.expiresAt > now && __acuerdosUsuariosActivosCache.usernames.length) {
+    return __acuerdosUsuariosActivosCache.usernames;
+  }
+  if (__acuerdosUsuariosActivosCache.promise) return __acuerdosUsuariosActivosCache.promise;
+
+  __acuerdosUsuariosActivosCache.promise = (async () => {
+    const empleados = await Empleado.find({ isActive: { $ne: false } })
+      .select("username isActive")
+      .lean();
+    const usernames = empleados
+      .map((empleado) => String(empleado?.username || "").trim().toLowerCase())
+      .filter((username) => esUsuarioVisibleEnReportesControl(username));
+
+    if (esUsuarioEspecialReportes("residual") && !usernames.includes("residual")) {
+      usernames.push("residual");
+    }
+
+    const unicos = [...new Set(usernames)];
+    __acuerdosUsuariosActivosCache = {
+      expiresAt: Date.now() + 15_000,
+      promise: null,
+      usernames: unicos,
+    };
+    return unicos;
+  })();
+
+  try {
+    return await __acuerdosUsuariosActivosCache.promise;
+  } finally {
+    if (__acuerdosUsuariosActivosCache.promise) __acuerdosUsuariosActivosCache.promise = null;
+  }
 }
+
+async function queryUsuariosActivosControl(query = {}, campo = "operador") {
+  const usernames = await usuariosActivosAcuerdos();
+  const permitidos = usernames.map(
+    (username) => new RegExp(`^${escapeRegex(username)}$`, "i")
+  );
+  return {
+    $and: [
+      query,
+      { [campo]: { $in: permitidos.length ? permitidos : ["__cobrina_sin_usuario_activo__"] } },
+    ],
+  };
+}
+
 
 /** Scope:
  * - admin/super-admin => ver todo (salvo onlyMine=true)
@@ -524,7 +571,7 @@ export async function listar(req, res) {
     const { page = 1, limit = 200, sortKey, sortDir, fields = "min" } =
       req.query || {};
 
-    const q = queryUsuariosVisiblesControl(buildQueryFromReq(req));
+    const q = await queryUsuariosActivosControl(buildQueryFromReq(req));
 
     const pageNum = Math.max(1, Number(page) || 1);
     const limitNum = Math.min(1000, Math.max(1, Number(limit) || 200));
@@ -705,15 +752,16 @@ export async function catalogos(req, res) {
 
     throwIfAborted(req);
 
-    const empleados = (await Empleado.find({ isActive: true })
+    const empleados = (await Empleado.find({ isActive: { $ne: false } })
       .select("username")
       .lean()).map((e) => String(e.username || "").trim());
+    const baseActiva = await queryUsuariosActivosControl(base);
 
     const [opsData, entsData, estados, tipos] = await Promise.all([
-      AcuerdoPago.distinct("operador", base).collation({ locale: "es", strength: 1 }),
-      AcuerdoPago.distinct("entidad", base).collation({ locale: "es", strength: 1 }),
-      AcuerdoPago.distinct("estadoCuenta", base).collation({ locale: "es", strength: 1 }),
-      AcuerdoPago.distinct("tipoAcuerdo", base).collation({ locale: "es", strength: 1 }),
+      AcuerdoPago.distinct("operador", baseActiva).collation({ locale: "es", strength: 1 }),
+      AcuerdoPago.distinct("entidad", baseActiva).collation({ locale: "es", strength: 1 }),
+      AcuerdoPago.distinct("estadoCuenta", baseActiva).collation({ locale: "es", strength: 1 }),
+      AcuerdoPago.distinct("tipoAcuerdo", baseActiva).collation({ locale: "es", strength: 1 }),
     ]);
 
     const entidadesCatalogo = (await Entidad.find()
@@ -755,7 +803,7 @@ export async function exportarXlsx(req, res) {
       return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
-    const q = queryUsuariosVisiblesControl(buildQueryFromReq(req));
+    const q = await queryUsuariosActivosControl(buildQueryFromReq(req));
 
     const items = await AcuerdoPago.find(q)
       .sort({ fecha: -1, hora: -1 })
@@ -892,7 +940,7 @@ export async function analyticsResumen(req, res) {
       return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
-    const q = buildQueryFromReq(req);
+    const q = await queryUsuariosActivosControl(buildQueryFromReq(req));
 
     throwIfAborted(req);
 
@@ -987,7 +1035,7 @@ export async function resumenOperador(req, res) {
       return res.status(401).json({ error: "Token inválido o ausente." });
     if (!ensureNoOperador(req, res)) return;
 
-    const q = buildQueryFromReq(req);
+    const q = await queryUsuariosActivosControl(buildQueryFromReq(req));
 
     const rows = await AcuerdoPago.aggregate([
       { $match: q },
@@ -1047,7 +1095,7 @@ export async function acuerdosPorDia(req, res) {
     const range = monthRangeUTC(mes);
     if (!range) return res.status(400).json({ error: "Mes inválido. Usá mes=YYYY-MM" });
 
-    const q = { ...buildQueryFromReq(req), mes };
+    const q = await queryUsuariosActivosControl({ ...buildQueryFromReq(req), mes });
 
     const rows = await AcuerdoPago.aggregate([
       { $match: q },
@@ -1076,13 +1124,11 @@ export async function acuerdosPorDia(req, res) {
       it.dias[String(dia)] = (it.dias[String(dia)] || 0) + acuerdos;
     }
 
-    // opcional: incluir todos los operadores activos para que aparezcan con “-”
-    const empleados = (await Empleado.find({ isActive: true })
-      .select("username")
-      .lean()).map((e) => String(e.username || "").trim().toLowerCase());
-
+    // Incluir el mismo universo activo del resto del módulo para que los días
+    // sin acuerdos no reincorporen usuarios dados de baja.
+    const empleados = await usuariosActivosAcuerdos();
     for (const op of empleados) {
-      if (!op || !esUsuarioVisibleEnReportesControl(op)) continue;
+      if (!op) continue;
       if (!map.has(op)) map.set(op, { operador: op, total: 0, dias: {} });
     }
 
@@ -1120,8 +1166,11 @@ export async function analyticsCalendarioMes(req, res) {
     const range = monthRangeUTC(mes);
     if (!range) return res.status(400).json({ error: "Mes inválido. Usá mes=YYYY-MM" });
 
-    const q = { ...buildQueryFromReq(req), mes };
-    q.fecha = { $gte: range.start, $lte: range.end };
+    const q = await queryUsuariosActivosControl({
+      ...buildQueryFromReq(req),
+      mes,
+      fecha: { $gte: range.start, $lte: range.end },
+    });
 
     const agg = await AcuerdoPago.aggregate([
       { $match: q },
@@ -1186,7 +1235,7 @@ export async function ultimosTresMeses(req, res) {
 
     const results = [];
     for (const mes of months) {
-      const q = { ...buildQueryFromReq(req), mes };
+      const q = await queryUsuariosActivosControl({ ...buildQueryFromReq(req), mes });
       const [tot, dnisAgg, moneyAgg] = await Promise.all([
         AcuerdoPago.countDocuments(q),
         AcuerdoPago.aggregate([{ $match: q }, { $group: { _id: "$dni" } }, { $count: "n" }]),
@@ -1248,11 +1297,14 @@ export async function comparativo(req, res) {
     const baseFilters = { ...buildQueryFromReq(req) };
     delete baseFilters.fecha;
 
-    const qCur = { ...baseFilters, fecha: { $gte: d1, $lte: endOfDayUTC(d2) } };
-    const qPrev = {
+    const qCur = await queryUsuariosActivosControl({
+      ...baseFilters,
+      fecha: { $gte: d1, $lte: endOfDayUTC(d2) },
+    });
+    const qPrev = await queryUsuariosActivosControl({
       ...baseFilters,
       fecha: { $gte: prevStart, $lte: endOfDayUTC(prevEnd) },
-    };
+    });
 
     const calc = async (q) => {
       const [tot, dnisAgg, moneyAgg] = await Promise.all([
