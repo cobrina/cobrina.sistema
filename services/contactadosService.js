@@ -949,6 +949,7 @@ async function ejecutarSincronizacion() {
 }
 
 let ultimoErrorSync = "";
+let ultimoErrorSyncAt = 0;
 let ultimoInicioSync = null;
 let ultimoFinSync = null;
 
@@ -968,6 +969,7 @@ export async function sincronizarContactados() {
   syncEnCurso = ejecutarSincronizacion()
     .catch((error) => {
       ultimoErrorSync = error?.message || String(error || "Error de sincronización");
+      ultimoErrorSyncAt = Date.now();
       console.error("⚠️ Error sincronizando Contactados:", ultimoErrorSync);
       throw error;
     })
@@ -983,7 +985,8 @@ export function sincronizarContactadosEnSegundoPlano() {
   const ahora = Date.now();
   // Una misma pantalla puede pedir catálogo, listado y estadísticas casi juntas.
   // Evitamos disparar varias sincronizaciones incrementales consecutivas por esas lecturas.
-  if (syncEnCurso || ahora - ultimoDisparoBackgroundAt < BACKGROUND_SYNC_MIN_INTERVAL_MS) {
+  const backoffPorError = ultimoErrorSyncAt > 0 && ahora - ultimoErrorSyncAt < 5 * 60_000;
+  if (syncEnCurso || backoffPorError || ahora - ultimoDisparoBackgroundAt < BACKGROUND_SYNC_MIN_INTERVAL_MS) {
     return estadoSincronizacionContactados();
   }
   ultimoDisparoBackgroundAt = ahora;

@@ -10,7 +10,7 @@ export const heartbeat = async (req, res) => {
     }
 
     const ahora = new Date();
-    const [resultado] = await Promise.all([
+    const [actividadResult, asistenciaResult] = await Promise.allSettled([
       Empleado.updateOne(
         { _id: userId, isActive: { $ne: false } },
         { $set: { ultimaActividad: ahora } }
@@ -27,8 +27,15 @@ export const heartbeat = async (req, res) => {
       ),
     ]);
 
-    if (!resultado.matchedCount) {
+    const resultado = actividadResult.status === "fulfilled" ? actividadResult.value : null;
+    if (resultado && !resultado.matchedCount) {
       return res.status(404).json({ error: "Usuario no encontrado o inactivo" });
+    }
+    if (actividadResult.status === "rejected") {
+      console.warn("⚠️ Heartbeat: no se pudo persistir ultimaActividad:", actividadResult.reason?.message || actividadResult.reason);
+    }
+    if (asistenciaResult.status === "rejected") {
+      console.warn("⚠️ Heartbeat: no se pudo limpiar cierre pendiente de asistencia:", asistenciaResult.reason?.message || asistenciaResult.reason);
     }
 
     const ahoraSegundos = Math.floor(Date.now() / 1000);
@@ -66,6 +73,10 @@ export const heartbeat = async (req, res) => {
         ultimaActividad: ahora,
       },
       now: ahora.getTime(),
+      persistencia: {
+        actividad: actividadResult.status === "fulfilled",
+        asistencia: asistenciaResult.status === "fulfilled",
+      },
     });
   } catch (error) {
     console.error("❌ Error en heartbeat:", error?.message || error);

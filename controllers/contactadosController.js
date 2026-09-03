@@ -87,6 +87,18 @@ function mesRecuperadosPermitido(req, solicitado) {
 function syncMeta() {
   return estadoSincronizacionContactados();
 }
+
+async function expirarContactadosSeguro() {
+  try {
+    await expirarContactadosAhora();
+    return true;
+  } catch (error) {
+    // Expirar es una materialización de estado. Si Mongo rechaza temporalmente
+    // la escritura, las lecturas siguen pudiendo calcular vencimiento por fecha.
+    console.warn("⚠️ Contactados: no se pudo persistir expiración:", error?.message || error);
+    return false;
+  }
+}
 function rangoMes(mes) {
   const safe = /^\d{4}-\d{2}$/.test(norm(mes)) ? norm(mes) : mesActualArgentina();
   return { mes: safe, desde: inicioMesArgentina(safe), hasta: finMesArgentina(safe) };
@@ -104,6 +116,12 @@ function rangoMesCalendarioUTC(mes) {
 function filtroVencimientoMes(mes) {
   const { desde, hasta } = rangoMes(mes);
   return { venceAt: { $gte: desde, $lte: hasta } };
+}
+
+function filtroVencimientoMesHastaAhora(mes, now = new Date()) {
+  const { desde, hasta } = rangoMes(mes);
+  const limite = new Date(Math.min(hasta.getTime(), now.getTime()));
+  return { venceAt: { $gte: desde, $lte: limite } };
 }
 
 async function asegurarUniversoPorVencimiento(mes) {
@@ -514,7 +532,7 @@ async function obtenerVencidosData(req, { hoy = false, exportar = false } = {}) 
   }
 
   sincronizarContactadosEnSegundoPlano();
-  await expirarContactadosAhora();
+  const expiracionPersistida = await expirarContactadosSeguro();
   const mes = hoy
     ? mesActualArgentina()
     : (/^\d{4}-\d{2}$/.test(norm(req.query.mes)) ? norm(req.query.mes) : mesActualArgentina());
@@ -523,10 +541,10 @@ async function obtenerVencidosData(req, { hoy = false, exportar = false } = {}) 
   const filtro = {
     ...filtroScopeTabla(req, req.query),
     ...FILTRO_SIN_ESTADOS_TERMINALES,
-    estado: "vencida",
+    estado: expiracionPersistida ? "vencida" : { $in: ["abierta", "vencida"] },
     ...(hoy
-      ? { venceAt: { $gte: inicioDiaArgentina(now), $lte: finDiaArgentina(now) } }
-      : filtroVencimientoMes(mes)),
+      ? { venceAt: { $gte: inicioDiaArgentina(now), $lte: now } }
+      : filtroVencimientoMesHastaAhora(mes, now)),
   };
 
   const page = exportar ? 1 : Math.max(1, Number(req.query.page || 1));
@@ -593,13 +611,13 @@ export async function resumenAlerta(req, res) {
   try {
     sincronizarContactadosEnSegundoPlano();
     await asegurarUniversoPorVencimiento(mesActualArgentina());
-    await expirarContactadosAhora();
+    const expiracionPersistida = await expirarContactadosSeguro();
     const now = new Date();
     if (esMandoMedio(req)) {
       const vencidosHoy = await ContactadoVentana.countDocuments({
         ...FILTRO_SIN_ESTADOS_TERMINALES,
-        estado: "vencida",
-        venceAt: { $gte: inicioDiaArgentina(now), $lte: finDiaArgentina(now) },
+        estado: expiracionPersistida ? "vencida" : { $in: ["abierta", "vencida"] },
+        venceAt: { $gte: inicioDiaArgentina(now), $lte: now },
         operador: { $nin: [...USUARIOS_OCULTOS_REPORTES_CONTROL] },
       });
       return res.json({ ok: true, canViewAll: true, vencidosHoy, sync: syncMeta() });
@@ -841,14 +859,14 @@ async function calcularEstadisticasVencidos(req, { hoy = false } = {}) {
 
   await asegurarUniversoPorVencimiento(mes);
 
-  await expirarContactadosAhora();
+  const expiracionPersistida = await expirarContactadosSeguro();
   const filtro = {
     ...filtroScopeTabla(req, req.query),
     ...FILTRO_SIN_ESTADOS_TERMINALES,
-    estado: "vencida",
+    estado: expiracionPersistida ? "vencida" : { $in: ["abierta", "vencida"] },
     ...(hoy
-      ? { venceAt: { $gte: inicioDiaArgentina(now), $lte: finDiaArgentina(now) } }
-      : filtroVencimientoMes(mes)),
+      ? { venceAt: { $gte: inicioDiaArgentina(now), $lte: now } }
+      : filtroVencimientoMesHastaAhora(mes, now)),
   };
 
   let rows = await ContactadoVentana.find(filtro).lean();

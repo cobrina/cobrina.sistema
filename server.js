@@ -121,12 +121,25 @@ app.use(
   })
 );
 
-app.get("/health", (_req, res) => {
+app.get("/health", async (_req, res) => {
   const dbState = mongoose.connection.readyState;
+  let writable = null;
+  let mongoRole = "unknown";
+  if (dbState === 1) {
+    try {
+      const hello = await mongoose.connection.db.admin().command({ hello: 1 });
+      mongoRole = hello?.msg === "isdbgrid" ? "mongos" : (hello?.isWritablePrimary ? "primary" : "secondary");
+      writable = hello?.msg === "isdbgrid" || hello?.isWritablePrimary === true;
+    } catch {
+      // El health sigue informando conexión aunque el diagnóstico hello no responda.
+    }
+  }
   return res.status(dbState === 1 ? 200 : 503).json({
     ok: dbState === 1,
     service: "cobrina-rdc-backend",
     database: dbState === 1 ? "connected" : "unavailable",
+    writable,
+    mongoRole,
     timestamp: new Date().toISOString(),
   });
 });
@@ -258,7 +271,14 @@ async function start() {
     asistenciaTimer.unref?.();
 
     // Contactados se mantiene sincronizado con las gestiones importadas.
-    sincronizarContactados().catch(() => {});
+    // Damos unos segundos de aire al arranque para que login/importaciones no
+    // compitan con una reconstrucción mensual pesada apenas levanta el servidor.
+    const contactadosInicioTimer = setTimeout(() => {
+      sincronizarContactados().catch(() => {});
+      expirarContactadosAhora().catch(() => {});
+    }, 15_000);
+    contactadosInicioTimer.unref?.();
+
     const contactadosTimer = setInterval(() => {
       sincronizarContactados().catch(() => {});
       expirarContactadosAhora().catch(() => {});

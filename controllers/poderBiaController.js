@@ -49,7 +49,17 @@ function nombreArchivoSeguro(texto) {
 function prepararDescarga(res, registro, filename) {
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
-  res.setHeader("X-Cobrina-Document-Id", String(registro._id));
+  if (registro?._id) res.setHeader("X-Cobrina-Document-Id", String(registro._id));
+}
+
+function guardarHistorialPoderSinBloquear(payload) {
+  // El historial es útil, pero NUNCA debe impedir descargar un poder operativo.
+  // Si Mongo tiene un problema de escritura, el PDF igual se genera y el error
+  // queda registrado en consola para diagnóstico.
+  PoderBia.create(payload).catch((error) => {
+    console.error("⚠️ Poder generado, pero no se pudo guardar su historial:", error?.message || error);
+  });
+  return null;
 }
 
 function normalizarProductosGreenLight(body = {}) {
@@ -82,7 +92,7 @@ export async function generarPoderBia(req, res) {
       return res.status(400).json({ error: "Completá DNI, titular, cartera y una fecha válida" });
     }
 
-    const registro = await PoderBia.create({
+    const registro = guardarHistorialPoderSinBloquear({
       tipoPoder: "grupo-bia",
       dni,
       nombreTitular,
@@ -161,7 +171,7 @@ export async function generarPoderGreenLight(req, res) {
       });
     }
 
-    const registro = await PoderBia.create({
+    const registro = guardarHistorialPoderSinBloquear({
       tipoPoder: "green-light",
       dni,
       nombreTitular,

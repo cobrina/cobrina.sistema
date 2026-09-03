@@ -418,71 +418,88 @@ export async function cargar(req, res) {
     let insertados = 0;
     let duplicadosEnBD = 0;
 
-    try {
-      const inserted = await ReporteGestion.insertMany(docs, { ordered: false });
-      insertados = Array.isArray(inserted) ? inserted.length : 0;
-    } catch (e) {
-      const writeErrors =
-        e?.writeErrors ||
-        e?.result?.result?.writeErrors ||
-        e?.result?.writeErrors ||
-        e?.writeErrors?.errors ||
-        [];
+    // Importación idempotente por bloques. En vez de depender de insertMany +
+    // E11000, usamos upsert sobre EXACTAMENTE la misma clave única de negocio.
+    // Esto evita falsos "0 insertados / 0 duplicados" cuando Mongo devuelve un
+    // error global y además tolera mejor reintentos/transitorios.
+    const TAMANIO_BLOQUE_IMPORT = 500;
+    const claveGestion = (doc) => ({
+      propietario: doc.propietario,
+      dni: doc.dni,
+      fecha: doc.fecha,
+      hora: doc.hora,
+      usuario: doc.usuario,
+      tipoContacto: doc.tipoContacto,
+      resultadoGestion: doc.resultadoGestion,
+      estadoCuenta: doc.estadoCuenta,
+      entidad: doc.entidad,
+    });
 
-      const isDup = (w, top = e) => {
-        const code = w?.code ?? top?.code;
-        const codeName = w?.codeName ?? top?.codeName;
-        const msg = w?.errmsg || w?.message || w?.err?.message || top?.message || "";
-        return (
-          Number(code) === 11000 ||
-          String(codeName || "").toLowerCase() === "duplicatekey" ||
-          /E11000/i.test(String(msg))
-        );
-      };
+    const mensajeMongoSeguro = (error) => {
+      const code = error?.code ?? error?.cause?.code ?? error?.result?.code ?? "";
+      const codeName = error?.codeName ?? error?.cause?.codeName ?? "";
+      const raw = String(error?.message || error?.cause?.message || "Error de escritura en MongoDB")
+        .replace(/mongodb(?:\+srv)?:\/\/[^\s]+/gi, "mongodb://<oculto>")
+        .slice(0, 500);
+      return { code: String(code || ""), codeName: String(codeName || ""), message: raw };
+    };
 
-      const getIdx = (w) => {
-        if (Number.isFinite(w?.index)) return w.index;
-        if (Number.isFinite(w?.err?.index)) return w.err.index;
-        if (Number.isFinite(e?.index)) return e.index;
-        return null;
-      };
+    for (let desde = 0; desde < docs.length; desde += TAMANIO_BLOQUE_IMPORT) {
+      const bloque = docs.slice(desde, desde + TAMANIO_BLOQUE_IMPORT);
+      const operaciones = bloque.map((doc) => ({
+        updateOne: {
+          filter: claveGestion(doc),
+          update: { $setOnInsert: doc },
+          upsert: true,
+        },
+      }));
 
-      writeErrors.forEach((w) => {
-        const idx = getIdx(w);
-        const rowData = idx != null ? rawRows[idx] : null;
+      try {
+        const resultado = await ReporteGestion.bulkWrite(operaciones, { ordered: false });
+        insertados += Number(resultado?.upsertedCount || 0);
+        duplicadosEnBD += Number(resultado?.matchedCount || 0);
+      } catch (e) {
+        // Algunos drivers exponen conteos parciales aun cuando el bulk falla.
+        const parcial = e?.result || e?.writeResult || e?.cause?.result || null;
+        insertados += Number(parcial?.upsertedCount || parcial?.result?.nUpserted || 0);
+        duplicadosEnBD += Number(parcial?.matchedCount || parcial?.result?.nMatched || 0);
 
-        if (isDup(w)) {
-          duplicadosEnBD++;
-          errores.push({
-            fila: idx != null ? idx + 2 : "-",
-            motivo:
-              "Gestion duplicada en BD (dni+fecha+hora+usuario+tipoContacto+resultadoGestion+estadoCuenta+entidad)",
-            row: rowData || {},
-          });
-        } else {
-          const msg =
-            w?.errmsg || w?.message || w?.err?.message || e?.message || "Error de insercion";
-          errores.push({
-            fila: idx != null ? idx + 2 : "-",
-            motivo: msg,
-            row: rowData || {},
+        const writeErrors = Array.isArray(e?.writeErrors)
+          ? e.writeErrors
+          : Array.isArray(e?.result?.writeErrors)
+            ? e.result.writeErrors
+            : [];
+        const noDuplicados = writeErrors.filter((w) => Number(w?.code) !== 11000);
+        const duplicados = writeErrors.length - noDuplicados.length;
+        duplicadosEnBD += Math.max(0, duplicados);
+
+        if (noDuplicados.length) {
+          noDuplicados.slice(0, 100).forEach((w) => {
+            const idxLocal = Number.isFinite(w?.index) ? w.index : null;
+            const idxGlobal = idxLocal == null ? null : desde + idxLocal;
+            errores.push({
+              fila: idxGlobal == null ? "-" : idxGlobal + 2,
+              motivo: String(w?.errmsg || w?.message || e?.message || "Error de escritura").slice(0, 500),
+              row: idxGlobal == null ? {} : (rawRows[idxGlobal] || {}),
+            });
           });
         }
-      });
 
-      if (!writeErrors.length && /E11000/i.test(String(e?.message || ""))) {
-        errores.push({
-          fila: "-",
-          motivo: "Gestion duplicada en BD (detectado por mensaje E11000 sin indice de fila)",
-          row: {},
-        });
-        duplicadosEnBD++;
-      }
-
-      if (typeof e?.result?.result?.nInserted === "number") {
-        insertados = e.result.result.nInserted;
-      } else if (Array.isArray(e?.insertedDocs)) {
-        insertados = e.insertedDocs.length;
+        // CRÍTICO: antes un error global de escritura sin writeErrors era
+        // tragado y el frontend mostraba "procesado: 0 / 0 / 0". Nunca más.
+        if (!writeErrors.length || noDuplicados.length) {
+          const detalle = mensajeMongoSeguro(e);
+          console.error("❌ Mongo rechazó la importación de gestiones:", detalle);
+          return res.status(503).json({
+            error: "La base de datos no aceptó la escritura de gestiones. No vuelvas a cargar el archivo hasta resolver este error para evitar confusión.",
+            codigo: detalle.code || detalle.codeName || "MONGO_WRITE_FAILED",
+            detalle: detalle.message,
+            insertados,
+            duplicadosEnBD,
+            totalLeido: filas.length,
+            errores,
+          });
+        }
       }
     }
 

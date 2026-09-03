@@ -242,16 +242,21 @@ export async function miEstado(req, res) {
   try {
     await procesarCierresAutomaticos();
     const fechaClave = fechaClaveArgentina();
-    await Asistencia.updateOne(
-      { empleado: req.user.id, fechaClave, estado: "presente" },
-      {
-        $set: {
-          cierrePendienteDesde: null,
-          cierrePendienteHasta: null,
-          motivoCierrePendiente: "",
-        },
-      }
-    );
+    try {
+      await Asistencia.updateOne(
+        { empleado: req.user.id, fechaClave, estado: "presente" },
+        {
+          $set: {
+            cierrePendienteDesde: null,
+            cierrePendienteHasta: null,
+            motivoCierrePendiente: "",
+          },
+        }
+      );
+    } catch (error) {
+      // Consultar el estado no debe romperse por una escritura auxiliar.
+      console.warn("⚠️ Asistencia mi-estado: no se pudo limpiar cierre pendiente:", error?.message || error);
+    }
 
     const [asistencia, empleado] = await Promise.all([
       Asistencia.findOne({ empleado: req.user.id, fechaClave }).lean(),
