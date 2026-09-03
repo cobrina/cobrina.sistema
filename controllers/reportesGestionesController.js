@@ -418,88 +418,112 @@ export async function cargar(req, res) {
     let insertados = 0;
     let duplicadosEnBD = 0;
 
-    // Importación idempotente por bloques. En vez de depender de insertMany +
-    // E11000, usamos upsert sobre EXACTAMENTE la misma clave única de negocio.
-    // Esto evita falsos "0 insertados / 0 duplicados" cuando Mongo devuelve un
-    // error global y además tolera mejor reintentos/transitorios.
-    const TAMANIO_BLOQUE_IMPORT = 500;
-    const claveGestion = (doc) => ({
-      propietario: doc.propietario,
-      dni: doc.dni,
-      fecha: doc.fecha,
-      hora: doc.hora,
-      usuario: doc.usuario,
-      tipoContacto: doc.tipoContacto,
-      resultadoGestion: doc.resultadoGestion,
-      estadoCuenta: doc.estadoCuenta,
-      entidad: doc.entidad,
-    });
+    // Importación con insertMany para conservar el comportamiento histórico:
+    // las gestiones duplicadas se identifican fila por fila y se devuelven en
+    // `errores`, de modo que el frontend pueda descargar el CSV de detalle.
+    // La unicidad sigue protegida por el índice ACTUAL que incluye propietario.
+    try {
+      const inserted = await ReporteGestion.insertMany(docs, { ordered: false });
+      insertados = Array.isArray(inserted) ? inserted.length : 0;
+    } catch (e) {
+      const writeErrors =
+        e?.writeErrors ||
+        e?.result?.result?.writeErrors ||
+        e?.result?.writeErrors ||
+        e?.writeErrors?.errors ||
+        [];
 
-    const mensajeMongoSeguro = (error) => {
-      const code = error?.code ?? error?.cause?.code ?? error?.result?.code ?? "";
-      const codeName = error?.codeName ?? error?.cause?.codeName ?? "";
-      const raw = String(error?.message || error?.cause?.message || "Error de escritura en MongoDB")
-        .replace(/mongodb(?:\+srv)?:\/\/[^\s]+/gi, "mongodb://<oculto>")
-        .slice(0, 500);
-      return { code: String(code || ""), codeName: String(codeName || ""), message: raw };
-    };
+      const isDup = (w, top = e) => {
+        const code = w?.code ?? top?.code;
+        const codeName = w?.codeName ?? top?.codeName;
+        const msg = w?.errmsg || w?.message || w?.err?.message || top?.message || "";
+        return (
+          Number(code) === 11000 ||
+          String(codeName || "").toLowerCase() === "duplicatekey" ||
+          /E11000/i.test(String(msg))
+        );
+      };
 
-    for (let desde = 0; desde < docs.length; desde += TAMANIO_BLOQUE_IMPORT) {
-      const bloque = docs.slice(desde, desde + TAMANIO_BLOQUE_IMPORT);
-      const operaciones = bloque.map((doc) => ({
-        updateOne: {
-          filter: claveGestion(doc),
-          update: { $setOnInsert: doc },
-          upsert: true,
-        },
-      }));
+      const getIdx = (w) => {
+        if (Number.isFinite(w?.index)) return w.index;
+        if (Number.isFinite(w?.err?.index)) return w.err.index;
+        if (Number.isFinite(e?.index)) return e.index;
+        return null;
+      };
 
-      try {
-        const resultado = await ReporteGestion.bulkWrite(operaciones, { ordered: false });
-        insertados += Number(resultado?.upsertedCount || 0);
-        duplicadosEnBD += Number(resultado?.matchedCount || 0);
-      } catch (e) {
-        // Algunos drivers exponen conteos parciales aun cuando el bulk falla.
-        const parcial = e?.result || e?.writeResult || e?.cause?.result || null;
-        insertados += Number(parcial?.upsertedCount || parcial?.result?.nUpserted || 0);
-        duplicadosEnBD += Number(parcial?.matchedCount || parcial?.result?.nMatched || 0);
+      let erroresNoDuplicados = 0;
 
-        const writeErrors = Array.isArray(e?.writeErrors)
-          ? e.writeErrors
-          : Array.isArray(e?.result?.writeErrors)
-            ? e.result.writeErrors
-            : [];
-        const noDuplicados = writeErrors.filter((w) => Number(w?.code) !== 11000);
-        const duplicados = writeErrors.length - noDuplicados.length;
-        duplicadosEnBD += Math.max(0, duplicados);
+      writeErrors.forEach((w) => {
+        const idx = getIdx(w);
+        const rowData = idx != null ? rawRows[idx] : null;
 
-        if (noDuplicados.length) {
-          noDuplicados.slice(0, 100).forEach((w) => {
-            const idxLocal = Number.isFinite(w?.index) ? w.index : null;
-            const idxGlobal = idxLocal == null ? null : desde + idxLocal;
-            errores.push({
-              fila: idxGlobal == null ? "-" : idxGlobal + 2,
-              motivo: String(w?.errmsg || w?.message || e?.message || "Error de escritura").slice(0, 500),
-              row: idxGlobal == null ? {} : (rawRows[idxGlobal] || {}),
-            });
+        if (isDup(w)) {
+          duplicadosEnBD++;
+          errores.push({
+            fila: idx != null ? idx + 2 : "-",
+            motivo:
+              "Gestion duplicada en BD (propietario+dni+fecha+hora+usuario+tipoContacto+resultadoGestion+estadoCuenta+entidad)",
+            row: rowData || {},
+          });
+        } else {
+          erroresNoDuplicados++;
+          const msg =
+            w?.errmsg || w?.message || w?.err?.message || e?.message || "Error de insercion";
+          errores.push({
+            fila: idx != null ? idx + 2 : "-",
+            motivo: String(msg).slice(0, 500),
+            row: rowData || {},
           });
         }
+      });
 
-        // CRÍTICO: antes un error global de escritura sin writeErrors era
-        // tragado y el frontend mostraba "procesado: 0 / 0 / 0". Nunca más.
-        if (!writeErrors.length || noDuplicados.length) {
-          const detalle = mensajeMongoSeguro(e);
-          console.error("❌ Mongo rechazó la importación de gestiones:", detalle);
-          return res.status(503).json({
-            error: "La base de datos no aceptó la escritura de gestiones. No vuelvas a cargar el archivo hasta resolver este error para evitar confusión.",
-            codigo: detalle.code || detalle.codeName || "MONGO_WRITE_FAILED",
-            detalle: detalle.message,
-            insertados,
-            duplicadosEnBD,
-            totalLeido: filas.length,
-            errores,
-          });
-        }
+      // Algunos drivers devuelven E11000 arriba sin writeErrors detallados.
+      if (!writeErrors.length && isDup(e)) {
+        errores.push({
+          fila: "-",
+          motivo:
+            "Gestion duplicada en BD (detectado por E11000 sin indice de fila)",
+          row: {},
+        });
+        duplicadosEnBD++;
+      }
+
+      if (typeof e?.result?.result?.nInserted === "number") {
+        insertados = e.result.result.nInserted;
+      } else if (typeof e?.result?.insertedCount === "number") {
+        insertados = e.result.insertedCount;
+      } else if (Array.isArray(e?.insertedDocs)) {
+        insertados = e.insertedDocs.length;
+      }
+
+      // Si Mongo falla globalmente (cuota, permisos, primary, etc.) NO lo
+      // disfrazamos de importación correcta. Los duplicados normales sí son
+      // una respuesta 200 con CSV de detalle, como antes.
+      const falloGlobalNoDuplicado = !writeErrors.length && !isDup(e);
+      if (falloGlobalNoDuplicado || erroresNoDuplicados > 0) {
+        const code = e?.code ?? e?.cause?.code ?? e?.result?.code ?? "";
+        const codeName = e?.codeName ?? e?.cause?.codeName ?? "";
+        const detalle = String(e?.message || e?.cause?.message || "Error de escritura en MongoDB")
+          .replace(/mongodb(?:\+srv)?:\/\/[^\s]+/gi, "mongodb://<oculto>")
+          .slice(0, 500);
+        console.error("❌ Mongo rechazó parte o toda la importación de gestiones:", {
+          code,
+          codeName,
+          detalle,
+          insertados,
+          duplicadosEnBD,
+          erroresNoDuplicados,
+        });
+        return res.status(503).json({
+          error:
+            "La base de datos rechazó parte o toda la escritura de gestiones. Revisá el detalle descargado antes de volver a cargar el archivo.",
+          codigo: String(code || codeName || "MONGO_WRITE_FAILED"),
+          detalle,
+          insertados,
+          duplicadosEnBD,
+          totalLeido: filas.length,
+          errores,
+        });
       }
     }
 

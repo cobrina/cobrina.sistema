@@ -743,7 +743,7 @@ export async function listarObservaciones(req, res) {
   }
 }
 
-async function calcularEstadisticasActivos(req) {
+export async function calcularEstadisticasActivos(req) {
   sincronizarContactadosEnSegundoPlano();
   const now = new Date();
   const rangoSolicitado = rangoMes(req.query.mes);

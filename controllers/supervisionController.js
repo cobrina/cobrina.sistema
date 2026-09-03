@@ -9,7 +9,6 @@ import Colchon from "../models/Colchon.js";
 import ReporteGestion from "../models/ReporteGestion.js";
 import NovedadRRHH from "../models/NovedadRRHH.js";
 import AcuerdoPago from "../models/AcuerdoPago.js";
-import ContactadoVentana from "../models/ContactadoVentana.js";
 import {
   horarioEfectivoParaFecha,
   minutosEsperadosEnRango,
@@ -28,6 +27,7 @@ import {
 import { actividadDeUsuarioEnFecha, horaGestionHHMM, resumirActividadMensual } from "../utils/actividadGestiones.js";
 import { filtrarEmpleadosControlados, usernamesControlados } from "../utils/controlEquipo.js";
 import { normalizeUsername } from "../config/roles.js";
+import { calcularEstadisticasActivos as calcularEstadisticasContactadosActivos } from "./contactadosController.js";
 import { transformarGestionEnAcuerdo, resolverEpisodiosAcuerdos, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
 import {
   claveFechaCalendario,
@@ -1572,105 +1572,38 @@ export async function resumenGestionesSupervision(req, res) {
 
 
 /**
- * Resumen liviano de Contactados para el Panel de Supervisión.
- * No dispara sincronizaciones ni reconstrucciones: usa el material ya generado
- * por el módulo Contactados. Así la apertura de Supervisión no compite con el
- * endpoint completo /contactados/estadisticas.
+ * Resumen de Contactados para el Panel de Supervisión.
+ *
+ * IMPORTANTE: usa EXACTAMENTE el mismo cálculo que /api/contactados/estadisticas.
+ * Antes este endpoint tenía una copia "liviana" que filtraba por mesOrigen y por
+ * empleados activos; después de la regla de arrastre entre meses eso dejó de ser
+ * equivalente y Supervisión mostraba números mucho menores que Contactados.
+ *
+ * La fuente canónica atribuye cada ventana al MES DE VENCIMIENTO (venceAt), incluye
+ * arrastres del mes anterior y aplica el mismo universo/visibilidad por operador.
  */
 export async function resumenContactadosSupervision(req, res) {
   const iniciadoEnMs = Date.now();
   try {
-    const mes = mesValido(req.query?.mes) || mesClaveArgentina();
-    const empleados = await Empleado.find({ isActive: { $ne: false } })
-      .select("username nombre role")
-      .lean()
-      .maxTimeMS(SUPERVISION_QUERY_MS);
-    const usuarios = [...usernamesControlados(empleados)];
-    const now = new Date();
-
-    const rows = await ContactadoVentana.find({
-      mesOrigen: mes,
-      operador: { $in: usuarios },
-      estado: { $in: ["abierta", "cumplida", "vencida"] },
-    })
-      .select("operador estado alertaAt criticoAt venceAt clickRealizadoAt esOrigenContactado calificacionResolucion")
-      .lean()
-      .maxTimeMS(SUPERVISION_QUERY_MS);
-
-    const cerradas = rows.filter((row) => ["cumplida", "vencida"].includes(row.estado));
-    const cumplidas = cerradas.filter((row) => row.estado === "cumplida");
-    const vencidas = cerradas.filter((row) => row.estado === "vencida");
-    const abiertas = rows.filter((row) => row.estado === "abierta" && new Date(row.venceAt) > now);
-    const pendientes = abiertas.filter((row) => new Date(row.alertaAt) <= now);
-
-    let vigente = 0;
-    let porVencer = 0;
-    let critico = 0;
-    for (const row of abiertas) {
-      if (now < new Date(row.alertaAt)) vigente += 1;
-      else if (now < new Date(row.criticoAt)) porVencer += 1;
-      else critico += 1;
-    }
-
-    const porOperador = new Map();
-    for (const row of [...cerradas, ...pendientes]) {
-      const operador = String(row.operador || "sin-operador");
-      const item = porOperador.get(operador) || {
-        operador,
-        cumplidos: 0,
-        vencidos: 0,
-        pendientes: 0,
-        totalCerrados: 0,
-        cumplimientoPct: 0,
-      };
-      if (row.estado === "cumplida") {
-        item.cumplidos += 1;
-        item.totalCerrados += 1;
-      } else if (row.estado === "vencida") {
-        item.vencidos += 1;
-        item.totalCerrados += 1;
-      } else {
-        item.pendientes += 1;
-      }
-      porOperador.set(operador, item);
-    }
-
-    const rendimiento = [...porOperador.values()]
-      .map((item) => ({
-        ...item,
-        cumplimientoPct: item.totalCerrados
-          ? Math.round((item.cumplidos * 1000) / item.totalCerrados) / 10
-          : 0,
-      }))
-      .sort((a, b) => b.cumplimientoPct - a.cumplimientoPct || b.totalCerrados - a.totalCerrados);
-
-    const cumplimientoPct = cerradas.length
-      ? Math.round((cumplidas.length * 1000) / cerradas.length) / 10
-      : 0;
-
+    const data = await calcularEstadisticasContactadosActivos(req);
     const payload = {
       ok: true,
-      mes,
-      canViewAll: true,
-      resumen: {
-        contactadosGenerados: rows.filter((row) => row.esOrigenContactado).length,
-        cumplidos: cumplidas.length,
-        vencidos: vencidas.length,
-        pendientes: pendientes.length,
-        cumplimientoPct,
-        vigente,
-        porVencer,
-        critico,
+      mes: data.mes,
+      canViewAll: data.canViewAll,
+      resumen: data.resumen,
+      rendimiento: data.rendimiento,
+      meta: {
+        duracionMs: Date.now() - iniciadoEnMs,
+        fuente: "contactados-estadisticas-canonicas",
+        criterioMes: "venceAt",
       },
-      rendimiento,
-      meta: { duracionMs: Date.now() - iniciadoEnMs, fuente: "contactados-materializados" },
     };
     res.set("Server-Timing", `supervision-contactados;dur=${payload.meta.duracionMs}`);
     return res.json(payload);
   } catch (error) {
-    console.error("Contactados liviano de Supervisión:", error);
-    const payload = { error: "No se pudo preparar el resumen liviano de Contactados" };
+    console.error("Contactados de Supervisión:", error);
+    const payload = { error: "No se pudo preparar el resumen de Contactados" };
     if (process.env.NODE_ENV !== "production") payload.detalle = String(error?.message || error || "Error desconocido");
-    return res.status(500).json(payload);
+    return res.status(error?.status || 500).json(payload);
   }
 }
