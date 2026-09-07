@@ -12,6 +12,7 @@ export const TIPOS_INTERLOCUTOR_VIGENTES = Object.freeze([
   "FAMILIAR_DIRECTO",
   "REFERENCIA",
   "TERCERO_PAGADOR",
+  "REPRESENTANTE_LEGAL",
   "NO_AUDITABLE",
 ]);
 
@@ -309,6 +310,36 @@ export const CRITERIOS_TERCERO_PAGADOR = Object.freeze(numerar([
   criterio("calidad", "Realiza correctamente el cierre de gestión / próxima acción en Mango", AYUDA_CIERRE_MANGO),
 ]));
 
+export const CRITERIOS_REPRESENTANTE_LEGAL = Object.freeze(numerar([
+  criterio("presentacion", "Se presenta completa, cordial y correctamente", AYUDA_PRESENTACION),
+  criterio("presentacion", "Identifica al abogado/representante, a quién representa y su vínculo con el titular", simpleHelp("Confirma nombre, carácter de representante y a qué titular/legajo refiere antes de avanzar.")),
+  criterio("presentacion", "Verifica que cuenta con autorización o representación suficiente antes de brindar información sensible", simpleHelp("Valida poder, autorización, referencia previa o alcance de representación según lo disponible en el legajo.", "Cuando sólo se brinda información general que no requiere validar representación.")),
+
+  criterio("negociacion", "Ubica correctamente entidad, legajo y saldo vigente", simpleHelp("Trabaja sobre la deuda correcta y comunica saldo/estado actualizado sin contradicciones.")),
+  criterio("negociacion", "Detecta con claridad el motivo de la consulta del representante", simpleHelp("Define si llama por saldo, documentación, reclamo, propuesta, cancelación, plan de pago o seguimiento.")),
+  criterio("negociacion", "Determina si el representante tiene facultades para negociar o sólo para solicitar información", simpleHelp("Antes de cerrar condiciones, confirma si puede formular/aceptar propuestas o si debe consultar al titular.")),
+  criterio("negociacion", "Brinda información de deuda y condiciones dentro del alcance que corresponde", simpleHelp("Informa lo necesario de forma precisa, sin exceder el alcance de representación ni asumir autorizaciones inexistentes.")),
+  criterio("negociacion", "Solicita y ordena la documentación necesaria para destrabar la gestión", simpleHelp("Identifica qué documento falta, quién debe enviarlo, por qué canal y para qué instancia.", "Cuando no hay documentación pendiente.")),
+  criterio("negociacion", "Presenta alternativas de pago en orden de mejor recupero cuando existe facultad para negociar", AYUDA_NEGOCIACION),
+  criterio("negociacion", "Trabaja una propuesta o contraoferta concreta sin limitarse a informar planes", AYUDA_NEGOCIACION),
+  criterio("negociacion", "Maneja objeciones legales/administrativas y distingue cuándo debe escalar el caso", simpleHelp("Responde lo que corresponde y deriva cuando la consulta requiere validación jurídica, documental o del cliente.")),
+  criterio("negociacion", "Conduce y mantiene el control de la llamada", AYUDA_CONDUCCION),
+
+  criterio("cierre", "Consigue una definición útil: pago, propuesta, documentación o próxima respuesta", AYUDA_COMPROMISO),
+  criterio("cierre", "Define monto y condición exacta cuando existe propuesta o acuerdo", simpleHelp("Deja monto, anticipo/cuotas/condición y alcance de la propuesta claramente establecidos.", "Cuando la llamada no contiene una propuesta económica.")),
+  criterio("cierre", "Define fecha concreta de pago, envío de documentación o respuesta", simpleHelp("Evita cierres abiertos: fija una fecha verificable para la próxima acción.")),
+  criterio("cierre", "Confirma quién realizará efectivamente el pago o quién debe autorizarlo", simpleHelp("Distingue si paga el titular, un tercero, el estudio jurídico o si el representante debe volver con autorización.", "Cuando no hay instancia de pago o propuesta.")),
+  criterio("cierre", "Confirma medios de pago y canal de envío/recepción de documentación", simpleHelp("Cierra con instrucciones concretas y canal válido para comprobantes o documentación.", "Cuando no corresponde informar medios o documentación.")),
+  criterio("cierre", "Deja responsable y próxima acción claramente definidos", simpleHelp("Queda claro qué hará Cobrina, qué hará el representante y cuándo se retoma el caso.")),
+
+  criterio("calidad", "Mantiene trato profesional, formal y claro acorde a un interlocutor legal", simpleHelp("Usa lenguaje preciso, respetuoso y comprensible sin perder firmeza.")),
+  criterio("calidad", "Evita afirmaciones legales inexactas, amenazas o compromisos que no puede sostener", simpleHelp("No inventa consecuencias, plazos, facultades ni condiciones; diferencia hechos del legajo de interpretaciones.")),
+  criterio("calidad", "Adapta la estrategia al rol del representante y no lo trata como si fuera el deudor", simpleHelp("Negocia cuando corresponde y, cuando no, orienta la llamada a información, documentación o próxima acción útil.")),
+  criterio("calidad", "Maneja correctamente reclamos, controversias o pedidos de respaldo", AYUDA_CONFLICTO),
+  criterio("calidad", "Registra en Mango identidad/representación, motivo, propuesta, documentación y próximo paso", simpleHelp("La observación permite reconstruir quién llamó, en qué carácter, qué pidió/ofreció y qué quedó pendiente.")),
+  criterio("calidad", "Realiza correctamente el cierre de gestión / próxima acción en Mango", AYUDA_CIERRE_MANGO),
+]));
+
 /* =========================
    FORMULARIOS HISTÓRICOS V1
    No se ofrecen para nuevas auditorías.
@@ -355,6 +386,7 @@ export const FORMULARIOS_AUDITORIA = Object.freeze({
   FAMILIAR_DIRECTO: { key: "FAMILIAR_DIRECTO", label: "Familiar directo / Pareja", version: 1, criterios: CRITERIOS_FAMILIAR_DIRECTO },
   REFERENCIA: { key: "REFERENCIA", label: "Referencia / Tercero no directo", version: 1, criterios: CRITERIOS_REFERENCIA },
   TERCERO_PAGADOR: { key: "TERCERO_PAGADOR", label: "Tercero pagador", version: 2, criterios: CRITERIOS_TERCERO_PAGADOR },
+  REPRESENTANTE_LEGAL: { key: "REPRESENTANTE_LEGAL", label: "Representante legal / Abogado", version: 1, criterios: CRITERIOS_REPRESENTANTE_LEGAL },
 });
 
 export const FORMULARIOS_LEGACY = Object.freeze({
@@ -369,6 +401,7 @@ export function normalizarTipoInterlocutor(value, fallback = "TITULAR") {
   if (["TERCERO/FAMILIAR/REFERENCIA", "TERCERO_FAMILIAR_REFERENCIA"].includes(raw)) return "TERCERO";
   if (["FAMILIAR", "FAMILIAR_DIRECTO/PAREJA", "FAMILIAR_DIRECTO_PAREJA"].includes(raw)) return "FAMILIAR_DIRECTO";
   if (["REFERENCIA/TERCERO_NO_DIRECTO", "REFERENCIA_TERCERO_NO_DIRECTO"].includes(raw)) return "REFERENCIA";
+  if (["ABOGADO", "ABOGADA", "REPRESENTANTE", "REPRESENTANTE_LEGAL/ABOGADO", "REPRESENTANTE_LEGAL_ABOGADO"].includes(raw)) return "REPRESENTANTE_LEGAL";
   return fallback;
 }
 

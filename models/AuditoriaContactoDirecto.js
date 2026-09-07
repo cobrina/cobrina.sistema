@@ -160,13 +160,13 @@ const AuditoriaContactoDirectoSchema = new Schema(
     // se interpretan como TITULAR desde el controlador, sin recalcular su score.
     tipoInterlocutor: {
       type: String,
-      enum: ["TITULAR", "FAMILIAR_DIRECTO", "REFERENCIA", "TERCERO", "TERCERO_PAGADOR", "NO_AUDITABLE"],
+      enum: ["TITULAR", "FAMILIAR_DIRECTO", "REFERENCIA", "TERCERO", "TERCERO_PAGADOR", "REPRESENTANTE_LEGAL", "NO_AUDITABLE"],
       default: "TITULAR",
       index: true,
     },
     formularioAplicado: {
       type: String,
-      enum: ["TITULAR", "FAMILIAR_DIRECTO", "REFERENCIA", "TERCERO", "TERCERO_PAGADOR", "NINGUNO"],
+      enum: ["TITULAR", "FAMILIAR_DIRECTO", "REFERENCIA", "TERCERO", "TERCERO_PAGADOR", "REPRESENTANTE_LEGAL", "NINGUNO"],
       default: "TITULAR",
       index: true,
     },

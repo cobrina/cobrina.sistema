@@ -774,11 +774,10 @@ function aggregateAudit(audits) {
 
   for (const audit of orderedAsc) {
     semaforos[audit.semaforo] = (semaforos[audit.semaforo] || 0) + 1;
-    const formulario = ["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(audit?.formularioAplicado)
-      ? audit.formularioAplicado
-      : ["TITULAR", "TERCERO", "TERCERO_PAGADOR"].includes(audit?.tipoInterlocutor)
-        ? audit.tipoInterlocutor
-        : "TITULAR";
+    const formularioRaw = String(
+      audit?.formularioAplicado || audit?.tipoInterlocutor || "TITULAR",
+    ).toUpperCase();
+    const formulario = formularioRaw === "NINGUNO" ? "TITULAR" : formularioRaw;
     for (const item of audit.items || []) {
       for (const rawId of item.fallosIds || []) {
         const id = Number(rawId);

@@ -33,6 +33,7 @@ export const USUARIOS_EXCLUIDOS_CONTROLES_OPERATIVOS = new Set([
   "ksalinas",
   "ceballos1988",
   "prougier",
+  "residual",
 ]);
 
 export function esUsuarioVisibleEnReportesControl(value) {

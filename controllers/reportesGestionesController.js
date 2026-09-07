@@ -463,6 +463,54 @@ export async function cargar(req, res) {
       });
     });
 
+    // Aviso administrativo: no frenamos la importación por diferencias con el
+    // padrón de Empleados, pero las exponemos para detectar rápidamente
+    // gestiones de usuarios dados de baja o que ni siquiera están cargados.
+    const conteoUsuariosArchivo = new Map();
+    for (const doc of docs) {
+      const usuario = normUser(doc?.usuario);
+      if (!usuario) continue;
+      conteoUsuariosArchivo.set(usuario, (conteoUsuariosArchivo.get(usuario) || 0) + 1);
+    }
+
+    let advertenciasOperadores = [];
+    const usuariosArchivo = Array.from(conteoUsuariosArchivo.keys());
+    if (usuariosArchivo.length) {
+      const empleadosArchivo = await Empleado.find({ username: { $in: usuariosArchivo } })
+        .select("username nombre role isActive")
+        .lean();
+      const empleadosPorUsuario = new Map(
+        empleadosArchivo.map((emp) => [normUser(emp?.username), emp]),
+      );
+
+      advertenciasOperadores = usuariosArchivo
+        .map((usuario) => {
+          const emp = empleadosPorUsuario.get(usuario);
+          const gestiones = conteoUsuariosArchivo.get(usuario) || 0;
+          if (!emp) {
+            return {
+              usuario,
+              gestiones,
+              estado: "NO_EXISTE",
+              mensaje: "El usuario no existe en Empleados.",
+            };
+          }
+          if (emp.isActive === false) {
+            return {
+              usuario,
+              nombre: String(emp?.nombre || "").trim(),
+              role: String(emp?.role || "").trim(),
+              gestiones,
+              estado: "INACTIVO",
+              mensaje: "El usuario está dado de baja/inactivo en Empleados.",
+            };
+          }
+          return null;
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.gestiones - a.gestiones || a.usuario.localeCompare(b.usuario));
+    }
+
     if (!docs.length) {
       return res.status(200).json({
         ok: true,
@@ -470,6 +518,7 @@ export async function cargar(req, res) {
         duplicadosEnBD: 0,
         totalProcesados: 0,
         errores,
+        advertenciasOperadores,
       });
     }
 
@@ -581,6 +630,7 @@ export async function cargar(req, res) {
           duplicadosEnBD,
           totalLeido: filas.length,
           errores,
+          advertenciasOperadores,
         });
       }
     }
@@ -599,6 +649,7 @@ export async function cargar(req, res) {
       duplicadosEnBD,
       totalProcesados: docs.length + (errores?.length || 0),
       errores,
+      advertenciasOperadores,
     });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();

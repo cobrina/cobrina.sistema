@@ -470,6 +470,7 @@ export async function catalogos(req, res) {
         { value: "FAMILIAR_DIRECTO", label: "Familiar directo / Pareja" },
         { value: "REFERENCIA", label: "Referencia / Tercero no directo" },
         { value: "TERCERO_PAGADOR", label: "Tercero pagador" },
+        { value: "REPRESENTANTE_LEGAL", label: "Representante legal / Abogado" },
         { value: "NO_AUDITABLE", label: "No auditable" },
       ],
       motivosNoAuditable: MOTIVOS_NO_AUDITABLE,
