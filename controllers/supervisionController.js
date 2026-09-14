@@ -30,6 +30,11 @@ import { normalizeUsername } from "../config/roles.js";
 import { calcularEstadisticasActivos as calcularEstadisticasContactadosActivos } from "./contactadosController.js";
 import { transformarGestionEnAcuerdo, resolverEpisodiosAcuerdos, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
 import {
+  acuerdoSigueEnUniversoActual,
+  clasificarSituacionAcuerdo,
+  enriquecerAcuerdosConEstadoCuentaActual,
+} from "../services/acuerdosEstadoActualService.js";
+import {
   claveFechaCalendario,
   fechaClaveArgentina,
   inicioDiaCalendarioUTC,
@@ -867,10 +872,19 @@ export async function resumenSupervision(req, res) {
     // La consulta de proyección ya contiene al período seleccionado. Transformamos
     // una sola vez y derivamos el subconjunto mensual en memoria; antes se hacía
     // una segunda consulta + un segundo parseo de las mismas gestiones.
-    const acuerdosProyeccionBase = (gestionesAcuerdoProyeccion || [])
+    const acuerdosProyeccionCrudos = (gestionesAcuerdoProyeccion || [])
       .map((gestion) => transformarGestionEnAcuerdo(gestion))
       .filter(Boolean)
-      .filter((acuerdo) => usuariosActivos.has(String(acuerdo.usuario || "").trim().toLowerCase()));
+      .filter((acuerdo) => usuariosActivos.has(String(acuerdo.usuario || "").trim().toLowerCase()))
+      // Supervisión es un snapshot por fecha: nunca incorpora un acuerdo creado
+      // después del día que se está revisando.
+      .filter((acuerdo) => String(acuerdo?.fecha || "").slice(0, 10) <= hastaPeriodoClave);
+
+    const acuerdosUniversoActual = await enriquecerAcuerdosConEstadoCuentaActual(
+      acuerdosProyeccionCrudos,
+      { fechaHasta: selectedHastaUTC, maxTimeMS: SUPERVISION_QUERY_MS }
+    );
+    const acuerdosProyeccionBase = acuerdosUniversoActual;
 
     const acuerdosPeriodoBase = acuerdosProyeccionBase.filter((acuerdo) => {
       const fecha = String(acuerdo?.fecha || "").slice(0, 10);
@@ -929,8 +943,15 @@ export async function resumenSupervision(req, res) {
       entidades,
       { disponible: crucePagosDisponible, motivo: crucePagosDisponible ? "" : "SIN_CRUCE_PAGOS" }
     );
-    const episodiosPeriodo = resolverEpisodiosAcuerdos(periodoVinculado);
-    const acuerdosValidos = episodiosPeriodo.rows;
+    const episodiosPeriodoBase = resolverEpisodiosAcuerdos(periodoVinculado);
+    const acuerdosValidos = (episodiosPeriodoBase.rows || [])
+      .map((row) => ({ ...row, ...clasificarSituacionAcuerdo(row) }))
+      .filter(acuerdoSigueEnUniversoActual);
+    const episodiosPeriodo = {
+      ...episodiosPeriodoBase,
+      rows: acuerdosValidos,
+      meta: { ...episodiosPeriodoBase.meta, acuerdosEfectivos: acuerdosValidos.length },
+    };
     const acuerdosConPagos = acuerdosValidos;
 
     const proyeccionVinculada = vincularPagosPosteriores(
@@ -939,12 +960,24 @@ export async function resumenSupervision(req, res) {
       entidades,
       { disponible: crucePagosDisponible, motivo: crucePagosDisponible ? "" : "SIN_CRUCE_PAGOS" }
     );
-    const episodiosProyeccion = resolverEpisodiosAcuerdos(proyeccionVinculada);
+    const episodiosProyeccionBase = resolverEpisodiosAcuerdos(proyeccionVinculada);
+    const efectivosProyeccionClasificados = (episodiosProyeccionBase.rows || [])
+      .map((row) => ({ ...row, ...clasificarSituacionAcuerdo(row) }));
+    const acuerdosExcluidosEstadoActual = efectivosProyeccionClasificados.filter((row) => !acuerdoSigueEnUniversoActual(row)).length;
+    const episodiosProyeccion = {
+      ...episodiosProyeccionBase,
+      rows: efectivosProyeccionClasificados.filter(acuerdoSigueEnUniversoActual),
+      meta: {
+        ...episodiosProyeccionBase.meta,
+        acuerdosEfectivos: efectivosProyeccionClasificados.filter(acuerdoSigueEnUniversoActual).length,
+      },
+    };
 
     // PROYECCIÓN DEL MES = suma del PRIMER PAGO esperado cuyo vencimiento cae
     // en el mes seleccionado, pero solo de episodios efectivos.
     const acuerdosProyectablesMes = episodiosProyeccion.rows.filter(
-      (acuerdo) => String(acuerdo.fechaPrimerPago || acuerdo.primerVencimiento || "").slice(0, 7) === mesSeleccionado
+      (acuerdo) => acuerdo.acuerdoProyectable !== false &&
+        String(acuerdo.fechaPrimerPago || acuerdo.primerVencimiento || "").slice(0, 7) === mesSeleccionado
     );
 
     const proyeccionPorOperadorMap = new Map();
@@ -1017,6 +1050,7 @@ export async function resumenSupervision(req, res) {
       // y no debe inflar el porcentaje de cumplimiento del primer vencimiento.
       const montoPrimerPagoCobrado = conPago ? Number(acuerdo.montoPrimerPagoCobrado || 0) : 0;
       const tipo = acuerdo.tipoAcuerdo || "Sin clasificar";
+      const proyectable = acuerdo.acuerdoProyectable !== false;
 
       if (usuarioControlado) {
         const actual = acuerdosPorOperadorMap.get(usuario) || {
@@ -1042,8 +1076,10 @@ export async function resumenSupervision(req, res) {
           tiposMap: new Map(),
         };
         actual.total += 1;
-        actual.montoTotal += Number(acuerdo.montoTotalAcuerdo || 0);
-        actual.primerPagoTotal += Number(acuerdo.primerPago || 0);
+        if (proyectable) {
+          actual.montoTotal += Number(acuerdo.montoTotalAcuerdo || 0);
+          actual.primerPagoTotal += Number(acuerdo.primerPago || 0);
+        }
         actual.primerPagoCobradoTotal += Number(acuerdo.montoPrimerPagoCobrado || 0);
         if (acuerdo.primerPagoCubierto) actual.primerosPagosCubiertos += 1;
         if (acuerdo.esReacuerdoEfectivo) actual.reacuerdosEfectivos += 1;
@@ -1054,14 +1090,14 @@ export async function resumenSupervision(req, res) {
           actual.sinPago += 1;
         }
         actual.tiposMap.set(tipo, (actual.tiposMap.get(tipo) || 0) + 1);
-        if (acuerdo.estadoVencimiento === "VENCIDO") {
+        if (proyectable && acuerdo.estadoVencimiento === "VENCIDO") {
           actual.vencidosHistoricos += 1;
           if (conPago) actual.vencidosConPago += 1;
           else actual.vencidos += 1;
         }
-        if (!conPago && acuerdo.estadoVencimiento === "VENCE HOY") actual.venceHoy += 1;
-        if (!conPago && acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") actual.proximos += 1;
-        if (["VENCIDO", "VENCE HOY"].includes(acuerdo.estadoVencimiento)) {
+        if (proyectable && !conPago && acuerdo.estadoVencimiento === "VENCE HOY") actual.venceHoy += 1;
+        if (proyectable && !conPago && acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") actual.proximos += 1;
+        if (proyectable && ["VENCIDO", "VENCE HOY"].includes(acuerdo.estadoVencimiento)) {
           actual.exigibles += 1;
           actual.primerPagoExigibleTotal += Number(acuerdo.primerPago || 0);
           if (conPago) {
@@ -1073,20 +1109,22 @@ export async function resumenSupervision(req, res) {
       }
 
       acuerdosPorTipoMap.set(tipo, (acuerdosPorTipoMap.get(tipo) || 0) + 1);
-      montoTotalAcuerdos += Number(acuerdo.montoTotalAcuerdo || 0);
-      primerPagoTotal += Number(acuerdo.primerPago || 0);
+      if (proyectable) {
+        montoTotalAcuerdos += Number(acuerdo.montoTotalAcuerdo || 0);
+        primerPagoTotal += Number(acuerdo.primerPago || 0);
+      }
       if (conPago) {
         acuerdosConPago += 1;
         montoPagadoAcuerdos += montoPagado;
       }
-      if (acuerdo.estadoVencimiento === "VENCIDO") {
+      if (proyectable && acuerdo.estadoVencimiento === "VENCIDO") {
         acuerdosVencidosHistoricos += 1;
         if (conPago) acuerdosVencidosConPago += 1;
         else acuerdosVencidos += 1;
       }
-      if (!conPago && acuerdo.estadoVencimiento === "VENCE HOY") acuerdosVenceHoy += 1;
-      if (!conPago && acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") acuerdosProximos += 1;
-      if (["VENCIDO", "VENCE HOY"].includes(acuerdo.estadoVencimiento)) {
+      if (proyectable && !conPago && acuerdo.estadoVencimiento === "VENCE HOY") acuerdosVenceHoy += 1;
+      if (proyectable && !conPago && acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") acuerdosProximos += 1;
+      if (proyectable && ["VENCIDO", "VENCE HOY"].includes(acuerdo.estadoVencimiento)) {
         acuerdosExigibles += 1;
         primerPagoExigibleTotal += Number(acuerdo.primerPago || 0);
         if (conPago) {
@@ -1381,6 +1419,7 @@ export async function resumenSupervision(req, res) {
           reemplazadosSinPago: episodiosPeriodo.meta.acuerdosReemplazadosSinPago,
           casosConMasDeUnEpisodio: episodiosPeriodo.meta.casosConMasDeUnEpisodio,
         },
+        excluidosEstadoCuentaActual: Number(acuerdosExcluidosEstadoActual || 0),
         fuente: "reporte-gestiones",
       },
       colchon: resumenColchon,

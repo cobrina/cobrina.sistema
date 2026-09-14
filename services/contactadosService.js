@@ -9,16 +9,21 @@ import {
   fechaHoraGestionArgentina,
   claveFechaArgentina,
   inicioMesArgentina,
+  inicioDiaArgentina,
   finMesArgentina,
+  finDiaArgentina,
 } from "../utils/contactadosTiempo.js";
 
-const CONTACTADO_RX = /contactad[oa]/i;
-const PAGO_A_IMPUTAR_RX = /pago\s+a\s+imputar/i;
-const ACUERDO_PAGO_RX = /^\s*acuerdo\s+de\s+pago(?:\s*[-–—:]?\s*cumplido)?\s*$/i;
+const CONTACTADO_RX = /^\s*contactad[oa]\s*$/i;
+const PAGO_A_IMPUTAR_RX = /^\s*pagos?\s+a\s+imputar\s*$/i;
+const INCOBRABLE_RX = /^\s*incobrable\s*$/i;
+const ACUERDO_PAGO_RX = /^\s*acuerdo\s+de\s+pago\s*$/i;
+const ACUERDO_CUMPLIDO_RX = /^\s*acuerdo(?:\s+de\s+pago)?\s+cumplido\s*$/i;
+const NO_VOLUNTAD_ARREGLO_RX = /^\s*no\s+tiene\s+voluntad\s+de\s+arreglo\s*$/i;
 const DIA_MS = 86_400_000;
 const SOLAPE_SYNC_MS = 5 * 60 * 1000;
-const SYNC_VERSION = "mensual-v3-fast";
-const ARRASTRE_SYNC_VERSION = "arrastre-v1";
+const SYNC_VERSION = "mensual-v8-fin-dia";
+const ARRASTRE_SYNC_VERSION = "arrastre-v4-fin-dia";
 const GESTION_SELECT = "_id dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero createdAt";
 const BACKGROUND_SYNC_MIN_INTERVAL_MS = 45_000;
 let syncEnCurso = null;
@@ -52,22 +57,108 @@ function mesClaveGestion(gestion = {}) {
   return `${fecha.getUTCFullYear()}-${String(fecha.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
+function entidadClave(obj = {}) {
+  // El nombre de entidad está normalizado a mayúsculas en ReporteGestion y es
+  // más estable para históricos donde entidadNumero todavía puede venir vacío.
+  const nombre = txt(obj?.entidad).toUpperCase();
+  if (nombre) return `e:${nombre}`;
+  const numero = Number(obj?.entidadNumero);
+  if (Number.isFinite(numero) && numero > 0) return `n:${numero}`;
+  return "e:SIN_ENTIDAD";
+}
+
+function casoKey(obj = {}) {
+  const dni = txt(obj?.dni).replace(/\D/g, "");
+  return dni ? `${dni}|${entidadClave(obj)}` : "";
+}
+
+function mismoCaso(a = {}, b = {}) {
+  const ka = casoKey(a);
+  const kb = casoKey(b);
+  return Boolean(ka && kb && ka === kb);
+}
+
+function estadoCuentaNormalizado(value) {
+  return txt(value).toLowerCase();
+}
+
+function esValorContactado(value) {
+  return CONTACTADO_RX.test(txt(value));
+}
+
+function aplicarEstadoActual(target, gestion, eventAt = null) {
+  if (!target || !gestion) return target;
+  const at = eventAt || fechaHoraGestionArgentina(gestion.fecha, gestion.hora);
+  target.estadoActual = txt(gestion.estadoCuenta);
+  target.ultimoOperador = normalizarUsername(gestion.usuario);
+  target.ultimaGestionAt = at || null;
+  target.ultimaGestionKey = gestion.__key || eventoKey(gestion);
+  return target;
+}
+
 export function esGestionPagoAImputar(gestion = {}) {
-  return PAGO_A_IMPUTAR_RX.test(`${txt(gestion.resultadoGestion)} | ${txt(gestion.estadoCuenta)}`);
+  return PAGO_A_IMPUTAR_RX.test(txt(gestion.estadoCuenta));
 }
 
 export function esGestionAcuerdoPago(gestion = {}) {
-  return ACUERDO_PAGO_RX.test(txt(gestion.resultadoGestion))
-    || ACUERDO_PAGO_RX.test(txt(gestion.estadoCuenta));
+  return ACUERDO_PAGO_RX.test(txt(gestion.estadoCuenta));
 }
 
+export function esGestionAcuerdoCumplido(gestion = {}) {
+  return ACUERDO_CUMPLIDO_RX.test(txt(gestion.estadoCuenta));
+}
+
+export function esGestionIncobrable(gestion = {}) {
+  return INCOBRABLE_RX.test(txt(gestion.estadoCuenta));
+}
+
+export function esResultadoSinVoluntadArreglo(gestion = {}) {
+  return NO_VOLUNTAD_ARREGLO_RX.test(txt(gestion.resultadoGestion));
+}
+
+export function esResultadoContactado(gestion = {}) {
+  return CONTACTADO_RX.test(txt(gestion.resultadoGestion));
+}
+
+// Estados de la Cuenta que sacan al caso del universo de Contactados sin
+// importar quién haya realizado la gestión. Son estados operativamente
+// incompatibles con un Contactado activo.
+export function esEstadoCuentaSalidaContactados(gestion = {}) {
+  return esGestionPagoAImputar(gestion)
+    || esGestionIncobrable(gestion)
+    || esGestionAcuerdoPago(gestion)
+    || esGestionAcuerdoCumplido(gestion);
+}
+
+// Para reconstrucciones/legacy también consideramos "No tiene voluntad de
+// arreglo" como terminal. Durante el flujo activo esa calificación sólo libera
+// la titularidad cuando la registra el operador dueño de la ventana.
 export function esGestionTerminalContactados(gestion = {}) {
-  return esGestionPagoAImputar(gestion) || esGestionAcuerdoPago(gestion);
+  return esEstadoCuentaSalidaContactados(gestion) || esResultadoSinVoluntadArreglo(gestion);
 }
 
+function datosCierreTerminal(gestion, eventAt) {
+  return {
+    estado: "cerrada_terminal",
+    cerradaAt: eventAt,
+    gestionResolucionKey: gestion.__key || eventoKey(gestion),
+    gestionResolucionId: gestion._id || null,
+    calificacionResolucion: calificacionGestion(gestion),
+    tipoContactoResolucion: txt(gestion.tipoContacto),
+    estadoCuentaResolucion: txt(gestion.estadoCuenta),
+  };
+}
+
+export function esEstadoCuentaContactado(gestion = {}) {
+  return CONTACTADO_RX.test(txt(gestion.estadoCuenta));
+}
+
+// IMPORTANTE: esto identifica una fila cuyo ESTADO DE LA CUENTA está en Contactado.
+// Que la fila sea un ORIGEN real se decide comparándola contra el estado anterior
+// del mismo caso (DNI + entidad). Así una gestión que simplemente encuentra el
+// caso ya Contactado no se convierte en un Contactado nuevo para ese operador.
 export function esGestionContactado(gestion = {}) {
-  const texto = `${txt(gestion.resultadoGestion)} | ${txt(gestion.estadoCuenta)}`;
-  return CONTACTADO_RX.test(texto) && !esGestionTerminalContactados(gestion);
+  return esEstadoCuentaContactado(gestion) && !esGestionTerminalContactados(gestion);
 }
 
 export function calificacionGestion(gestion = {}) {
@@ -141,14 +232,23 @@ function detectarTelefono(raw = "") {
   };
 }
 
-function ventanaDesdeGestion(gestion, { serieId, esOrigenContactado = false, telefonoFallback = null, mesOrigen = "" } = {}) {
+function ventanaDesdeGestion(gestion, {
+  serieId,
+  esOrigenContactado = false,
+  telefonoFallback = null,
+  mesOrigen = "",
+  metadataExistente = null,
+} = {}) {
   const iniciaAt = fechaHoraGestionArgentina(gestion.fecha, gestion.hora);
   const tel = detectarTelefono(gestion.telMailMarcado);
   const telefono = tel.telefonoVisible ? tel : (telefonoFallback || tel);
+  const venceBase = agregarHorasHabilesArgentina(iniciaAt, 72);
+  const key = gestion.__key || eventoKey(gestion);
   return {
-    serieId: serieId || randomUUID(),
+    serieId: serieId || metadataExistente?.serieId || randomUUID(),
     mesOrigen: mesOrigen || mesClaveGestion(gestion),
-    gestionInicioKey: eventoKey(gestion),
+    casoKey: casoKey(gestion),
+    gestionInicioKey: key,
     gestionInicioId: gestion._id || null,
     dni: txt(gestion.dni).replace(/\D/g, ""),
     nombreDeudor: txt(gestion.nombreDeudor),
@@ -162,13 +262,21 @@ function ventanaDesdeGestion(gestion, { serieId, esOrigenContactado = false, tel
     iniciaAt,
     alertaAt: agregarHorasHabilesArgentina(iniciaAt, 48),
     criticoAt: agregarHorasHabilesArgentina(iniciaAt, 60),
-    venceAt: agregarHorasHabilesArgentina(iniciaAt, 72),
+    // La regla operativa mantiene el caso vigente TODO el día en que completa
+    // las 72 horas hábiles. Recién vence al finalizar ese día en Argentina.
+    venceAt: finDiaArgentina(venceBase),
     estado: "abierta",
     esOrigenContactado,
     calificacionInicio: calificacionGestion(gestion),
     tipoContactoInicio: txt(gestion.tipoContacto),
     estadoCuentaInicio: txt(gestion.estadoCuenta),
     observacionGestionInicio: txt(gestion.observacionGestion).slice(0, 3000),
+    estadoActual: txt(gestion.estadoCuenta),
+    ultimoOperador: normalizarUsername(gestion.usuario),
+    ultimaGestionAt: iniciaAt,
+    ultimaGestionKey: key,
+    clickRealizadoAt: metadataExistente?.clickRealizadoAt || null,
+    clickRealizadoPor: metadataExistente?.clickRealizadoPor || "",
   };
 }
 
@@ -219,7 +327,7 @@ async function reconciliarEventoHistorico(gestion, eventAt, operador, dni, activ
     }
   );
 
-  // "Pago a imputar" informa que el pago ya fue comunicado. Resuelve la ventana
+  // Un estado terminal (o No tiene voluntad del titular) resuelve la ventana
   // que veníamos siguiendo, pero NO inicia una nueva ventana de Contactados.
   if (esGestionTerminalContactados(gestion)) {
     activeByPair.delete(`${operador}|${dni}`);
@@ -362,9 +470,68 @@ async function clavesYaProcesadas(keys = []) {
   return out;
 }
 
+async function gestionAnteriorMismoCaso(gestion, eventAt) {
+  const dni = txt(gestion.dni).replace(/\D/g, "");
+  if (!dni || !eventAt) return null;
+  const dia = diaUtc(gestion.fecha);
+  if (!dia) return null;
+  const filtro = {
+    borrado: { $ne: true },
+    dni,
+  };
+  const nombreEntidad = txt(gestion.entidad).toUpperCase();
+  const numero = Number(gestion.entidadNumero);
+  if (nombreEntidad) filtro.entidad = nombreEntidad;
+  else if (Number.isFinite(numero) && numero > 0) filtro.entidadNumero = numero;
+
+  const anteriores = [
+    { fecha: { $lt: dia } },
+    { fecha: dia, hora: { $lt: txt(gestion.hora) || "00:00:00" } },
+  ];
+  if (gestion._id) {
+    anteriores.push({ fecha: dia, hora: txt(gestion.hora) || "00:00:00", _id: { $lt: gestion._id } });
+  }
+  filtro.$or = anteriores;
+
+  return ReporteGestion.findOne(filtro)
+    .select(GESTION_SELECT)
+    .sort({ fecha: -1, hora: -1, _id: -1 })
+    .lean();
+}
+
+async function esTransicionRealContactadoDB(gestion, eventAt) {
+  if (!esGestionContactado(gestion)) return false;
+  const anterior = await gestionAnteriorMismoCaso(gestion, eventAt);
+  if (!anterior || !esValorContactado(anterior.estadoCuenta)) return true;
+
+  // Caso especial: el titular pudo haber liberado la cuenta con Resultado =
+  // "No tiene voluntad de arreglo" sin que Mango cambiara inmediatamente el
+  // Estado de la Cuenta. En ese escenario, el próximo operador que realmente
+  // registre Contactado (resultado + estado Contactado) puede tomar el caso.
+  if (!esResultadoContactado(gestion)) return false;
+  const keyCaso = casoKey(gestion);
+  if (!keyCaso) return false;
+  const ultimaVentana = await ContactadoVentana.findOne({
+    casoKey: keyCaso,
+    iniciaAt: { $lt: eventAt },
+  })
+    .sort({ iniciaAt: -1 })
+    .select("estado calificacionResolucion estadoCuentaResolucion cerradaAt")
+    .lean();
+  return Boolean(
+    ultimaVentana
+    && ultimaVentana.estado === "cerrada_terminal"
+    && esResultadoSinVoluntadArreglo({ resultadoGestion: ultimaVentana.calificacionResolucion })
+  );
+}
+
 async function procesarLoteGestiones(gestiones, { activeByPair, now, mesClave, reconstruirTardias = true }) {
   if (!gestiones.length) return { procesados: 0, leidos: 0, contactadosDetectados: 0 };
 
+  // activeByPair conserva el nombre por compatibilidad interna, pero desde V5 la
+  // clave es del CASO (DNI + entidad), no operador + DNI. La ventana conserva al
+  // operador dueño que generó el Contactado real.
+  const activeByCase = activeByPair;
   const unicos = new Map();
   for (const gestion of gestiones) {
     const key = eventoKey(gestion);
@@ -376,39 +543,20 @@ async function procesarLoteGestiones(gestiones, { activeByPair, now, mesClave, r
   let procesadosNuevos = 0;
   let contactadosDetectados = 0;
   for (const gestion of eventos) {
-    if (esGestionContactado(gestion)) contactadosDetectados += 1;
     if (procesadas.has(gestion.__key)) continue;
     const eventAt = fechaHoraGestionArgentina(gestion.fecha, gestion.hora);
     if (!eventAt) continue;
     const operador = normalizarUsername(gestion.usuario);
     const dni = txt(gestion.dni).replace(/\D/g, "");
-    if (!operador || !dni) continue;
+    const keyCaso = casoKey(gestion);
+    if (!operador || !dni || !keyCaso) continue;
 
-    const pairKey = `${operador}|${dni}`;
-    let activa = activeByPair.get(pairKey) || null;
+    let activa = activeByCase.get(keyCaso) || null;
 
-    // Una carga tardía puede traer una gestión anterior a la ventana que hoy
-    // está abierta. Primero intentamos insertarla dentro de una ventana histórica.
+    // Si llega una fila histórica anterior al inicio materializado, no puede
+    // cambiar el dueño actual. La reconstrucción V5 mensual ya ordena el histórico
+    // completo; este guard evita que una importación tardía robe la ventana viva.
     if (activa && eventAt.getTime() <= new Date(activa.iniciaAt).getTime()) {
-      const reconciliada = await reconciliarEventoHistorico(gestion, eventAt, operador, dni, activeByPair, now, mesClave);
-      if (reconciliada) {
-        procesadas.add(gestion.__key);
-        procesadosNuevos += 1;
-        continue;
-      }
-      const creadaHistorica = await crearContactadoHistoricoAntesDeVentana(
-        gestion,
-        eventAt,
-        operador,
-        dni,
-        activeByPair,
-        now,
-        mesClave
-      );
-      if (creadaHistorica) {
-        procesadas.add(gestion.__key);
-        procesadosNuevos += 1;
-      }
       continue;
     }
 
@@ -417,13 +565,61 @@ async function procesarLoteGestiones(gestiones, { activeByPair, now, mesClave, r
         { _id: activa._id, estado: "abierta" },
         { $set: { estado: "vencida", cerradaAt: activa.venceAt } }
       );
-      activeByPair.delete(pairKey);
+      activeByCase.delete(keyCaso);
       activa = null;
     }
 
     if (activa) {
-      const iniciaMs = new Date(activa.iniciaAt).getTime();
-      if (eventAt.getTime() <= iniciaMs) continue;
+      // Cualquier operador puede modificar el estado visible en Mango. Eso se
+      // refleja como estado actual / último operador, pero NO cambia la propiedad.
+      aplicarEstadoActual(activa, gestion, eventAt);
+      await ContactadoVentana.updateOne(
+        { _id: activa._id, estado: "abierta" },
+        {
+          $set: {
+            estadoActual: txt(gestion.estadoCuenta),
+            ultimoOperador: operador,
+            ultimaGestionAt: eventAt,
+            ultimaGestionKey: gestion.__key,
+          },
+        }
+      );
+
+      // Estos Estados de la Cuenta sacan el caso de Contactados inmediatamente,
+      // incluso si la gestión fue realizada por otra persona. No hay renovación.
+      if (esEstadoCuentaSalidaContactados(gestion)) {
+        await ContactadoVentana.updateOne(
+          { _id: activa._id, estado: "abierta" },
+          { $set: datosCierreTerminal(gestion, eventAt) }
+        );
+        activeByCase.delete(keyCaso);
+        procesadas.add(gestion.__key);
+        procesadosNuevos += 1;
+        continue;
+      }
+
+      // Sólo el operador dueño que originó el Contactado puede renovar sus 72 h.
+      // Si otro operador toca el caso, únicamente actualizamos Estado actual /
+      // Último operador y conservamos dueño y vencimiento.
+      if (operador !== normalizarUsername(activa.operador)) {
+        procesadas.add(gestion.__key);
+        procesadosNuevos += 1;
+        continue;
+      }
+
+      // Excepción de Paula: si el propio titular registra "No tiene voluntad de
+      // arreglo", libera el caso aunque todavía tenga vigencia. La próxima
+      // transición real a Contactado podrá generar un dueño nuevo.
+      if (esResultadoSinVoluntadArreglo(gestion)) {
+        await ContactadoVentana.updateOne(
+          { _id: activa._id, estado: "abierta" },
+          { $set: datosCierreTerminal(gestion, eventAt) }
+        );
+        activeByCase.delete(keyCaso);
+        procesadas.add(gestion.__key);
+        procesadosNuevos += 1;
+        continue;
+      }
 
       const estadoCierre = eventAt.getTime() >= new Date(activa.alertaAt).getTime()
         ? "cumplida"
@@ -444,22 +640,15 @@ async function procesarLoteGestiones(gestiones, { activeByPair, now, mesClave, r
         }
       );
 
-      if (esGestionTerminalContactados(gestion)) {
-        activeByPair.delete(pairKey);
-        procesadas.add(gestion.__key);
-        procesadosNuevos += 1;
-        continue;
-      }
-
       const nuevaData = ventanaDesdeGestion(gestion, {
         serieId: activa.serieId,
         esOrigenContactado: false,
         telefonoFallback: telefonoFallbackVentana(activa),
-        mesOrigen: activa.mesOrigen || mesClave,
+        mesOrigen: activa.mesOrigen || mesClaveGestion(gestion) || mesClave,
       });
       try {
         const nueva = await ContactadoVentana.create(nuevaData);
-        activeByPair.set(pairKey, nueva.toObject());
+        activeByCase.set(keyCaso, nueva.toObject());
         procesadas.add(gestion.__key);
         procesadosNuevos += 1;
       } catch (error) {
@@ -468,47 +657,21 @@ async function procesarLoteGestiones(gestiones, { activeByPair, now, mesClave, r
       continue;
     }
 
-    // En la reconstrucción inicial del mes los eventos vienen cronológicos, por
-    // lo que una gestión sin ventana activa y que NO es Contactado no puede
-    // aportar nada. Saltearla acá evita una consulta Mongo por cada gestión común
-    // y hace que la primera carga mensual sea muchísimo más rápida.
-    if (!reconstruirTardias && !esGestionContactado(gestion)) continue;
-
-    if (reconstruirTardias) {
-      const reconciliada = await reconciliarEventoHistorico(gestion, eventAt, operador, dni, activeByPair, now, mesClave);
-      if (reconciliada) {
-        procesadas.add(gestion.__key);
-        procesadosNuevos += 1;
-        continue;
-      }
-
-      // Si es un Contactado importado tarde y ya existe una ventana posterior,
-      // lo reconstruimos sin convertirlo erróneamente en una ventana abierta actual.
-      const creadaHistorica = await crearContactadoHistoricoAntesDeVentana(
-        gestion,
-        eventAt,
-        operador,
-        dni,
-        activeByPair,
-        now,
-        mesClave
-      );
-      if (creadaHistorica) {
-        procesadas.add(gestion.__key);
-        procesadosNuevos += 1;
-        continue;
-      }
-    }
-
+    // Sin dueño vigente, una fila Contactado sólo abre una serie si representa
+    // una transición REAL desde otro Estado de la Cuenta hacia Contactado.
     if (!esGestionContactado(gestion)) continue;
+    const esOrigenReal = await esTransicionRealContactadoDB(gestion, eventAt);
+    if (!esOrigenReal) continue;
+    contactadosDetectados += 1;
+
     const nuevaData = ventanaDesdeGestion(gestion, {
       serieId: randomUUID(),
       esOrigenContactado: true,
-      mesOrigen: mesClave || mesClaveGestion(gestion),
+      mesOrigen: mesClaveGestion(gestion) || mesClave,
     });
     try {
       const nueva = await ContactadoVentana.create(nuevaData);
-      activeByPair.set(pairKey, nueva.toObject());
+      activeByCase.set(keyCaso, nueva.toObject());
       procesadas.add(gestion.__key);
       procesadosNuevos += 1;
     } catch (error) {
@@ -520,8 +683,12 @@ async function procesarLoteGestiones(gestiones, { activeByPair, now, mesClave, r
 }
 
 async function expirarVencidas(now = new Date()) {
+  // V8: una ventana sigue operativa durante TODO el día argentino que figura
+  // como fecha de vencimiento. Esto además protege datos legacy cuyo venceAt
+  // quedó guardado con una hora intermedia: nunca pasan a histórico el mismo día.
+  const inicioHoy = inicioDiaArgentina(now);
   return ContactadoVentana.updateMany(
-    { estado: "abierta", venceAt: { $lte: now } },
+    { estado: "abierta", venceAt: { $lt: inicioHoy } },
     [{ $set: { estado: "vencida", cerradaAt: "$venceAt" } }]
   );
 }
@@ -529,31 +696,38 @@ async function expirarVencidas(now = new Date()) {
 async function prepararReconstruccionRapidaDelMes(mesClave) {
   const stateKey = `contactados:${SYNC_VERSION}:${mesClave}`;
   const existente = await ContactadoSyncState.findOne({ key: stateKey }).lean();
-  if (existente) return { reconstruir: false, state: existente };
+  if (existente) return { reconstruir: false, state: existente, metadataExistente: new Map() };
 
-  // Migración única desde las versiones iniciales. Esas versiones podían quedar
-  // procesando durante minutos y dejar ventanas parciales aunque el frontend ya
-  // hubiera agotado su timeout. Para garantizar un mes consistente, V3 recompone
-  // solamente el mes vigente una sola vez y no toca Reporte de Gestiones ni Pagos.
+  // V5 recompone el mes vigente porque cambia la unidad de propiedad: el dueño
+  // es quien produjo la transición real a ESTADO DE LA CUENTA = Contactado.
   const desde = inicioMesArgentina(mesClave);
   const hasta = finMesArgentina(mesClave);
   const filtroMes = {
     $or: [
       { mesOrigen: mesClave },
-      {
-        iniciaAt: { $gte: desde, $lte: hasta },
-        $or: [{ mesOrigen: { $exists: false } }, { mesOrigen: "" }],
-      },
+      // También se eliminan las renovaciones que empiezan este mes aunque la
+      // serie haya nacido el mes anterior. Se reconstruyen con el mismo serieId.
+      { iniciaAt: { $gte: desde, $lte: hasta } },
     ],
   };
-  const series = await ContactadoVentana.distinct("serieId", filtroMes);
-  if (series.length) await ContactadoObservacion.deleteMany({ serieId: { $in: series } });
+
+  // Conservamos metadatos por gestión para no perder checks ni el serieId cuando
+  // la ventana correcta ya existía. Las observaciones son por serieId y por eso
+  // NO se borran durante esta migración.
+  const existentesMes = await ContactadoVentana.find(filtroMes).lean();
+  const metadataExistente = new Map();
+  for (const row of existentesMes) {
+    if (!row.gestionInicioKey) continue;
+    metadataExistente.set(row.gestionInicioKey, {
+      serieId: row.serieId || "",
+      clickRealizadoAt: row.clickRealizadoAt || null,
+      clickRealizadoPor: row.clickRealizadoPor || "",
+    });
+  }
   await ContactadoVentana.deleteMany(filtroMes);
 
-  // Las marcas viejas se dejan como auditoría técnica, pero ya no gobiernan el
-  // módulo: V3 usa una clave mensual/versionada propia.
-  console.log(`⚡ Contactados ${mesClave}: preparando reconstrucción rápida del mes vigente.`);
-  return { reconstruir: true, state: null };
+  console.log(`⚡ Contactados ${mesClave}: preparando reconstrucción V5 por dueño real, liberación y estados terminales.`);
+  return { reconstruir: true, state: null, metadataExistente, ventanasExistentes: existentesMes };
 }
 
 function enBloques(items = [], size = 700) {
@@ -623,31 +797,110 @@ async function obtenerGestionesDeParesEnRango(pares, primerDia, ultimoDia) {
   return eventos;
 }
 
-function construirVentanasEnMemoria(eventos = [], { now, mesClave }) {
+async function obtenerGestionesDeCasosEnRango(casos, primerDia, ultimoDia) {
+  if (!casos?.size) return [];
+  const dnis = [...new Set([...casos].map((key) => String(key).split("|")[0]).filter(Boolean))];
+  const eventos = [];
+  for (const bloqueDnis of enBloques(dnis, 700)) {
+    const rows = await ReporteGestion.find({
+      borrado: { $ne: true },
+      fecha: { $gte: primerDia, $lte: ultimoDia },
+      dni: { $in: bloqueDnis },
+    })
+      .select(GESTION_SELECT)
+      .lean();
+    for (const row of rows) {
+      if (casos.has(casoKey(row))) eventos.push(row);
+    }
+  }
+  return eventos;
+}
+
+async function obtenerEstadosPreviosCasos(casos, antesDe) {
+  const out = new Map();
+  if (!casos?.size) return out;
+  const dnis = [...new Set([...casos].map((key) => String(key).split("|")[0]).filter(Boolean))];
+  for (const bloqueDnis of enBloques(dnis, 500)) {
+    const rows = await ReporteGestion.aggregate([
+      {
+        $match: {
+          borrado: { $ne: true },
+          dni: { $in: bloqueDnis },
+          fecha: { $lt: antesDe },
+        },
+      },
+      { $sort: { fecha: -1, hora: -1, _id: -1 } },
+      {
+        $group: {
+          _id: { dni: "$dni", entidad: "$entidad" },
+          dni: { $first: "$dni" },
+          entidadNumero: { $first: "$entidadNumero" },
+          entidad: { $first: "$entidad" },
+          estadoCuenta: { $first: "$estadoCuenta" },
+          usuario: { $first: "$usuario" },
+          fecha: { $first: "$fecha" },
+          hora: { $first: "$hora" },
+        },
+      },
+    ]).allowDiskUse(true);
+    for (const row of rows) {
+      const key = casoKey(row);
+      if (casos.has(key) && !out.has(key)) out.set(key, row);
+    }
+  }
+  return out;
+}
+
+async function metadataVentanasPorGestionKeys(keys = []) {
+  const out = new Map();
+  const unicos = [...new Set(keys.filter(Boolean))];
+  for (const bloque of enBloques(unicos, 3000)) {
+    const rows = await ContactadoVentana.find({ gestionInicioKey: { $in: bloque } })
+      .select("gestionInicioKey serieId clickRealizadoAt clickRealizadoPor")
+      .lean();
+    for (const row of rows) {
+      if (!row.gestionInicioKey || out.has(row.gestionInicioKey)) continue;
+      out.set(row.gestionInicioKey, {
+        serieId: row.serieId || "",
+        clickRealizadoAt: row.clickRealizadoAt || null,
+        clickRealizadoPor: row.clickRealizadoPor || "",
+      });
+    }
+  }
+  return out;
+}
+
+export function construirVentanasEnMemoria(eventos = [], {
+  now = new Date(),
+  estadosPrevios = new Map(),
+  metadataExistente = new Map(),
+} = {}) {
   const unicos = new Map();
   for (const gestion of eventos) {
     const key = eventoKey(gestion);
     if (!unicos.has(key)) unicos.set(key, { ...gestion, __key: key });
   }
   const ordenados = [...unicos.values()].sort(compararEventos);
-  const porPar = new Map();
+  const porCaso = new Map();
   for (const gestion of ordenados) {
-    const operador = normalizarUsername(gestion.usuario);
-    const dni = txt(gestion.dni).replace(/\D/g, "");
-    if (!operador || !dni) continue;
-    const key = `${operador}|${dni}`;
-    if (!porPar.has(key)) porPar.set(key, []);
-    porPar.get(key).push(gestion);
+    const key = casoKey(gestion);
+    if (!key || !normalizarUsername(gestion.usuario)) continue;
+    if (!porCaso.has(key)) porCaso.set(key, []);
+    porCaso.get(key).push(gestion);
   }
 
   const ventanas = [];
   let origenes = 0;
 
-  for (const gestionesPar of porPar.values()) {
+  for (const [keyCaso, gestionesCaso] of porCaso.entries()) {
     let activa = null;
-    for (const gestion of gestionesPar) {
+    let estadoAnterior = txt(estadosPrevios.get(keyCaso)?.estadoCuenta);
+    let liberadoPorNoVoluntad = false;
+
+    for (const gestion of gestionesCaso) {
       const eventAt = fechaHoraGestionArgentina(gestion.fecha, gestion.hora);
       if (!eventAt) continue;
+      const operador = normalizarUsername(gestion.usuario);
 
       if (activa && eventAt.getTime() > new Date(activa.venceAt).getTime()) {
         activa.estado = "vencida";
@@ -655,42 +908,77 @@ function construirVentanasEnMemoria(eventos = [], { now, mesClave }) {
         activa = null;
       }
 
-      if (!activa) {
-        if (!esGestionContactado(gestion)) continue;
+      const transicionAContactado = esGestionContactado(gestion)
+        && (!esValorContactado(estadoAnterior) || (liberadoPorNoVoluntad && esResultadoContactado(gestion)));
+
+      if (activa && eventAt.getTime() > new Date(activa.iniciaAt).getTime()) {
+        // Siempre mostramos el estado real más reciente aunque lo haya tocado otra persona.
+        aplicarEstadoActual(activa, gestion, eventAt);
+
+        // Un Estado de la Cuenta terminal saca el caso del universo de Contactados
+        // inmediatamente, aunque la gestión la haya hecho otro operador.
+        if (esEstadoCuentaSalidaContactados(gestion)) {
+          Object.assign(activa, datosCierreTerminal(gestion, eventAt));
+          activa = null;
+          liberadoPorNoVoluntad = false;
+          estadoAnterior = txt(gestion.estadoCuenta);
+          continue;
+        }
+
+        // Otro operador no puede renovar ni apropiarse del Contactado vigente.
+        if (operador !== normalizarUsername(activa.operador)) {
+          estadoAnterior = txt(gestion.estadoCuenta);
+          continue;
+        }
+
+        // Si el operador dueño marca "No tiene voluntad de arreglo", libera la
+        // titularidad aunque todavía queden horas de vigencia.
+        if (esResultadoSinVoluntadArreglo(gestion)) {
+          Object.assign(activa, datosCierreTerminal(gestion, eventAt));
+          activa = null;
+          liberadoPorNoVoluntad = true;
+          estadoAnterior = txt(gestion.estadoCuenta);
+          continue;
+        }
+
+        activa.estado = eventAt.getTime() >= new Date(activa.alertaAt).getTime()
+          ? "cumplida"
+          : "renovada_anticipada";
+        activa.cerradaAt = eventAt;
+        activa.gestionResolucionKey = gestion.__key;
+        activa.gestionResolucionId = gestion._id || null;
+        activa.calificacionResolucion = calificacionGestion(gestion);
+        activa.tipoContactoResolucion = txt(gestion.tipoContacto);
+        activa.estadoCuentaResolucion = txt(gestion.estadoCuenta);
+
+        const meta = metadataExistente.get(gestion.__key) || null;
         activa = ventanaDesdeGestion(gestion, {
-          serieId: randomUUID(),
+          serieId: activa.serieId,
+          esOrigenContactado: false,
+          telefonoFallback: telefonoFallbackVentana(activa),
+          mesOrigen: activa.mesOrigen || mesClaveGestion(gestion),
+          metadataExistente: meta,
+        });
+        ventanas.push(activa);
+        estadoAnterior = txt(gestion.estadoCuenta);
+        continue;
+      }
+
+      if (!activa && transicionAContactado) {
+        const meta = metadataExistente.get(gestion.__key) || null;
+        activa = ventanaDesdeGestion(gestion, {
+          serieId: meta?.serieId || randomUUID(),
           esOrigenContactado: true,
-          mesOrigen: mesClave,
+          mesOrigen: mesClaveGestion(gestion),
+          metadataExistente: meta,
         });
         ventanas.push(activa);
         origenes += 1;
-        continue;
+        liberadoPorNoVoluntad = false;
       }
 
-      if (eventAt.getTime() <= new Date(activa.iniciaAt).getTime()) continue;
-
-      activa.estado = eventAt.getTime() >= new Date(activa.alertaAt).getTime()
-        ? "cumplida"
-        : "renovada_anticipada";
-      activa.cerradaAt = eventAt;
-      activa.gestionResolucionKey = gestion.__key;
-      activa.gestionResolucionId = gestion._id || null;
-      activa.calificacionResolucion = calificacionGestion(gestion);
-      activa.tipoContactoResolucion = txt(gestion.tipoContacto);
-      activa.estadoCuentaResolucion = txt(gestion.estadoCuenta);
-
-      if (esGestionTerminalContactados(gestion)) {
-        activa = null;
-        continue;
-      }
-
-      activa = ventanaDesdeGestion(gestion, {
-        serieId: activa.serieId,
-        esOrigenContactado: false,
-        telefonoFallback: telefonoFallbackVentana(activa),
-        mesOrigen: mesClave,
-      });
-      ventanas.push(activa);
+      if (!esValorContactado(gestion.estadoCuenta)) liberadoPorNoVoluntad = false;
+      estadoAnterior = txt(gestion.estadoCuenta);
     }
 
     if (activa && new Date(activa.venceAt) <= now) {
@@ -723,61 +1011,70 @@ async function insertarVentanasPorBloques(ventanas = []) {
   return insertadas;
 }
 
-async function reconstruirMesRapido({ mesClave, primerDia, ultimoDia, now, paresExcluir = new Set() }) {
+async function reconstruirMesRapido({
+  mesClave,
+  primerDia,
+  ultimoDia,
+  now,
+  desdeAnalisis = null,
+  metadataSeed = new Map(),
+}) {
   const inicio = Date.now();
+  const desde = desdeAnalisis || primerDia;
 
-  // PASO 1: localizar únicamente las gestiones que realmente califican como
-  // Contactado. Ya no recorremos ni procesamos cada gestión común del mes.
+  // Candidatos por ESTADO DE LA CUENTA exclusivamente. Luego el constructor
+  // cronológico decide cuáles son transiciones reales hacia Contactado.
   const contactados = await ReporteGestion.find({
     borrado: { $ne: true },
-    fecha: { $gte: primerDia, $lte: ultimoDia },
-    $or: [
-      { resultadoGestion: CONTACTADO_RX },
-      { estadoCuenta: CONTACTADO_RX },
-    ],
+    fecha: { $gte: desde, $lte: ultimoDia },
+    estadoCuenta: CONTACTADO_RX,
   })
     .select(GESTION_SELECT)
     .lean();
 
   if (!contactados.length) {
-    console.log(`✅ Contactados ${mesClave}: 0 gestiones calificadas Contactado en el mes vigente.`);
-    return { leidos: 0, contactadosDetectados: 0, procesados: 0, origenes: 0 };
+    console.log(`✅ Contactados ${mesClave}: 0 filas con Estado de la Cuenta = Contactado en el período analizado.`);
+    return { leidos: 0, contactadosDetectados: 0, procesados: 0, origenes: 0, casosReconstruidos: new Set() };
   }
 
-  // PASO 2: sólo necesitamos las gestiones de DNI+operador que tuvieron por lo
-  // menos un Contactado. Todo el resto de reportegestions queda fuera del cálculo.
-  const pares = new Set();
-  for (const g of contactados) {
-    const operador = normalizarUsername(g.usuario);
-    const dni = txt(g.dni).replace(/\D/g, "");
-    if (!operador || !dni) continue;
-    const par = `${operador}|${dni}`;
-    // Los pares que llegan arrastrados desde el mes anterior se procesan contra
-    // la ventana REAL ya existente. Si los reconstruyéramos como un mes aislado,
-    // una gestión de septiembre podría convertirse erróneamente en un nuevo origen
-    // y dejar el seguimiento de agosto en el limbo.
-    if (paresExcluir?.has?.(par)) continue;
-    pares.add(par);
-  }
+  const casos = new Set(contactados.map((g) => casoKey(g)).filter(Boolean));
+  const [eventos, estadosPrevios, metadataDB] = await Promise.all([
+    obtenerGestionesDeCasosEnRango(casos, desde, ultimoDia),
+    obtenerEstadosPreviosCasos(casos, desde),
+    metadataVentanasPorGestionKeys(contactados.map((g) => eventoKey(g))),
+  ]);
 
-  if (!pares.size) {
-    console.log(`✅ Contactados ${mesClave}: todos los Contactados del corte pertenecen a pares con arrastre; se procesarán sobre la serie previa.`);
-    return { leidos: 0, contactadosDetectados: 0, procesados: 0, origenes: 0 };
-  }
+  const metadataExistente = new Map(metadataDB);
+  for (const [key, value] of metadataSeed || []) metadataExistente.set(key, value);
 
-  const eventos = await obtenerGestionesDeParesEnRango(pares, primerDia, ultimoDia);
+  const { ventanas } = construirVentanasEnMemoria(eventos, {
+    now,
+    estadosPrevios,
+    metadataExistente,
+  });
 
-  const { ventanas, origenes } = construirVentanasEnMemoria(eventos, { now, mesClave });
-  const insertadas = await insertarVentanasPorBloques(ventanas);
+  // Sólo materializamos las ventanas que INICIAN en el mes solicitado. Las filas
+  // del mes anterior se usan como contexto para conservar dueño y serie, pero no
+  // se duplican ni se reescriben.
+  const desdeMes = inicioMesArgentina(mesClave);
+  const hastaMes = finMesArgentina(mesClave);
+  const delMes = ventanas.filter((v) => {
+    const at = new Date(v.iniciaAt);
+    return at >= desdeMes && at <= hastaMes;
+  });
+  const insertadas = await insertarVentanasPorBloques(delMes);
+  const origenesMes = delMes.filter((v) => v.esOrigenContactado).length;
+
   console.log(
-    `✅ Contactados ${mesClave}: reconstrucción rápida · ${contactados.length} Contactados detectados · ` +
-    `${eventos.length} gestiones relevantes leídas · ${insertadas} ventanas creadas · ${Date.now() - inicio} ms.`
+    `✅ Contactados ${mesClave}: reconstrucción V5 · ${origenesMes} Contactados reales · ` +
+    `${eventos.length} gestiones del universo analizadas · ${insertadas} ventanas creadas · ${Date.now() - inicio} ms.`
   );
   return {
     leidos: eventos.length,
-    contactadosDetectados: contactados.length,
+    contactadosDetectados: origenesMes,
     procesados: insertadas,
-    origenes,
+    origenes: origenesMes,
+    casosReconstruidos: casos,
   };
 }
 
@@ -797,6 +1094,100 @@ function rangoDiasReporteMesCompleto(mesClave) {
   return { primerDia, ultimoDia };
 }
 
+function mapaVentanasAbiertasPorCaso(rows = []) {
+  const map = new Map();
+  const ordenadas = [...rows].sort((a, b) => new Date(b.iniciaAt || 0) - new Date(a.iniciaAt || 0));
+  for (const row of ordenadas) {
+    const key = row.casoKey || casoKey(row);
+    if (key && !map.has(key)) map.set(key, row);
+  }
+  return map;
+}
+
+async function refrescarEstadoActualVentanasAbiertas(now = new Date()) {
+  const abiertas = await ContactadoVentana.find({ estado: "abierta", venceAt: { $gt: now } })
+    .select("_id dni entidad entidadNumero casoKey operador iniciaAt estadoActual ultimoOperador ultimaGestionAt ultimaGestionKey")
+    .lean();
+  if (!abiertas.length) return 0;
+
+  const porCaso = new Map();
+  for (const row of abiertas) {
+    const key = row.casoKey || casoKey(row);
+    if (!key) continue;
+    if (!porCaso.has(key)) porCaso.set(key, []);
+    porCaso.get(key).push(row);
+  }
+  const dnis = [...new Set(abiertas.map((r) => txt(r.dni).replace(/\D/g, "")).filter(Boolean))];
+  const minima = new Date(Math.min(...abiertas.map((r) => new Date(r.iniciaAt).getTime())));
+  const desde = diaUtc(minima) || new Date(0);
+  const ultimas = new Map();
+
+  for (const bloqueDnis of enBloques(dnis, 500)) {
+    const rows = await ReporteGestion.aggregate([
+      {
+        $match: {
+          borrado: { $ne: true },
+          dni: { $in: bloqueDnis },
+          fecha: { $gte: desde },
+        },
+      },
+      { $sort: { fecha: -1, hora: -1, _id: -1 } },
+      {
+        $group: {
+          _id: { dni: "$dni", entidad: "$entidad" },
+          dni: { $first: "$dni" },
+          entidadNumero: { $first: "$entidadNumero" },
+          entidad: { $first: "$entidad" },
+          usuario: { $first: "$usuario" },
+          estadoCuenta: { $first: "$estadoCuenta" },
+          fecha: { $first: "$fecha" },
+          hora: { $first: "$hora" },
+          tipoContacto: { $first: "$tipoContacto" },
+          resultadoGestion: { $first: "$resultadoGestion" },
+          telMailMarcado: { $first: "$telMailMarcado" },
+          observacionGestion: { $first: "$observacionGestion" },
+        },
+      },
+    ]).allowDiskUse(true);
+    for (const row of rows) {
+      const key = casoKey(row);
+      if (porCaso.has(key) && !ultimas.has(key)) ultimas.set(key, row);
+    }
+  }
+
+  const ops = [];
+  for (const [key, ventanas] of porCaso.entries()) {
+    const gestion = ultimas.get(key);
+    if (!gestion) continue;
+    const at = fechaHoraGestionArgentina(gestion.fecha, gestion.hora);
+    for (const ventana of ventanas) {
+      if (!at || at.getTime() <= new Date(ventana.iniciaAt).getTime()) continue;
+      const set = {
+        casoKey: key,
+        estadoActual: txt(gestion.estadoCuenta),
+        ultimoOperador: normalizarUsername(gestion.usuario),
+        ultimaGestionAt: at,
+        ultimaGestionKey: eventoKey(gestion),
+      };
+      const salidaPorEstado = esEstadoCuentaSalidaContactados(gestion);
+      const salidaPorTitular = normalizarUsername(gestion.usuario) === normalizarUsername(ventana.operador)
+        && esResultadoSinVoluntadArreglo(gestion);
+      if (salidaPorEstado || salidaPorTitular) Object.assign(set, datosCierreTerminal(gestion, at));
+
+      ops.push({
+        updateOne: {
+          filter: { _id: ventana._id, estado: "abierta" },
+          update: { $set: set },
+        },
+      });
+    }
+  }
+  for (const bloque of enBloques(ops, 1000)) {
+    if (bloque.length) await ContactadoVentana.bulkWrite(bloque, { ordered: false });
+  }
+  return ops.length;
+}
+
 async function ejecutarSincronizacion() {
   const syncStartedAt = new Date();
   const now = syncStartedAt;
@@ -804,9 +1195,8 @@ async function ejecutarSincronizacion() {
   const mesAnterior = mesAnteriorClave(mesClave);
   const stateKey = `contactados:${SYNC_VERSION}:${mesClave}`;
 
-  // Antes de construir el mes vigente garantizamos que exista el mes anterior.
-  // Es indispensable en los primeros días del mes: una ventana iniciada el 31/08
-  // puede vencer o recibir seguimiento el 01/09, 02/09, etc.
+  // Conservamos preparado el mes anterior para históricos, pero la V5 reconstruye
+  // el mes vigente mirando también sus gestiones como contexto de propiedad.
   await asegurarMesContactados(mesAnterior);
 
   const prep = await prepararReconstruccionRapidaDelMes(mesClave);
@@ -816,14 +1206,6 @@ async function ejecutarSincronizacion() {
     ? new Date(Math.max(0, new Date(state.ultimoCreatedAt).getTime() - SOLAPE_SYNC_MS))
     : null;
   const { primerDia, ultimoDia } = rangoDiasReporteMesActual(mesClave, now);
-  const arrastreStateKey = `contactados:${ARRASTRE_SYNC_VERSION}:${mesClave}`;
-  const arrastreYaReprocesado = await ContactadoSyncState.findOne({ key: arrastreStateKey }).select("_id").lean();
-  // El cálculo de arrastres es una migración del corte mensual. Una vez marcada
-  // no volvemos a recorrer ventanas históricas cada cinco minutos. Si por cambio
-  // de versión hay reconstrucción mensual, sí lo recalculamos para no romper la serie.
-  const paresArrastre = (esPrimeraCarga || !arrastreYaReprocesado)
-    ? await obtenerParesArrastre(mesClave, primerDia)
-    : new Set();
 
   let procesadosNuevos = 0;
   let leidos = 0;
@@ -831,56 +1213,45 @@ async function ejecutarSincronizacion() {
   let contactadosDetectados = 0;
 
   if (esPrimeraCarga) {
-    // Detectamos pares cuyo ciclo nació antes del mes vigente pero todavía puede
-    // tocar este mes. Esos pares NO se reconstruyen como universos nuevos: primero
-    // se conserva su serie anterior y luego se aplican las gestiones del mes actual.
-    const r = await reconstruirMesRapido({ mesClave, primerDia, ultimoDia, now, paresExcluir: paresArrastre });
+    // Para resolver arrastres correctamente analizamos desde el primer día del
+    // mes anterior. Sólo se materializan las ventanas que comienzan este mes.
+    const { primerDia: primerDiaAnterior } = rangoDiasReporteMesCompleto(mesAnterior);
+    const r = await reconstruirMesRapido({
+      mesClave,
+      primerDia,
+      ultimoDia,
+      now,
+      desdeAnalisis: primerDiaAnterior,
+      metadataSeed: prep.metadataExistente || new Map(),
+    });
     procesadosNuevos = r.procesados;
     leidos = r.leidos;
     contactadosDetectados = r.contactadosDetectados;
-    diasProcesados = 1;
 
-    if (paresArrastre.size) {
-      const eventosArrastre = await obtenerGestionesDeParesEnRango(paresArrastre, primerDia, ultimoDia);
-      if (eventosArrastre.length) {
-        const abiertas = await ContactadoVentana.find({ estado: "abierta" }).lean();
-        const activeByPair = new Map(abiertas.map((v) => [`${v.operador}|${v.dni}`, v]));
-        const extra = await procesarLoteGestiones(eventosArrastre, {
-          activeByPair,
-          now,
-          mesClave,
-          reconstruirTardias: true,
-        });
-        procesadosNuevos += extra.procesados;
-        leidos += extra.leidos;
-        contactadosDetectados += extra.contactadosDetectados || 0;
-      }
+    // Series muy antiguas pueden seguir renovándose aunque durante el período de
+    // análisis ya no vuelvan a mostrar Estado de la Cuenta = Contactado. Esas
+    // ventanas no participan del error que corregimos y se restauran sin tocarlas.
+    const casosReconstruidos = r.casosReconstruidos || new Set();
+    const restaurar = (prep.ventanasExistentes || []).filter((row) => {
+      const key = row.casoKey || casoKey(row);
+      return key && !casosReconstruidos.has(key);
+    });
+    if (restaurar.length) {
+      await insertarVentanasPorBloques(restaurar);
+      procesadosNuevos += restaurar.length;
     }
+    diasProcesados = 1;
   } else {
-    // La cola activa es global, no mensual. Así una ventana iniciada en agosto
-    // puede ser cerrada/renovada correctamente por una gestión de septiembre.
     const abiertas = await ContactadoVentana.find({ estado: "abierta" }).lean();
-    const activeByPair = new Map(abiertas.map((v) => [`${v.operador}|${v.dni}`, v]));
+    const activeByPair = mapaVentanasAbiertasPorCaso(abiertas);
 
-    // Las actualizaciones son pequeñas: sólo registros importados desde el último
-    // corte y cuya FECHA pertenece al mes vigente. Esto sí puede procesarse en
-    // forma incremental sin reconstruir nada.
-    let gestionesNuevas = await ReporteGestion.find({
+    const gestionesNuevas = await ReporteGestion.find({
       borrado: { $ne: true },
       createdAt: { $gte: desdeCreated },
       fecha: { $gte: primerDia, $lte: ultimoDia },
     })
       .select(GESTION_SELECT)
       .lean();
-
-    // Migración no destructiva del corte de mes. Si esta versión se instala con
-    // septiembre ya iniciado, releemos UNA sola vez las gestiones del mes para
-    // pares arrastrados desde agosto. Las claves globales evitan duplicados y se
-    // preservan checks/observaciones existentes.
-    if (!arrastreYaReprocesado && paresArrastre.size) {
-      const replay = await obtenerGestionesDeParesEnRango(paresArrastre, primerDia, ultimoDia);
-      if (replay.length) gestionesNuevas = [...gestionesNuevas, ...replay];
-    }
 
     if (gestionesNuevas.length) {
       const resultado = await procesarLoteGestiones(gestionesNuevas, {
@@ -896,22 +1267,8 @@ async function ejecutarSincronizacion() {
     }
   }
 
-  if (!arrastreYaReprocesado && paresArrastre.size) {
-    await ContactadoSyncState.findOneAndUpdate(
-      { key: arrastreStateKey },
-      {
-        $set: {
-          key: arrastreStateKey,
-          mesClave,
-          ultimaEjecucionAt: new Date(),
-          gestionesLeidas: paresArrastre.size,
-        },
-      },
-      { upsert: true }
-    );
-  }
-
   await expirarVencidas(now);
+  await refrescarEstadoActualVentanasAbiertas(now);
   const eliminadasTerminales = await asegurarLimpiezaEstadosTerminalesMes(mesClave);
 
   await ContactadoSyncState.findOneAndUpdate(
@@ -932,8 +1289,8 @@ async function ejecutarSincronizacion() {
 
   if (!esPrimeraCarga && procesadosNuevos > 0) {
     console.log(
-      `✅ Contactados ${mesClave}: actualización · ${leidos} gestiones nuevas leídas · ` +
-      `${contactadosDetectados} Contactado · ${procesadosNuevos} eventos procesados.`
+      `✅ Contactados ${mesClave}: actualización V5 · ${leidos} gestiones nuevas leídas · ` +
+      `${contactadosDetectados} Contactados reales · ${procesadosNuevos} eventos aplicados.`
     );
   }
 
@@ -1000,8 +1357,13 @@ async function limpiarContinuacionesEstadosTerminales(mesClave) {
     $or: [
       { calificacionInicio: PAGO_A_IMPUTAR_RX },
       { estadoCuentaInicio: PAGO_A_IMPUTAR_RX },
+      { calificacionInicio: INCOBRABLE_RX },
+      { estadoCuentaInicio: INCOBRABLE_RX },
       { calificacionInicio: ACUERDO_PAGO_RX },
       { estadoCuentaInicio: ACUERDO_PAGO_RX },
+      { calificacionInicio: ACUERDO_CUMPLIDO_RX },
+      { estadoCuentaInicio: ACUERDO_CUMPLIDO_RX },
+      { calificacionInicio: NO_VOLUNTAD_ARREGLO_RX },
     ],
   });
   if (!series.length) return 0;
@@ -1071,7 +1433,7 @@ async function limpiarContinuacionesEstadosTerminales(mesClave) {
 
 export async function asegurarLimpiezaEstadosTerminalesMes(mesClave) {
   if (limpiezaTerminalMesConfirmada.has(mesClave)) return 0;
-  const key = `contactados:cleanup-terminales-v2:${mesClave}`;
+  const key = `contactados:cleanup-terminales-v3:${mesClave}`;
   const hecha = await ContactadoSyncState.findOne({ key }).select("_id").lean();
   if (hecha) {
     limpiezaTerminalMesConfirmada.add(mesClave);
@@ -1104,7 +1466,7 @@ export async function asegurarMesContactados(mesSolicitado) {
     return { mes: mesClave, preparado: true, desdeCacheMemoria: true };
   }
 
-  const stateKey = `contactados:historico-v3-terminales:${mesClave}`;
+  const stateKey = `contactados:historico-v8-fin-dia:${mesClave}`;
   const yaPreparado = await ContactadoSyncState.findOne({ key: stateKey }).select("_id").lean();
   if (yaPreparado) {
     mesesHistoricosConfirmados.add(mesClave);
@@ -1119,7 +1481,7 @@ export async function asegurarMesContactados(mesSolicitado) {
 
     // Limpieza compatible con históricos ya existentes: las versiones anteriores
     // podían crear una nueva ventana desde un estado terminal (Pago a imputar o
-    // Acuerdo de pago). Eliminamos esa continuación artificial, preservando el
+    // estados terminales o No tiene voluntad de arreglo. Eliminamos esa continuación artificial, preservando el
     // ciclo Contactado anterior, sus checks y las observaciones de la serie.
     const eliminadasTerminales = existentes ? await asegurarLimpiezaEstadosTerminalesMes(mesClave) : 0;
 

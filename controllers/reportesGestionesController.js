@@ -33,6 +33,11 @@ import {
   selloAcuerdo,
   TIPOS_ACUERDO,
 } from "../services/acuerdosGestionesService.js";
+import {
+  acuerdoSigueEnUniversoActual,
+  clasificarSituacionAcuerdo,
+  enriquecerAcuerdosConEstadoCuentaActual,
+} from "../services/acuerdosEstadoActualService.js";
 
 
 function validarConfirmacionDestructiva(req, fraseEsperada) {
@@ -1313,17 +1318,21 @@ export async function catalogos(req, res) {
 
     throwIfAborted(req);
 
-    const empleadosActivosTodos = await Empleado.find({ isActive: { $ne: false } })
-      .select("username nombre role horarioLaboral.modalidad horarioLaboral.entrada horarioLaboral.salida")
+    // Catálogo de Reportes: incluimos empleados activos e inactivos para que
+    // Supervisión pueda filtrar acuerdos/gestiones históricas de personas que
+    // ya no están. Las cuentas técnicas siguen excluidas por la regla visible.
+    const empleadosTodos = await Empleado.find({})
+      .select("username nombre role isActive horarioLaboral.modalidad horarioLaboral.entrada horarioLaboral.salida")
       .sort({ username: 1 })
       .lean();
-    const empleadosActivos = filtrarEmpleadosControlados(empleadosActivosTodos);
-    const operadoresDetalle = empleadosActivos
+    const operadoresDetalle = empleadosTodos
+      .filter((empleado) => esUsuarioVisibleEnReportesControl(empleado?.username))
       .map((empleado) => ({
         username: String(empleado.username || "").trim(),
         nombre: String(empleado.nombre || "").trim(),
         role: String(empleado.role || "").trim(),
         effectiveRole: getEffectiveRole(empleado?.role, empleado?.username),
+        activo: empleado?.isActive !== false,
         modalidadHorario: empleado?.horarioLaboral?.modalidad === "libre" ? "libre" : "fijo",
         entrada: String(empleado?.horarioLaboral?.entrada || "").trim(),
         salida: String(empleado?.horarioLaboral?.salida || "").trim(),
@@ -1340,20 +1349,20 @@ export async function catalogos(req, res) {
       ReporteGestion.distinct("usuario", base).collation({ locale: "es", strength: 1 }),
     ]);
 
-    // No reincorporamos usuarios dados de baja sólo porque tengan historia en
-    // Mango. La única excepción es `residual`, que es una categoría de negocio
-    // y no una persona inactiva.
+    // Si una gestión histórica pertenece a un usuario que ya no existe en la
+    // colección Empleados (o es `residual`), también lo incorporamos al filtro.
     const detallePorUsername = new Map(
       operadoresDetalle.map((item) => [String(item.username || "").trim().toLowerCase(), item])
     );
     for (const raw of usuariosGestionesRaw || []) {
       const username = String(raw || "").trim().toLowerCase();
-      if (!esUsuarioEspecialReportes(username) || detallePorUsername.has(username)) continue;
+      if (!esUsuarioVisibleEnReportesControl(username) || detallePorUsername.has(username)) continue;
       const item = {
         username,
         nombre: "",
-        role: "especial",
-        effectiveRole: "especial",
+        role: esUsuarioEspecialReportes(username) ? "especial" : "historico",
+        effectiveRole: esUsuarioEspecialReportes(username) ? "especial" : "historico",
+        activo: false,
         modalidadHorario: "fijo",
         entrada: "",
         salida: "",
@@ -3530,7 +3539,7 @@ const ACUERDOS_SORT_KEYS = new Set([
   "tipoContacto", "resultadoGestion", "estadoCuenta", "telMailMarcado", "observacionGestion",
   "estadoPagoAcuerdo", "cantidadPagosPosteriores", "montoPagosPosteriores", "ultimoPagoPosterior",
   "ultimaGestionMangoFecha", "ultimaGestionMangoHora", "ultimaGestionMangoUsuario",
-  "ultimaGestionMangoResultado",
+  "ultimaGestionMangoResultado", "ultimaGestionMangoEstadoCuenta", "estadoCuentaActual", "situacionAcuerdo",
 ]);
 
 const ACUERDOS_NUMERIC_SORT_KEYS = new Set([
@@ -3726,7 +3735,12 @@ async function detectarReacuerdosRecurrentes90Dias(req, { hasta = "", operador =
     };
   }
 
-  const paymentLink = await vincularPagosConAcuerdosSinRomper(base, { fechaHasta: end.toISOString().slice(0, 10) });
+  const baseConEstadoActual = await vincularUltimaGestionMango(base, req);
+  const paymentLink = await vincularPagosConAcuerdosSinRomper(baseConEstadoActual, { fechaHasta: end.toISOString().slice(0, 10) });
+  const episodiosRecurrentes = resolverEpisodiosAcuerdos(paymentLink.rows || []);
+  paymentLink.rows = (episodiosRecurrentes.rows || [])
+    .map((row) => ({ ...row, ...clasificarSituacionAcuerdo(row) }))
+    .filter(acuerdoSigueEnUniversoActual);
   if (!paymentLink.meta?.disponible) {
     return {
       disponible: false,
@@ -4026,9 +4040,9 @@ function resumenComparacionAcuerdos(summary, desde, hasta) {
   };
 }
 
-function ordenarAcuerdos(rows, rawKey = "fecha", rawDir = "desc") {
+function ordenarAcuerdos(rows, rawKey = "fecha", rawDir = "asc") {
   const key = ACUERDOS_SORT_KEYS.has(String(rawKey || "")) ? String(rawKey) : "fecha";
-  const dir = String(rawDir || "desc").toLowerCase() === "asc" ? "asc" : "desc";
+  const dir = String(rawDir || "asc").toLowerCase() === "desc" ? "desc" : "asc";
   const factor = dir === "asc" ? 1 : -1;
 
   rows.sort((a, b) => {
@@ -4047,105 +4061,21 @@ function ordenarAcuerdos(rows, rawKey = "fecha", rawDir = "desc") {
 
     if (comparison !== 0) return comparison * factor;
 
-    const byDate = String(b.fecha || "").localeCompare(String(a.fecha || ""));
-    if (byDate !== 0) return byDate;
-    const byTime = String(b.hora || "").localeCompare(String(a.hora || ""));
-    if (byTime !== 0) return byTime;
-    return String(b.id || "").localeCompare(String(a.id || ""));
+    const byDate = String(a.fecha || "").localeCompare(String(b.fecha || ""));
+    if (byDate !== 0) return byDate * factor;
+    const byTime = String(a.hora || "").localeCompare(String(b.hora || ""));
+    if (byTime !== 0) return byTime * factor;
+    return String(a.id || "").localeCompare(String(b.id || "")) * factor;
   });
 
   return { key, dir };
 }
 
 
-const claveEntidadGestion = (value = "") =>
-  String(value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .trim()
-    .toUpperCase();
-
-const clavesCasoGestion = (row = {}) => {
-  const dniNormalizado = String(row?.dni || "").replace(/\D/g, "");
-  if (!dniNormalizado) return [];
-  const numero = Number(row?.entidadNumero || 0);
-  const nombre = claveEntidadGestion(row?.entidad);
-  return [
-    numero > 0 ? `${dniNormalizado}|N:${numero}` : "",
-    nombre ? `${dniNormalizado}|T:${nombre}` : "",
-  ].filter(Boolean);
-};
-
 async function vincularUltimaGestionMango(acuerdos = [], req) {
-  if (!acuerdos.length) return acuerdos;
-
-  const dnis = [...new Set(
-    acuerdos.map((row) => String(row?.dni || "").replace(/\D/g, "")).filter(Boolean)
-  )];
-  if (!dnis.length) return acuerdos;
-
-  const dniVariants = [...new Set(
-    dnis.flatMap((dniValue) => {
-      const numeric = Number(dniValue);
-      return Number.isSafeInteger(numeric) ? [dniValue, numeric] : [dniValue];
-    })
-  )];
-
-  const gestiones = await ReporteGestion.find({
-    ...ownerScope(req),
-    borrado: { $ne: true },
-    dni: { $in: dniVariants },
-  })
-    .select(
-      "dni entidad entidadNumero fecha hora usuario resultadoGestion estadoCuenta tipoContacto observacionGestion"
-    )
-    .sort({ fecha: -1, hora: -1, _id: -1 })
-    .lean()
-    .maxTimeMS(30000);
-
-  const latestByKey = new Map();
-  for (const gestion of gestiones) {
-    const snapshot = {
-      ultimaGestionMangoFecha: gestion?.fecha
-        ? new Date(gestion.fecha).toISOString().slice(0, 10)
-        : "",
-      ultimaGestionMangoHora: String(gestion?.hora || ""),
-      ultimaGestionMangoUsuario: String(gestion?.usuario || ""),
-      ultimaGestionMangoResultado: String(gestion?.resultadoGestion || ""),
-      ultimaGestionMangoEstadoCuenta: String(gestion?.estadoCuenta || ""),
-      ultimaGestionMangoTipoContacto: String(gestion?.tipoContacto || ""),
-      ultimaGestionMangoObservacion: String(gestion?.observacionGestion || ""),
-    };
-    for (const key of clavesCasoGestion(gestion)) {
-      if (!latestByKey.has(key)) latestByKey.set(key, snapshot);
-    }
-  }
-
-  return acuerdos.map((acuerdo) => {
-    let latest = null;
-    for (const key of clavesCasoGestion(acuerdo)) {
-      latest = latestByKey.get(key);
-      if (latest) break;
-    }
-    if (!latest) {
-      return {
-        ...acuerdo,
-        ultimaGestionMangoFecha: "",
-        ultimaGestionMangoHora: "",
-        ultimaGestionMangoUsuario: "",
-        ultimaGestionMangoResultado: "",
-        ultimaGestionMangoEstadoCuenta: "",
-        ultimaGestionMangoTipoContacto: "",
-        ultimaGestionMangoObservacion: "",
-      };
-    }
-    const original = `${String(acuerdo?.fecha || "").slice(0, 10)}T${String(acuerdo?.hora || "00:00:00")}`;
-    const latestStamp = `${latest.ultimaGestionMangoFecha}T${latest.ultimaGestionMangoHora || "00:00:00"}`;
-    return {
-      ...acuerdo,
-      ...latest,
-      ultimaGestionMangoEsPosterior: Boolean(latest.ultimaGestionMangoFecha) && latestStamp > original,
-    };
+  return enriquecerAcuerdosConEstadoCuentaActual(acuerdos, {
+    scope: ownerScope(req),
+    maxTimeMS: 30000,
   });
 }
 
@@ -4160,17 +4090,29 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     dni,
     tipoAcuerdo,
     estadoVencimiento,
+    situacionAcuerdo = "activos",
     sortKey = "fecha",
-    sortDir = "desc",
+    sortDir = "asc",
     page = 1,
     limit = 100,
   } = req.query || {};
 
+  const situacionVista = !soloVencidos && String(situacionAcuerdo || "activos").trim().toLowerCase() === "bajados"
+    ? "bajados"
+    : "activos";
+  const necesitaEstadisticas = situacionVista === "activos" && !soloVencidos;
+
+  // Acuerdos debe conservar el historial de TODOS los operadores reales,
+  // incluso usuarios dados de baja y `residual`. Sólo se excluyen las cuentas
+  // técnicas/de prueba definidas para reportes. Si se filtra un operador,
+  // respetamos ese nombre aunque el empleado ya no esté activo.
   const match = {
     ...ownerScope(req),
     borrado: { $ne: true },
-    usuario: await activeUserFilter(operador),
+    ...filtroMongoUsuariosVisiblesControl("usuario"),
   };
+  const fOperadorAcuerdos = rxExactMulti(operador, (value) => value.toLowerCase());
+  if (fOperadorAcuerdos) match.usuario = fOperadorAcuerdos;
 
   const d1 = diaInicioUTC(desde);
   const d2 = diaFinUTC(hasta);
@@ -4196,26 +4138,33 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
 
   throwIfAborted(req);
 
+  // Regla V17: el período se determina EXCLUSIVAMENTE por la fecha en que
+  // se cargó/generó el acuerdo. No se arrastran acuerdos de meses anteriores
+  // aunque su vencimiento caiga dentro del período seleccionado.
   const agreementMatch = {
     ...match,
     resultadoGestion: /acuerdo/i,
   };
 
   const [totalGestiones, gestionesPorOperador, rawRows] = await Promise.all([
-    ReporteGestion.countDocuments(match).maxTimeMS(30000),
-    ReporteGestion.aggregate([
-      { $match: match },
-      { $group: { _id: "$usuario", gestiones: { $sum: 1 } } },
-      { $project: { _id: 0, operador: "$_id", gestiones: 1 } },
-      { $sort: { gestiones: -1, operador: 1 } },
-    ])
-      .option({ maxTimeMS: 30000 })
-      .collation({ locale: "es", strength: 1 }),
+    necesitaEstadisticas
+      ? ReporteGestion.countDocuments(match).maxTimeMS(30000)
+      : Promise.resolve(0),
+    necesitaEstadisticas
+      ? ReporteGestion.aggregate([
+          { $match: match },
+          { $group: { _id: "$usuario", gestiones: { $sum: 1 } } },
+          { $project: { _id: 0, operador: "$_id", gestiones: 1 } },
+          { $sort: { gestiones: -1, operador: 1 } },
+        ])
+          .option({ maxTimeMS: 30000 })
+          .collation({ locale: "es", strength: 1 })
+      : Promise.resolve([]),
     ReporteGestion.find(agreementMatch)
       .select(
         "dni nombreDeudor fecha hora usuario tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion entidad entidadNumero"
       )
-      .sort({ fecha: -1, hora: -1, _id: -1 })
+      .sort({ fecha: 1, hora: 1, _id: 1 })
       .lean()
       .maxTimeMS(30000),
   ]);
@@ -4229,64 +4178,145 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
   // pago, solo queda el más reciente.
   let acuerdosBase = rawRows
     .map((row) => transformarGestionEnAcuerdo(row))
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((row) => ({ ...row, esArrastrePeriodo: false, dentroPeriodoCarga: true }));
 
   acuerdosBase = await vincularUltimaGestionMango(acuerdosBase, req);
 
+  // Cruzamos Pagos una sola vez y resolvemos primero la secuencia COMPLETA de
+  // episodios por DNI + entidad. Recién después clasificamos cada episodio
+  // efectivo como ACTIVO, PAGADO_BAJADO o BAJADO. Así un acuerdo anterior sin
+  // pagos queda correctamente ANULADO X NUEVO aunque el acuerdo posterior tenga
+  // otra situación operativa.
   const paymentLink = await vincularPagosConAcuerdosSinRomper(acuerdosBase, { fechaHasta: hasta });
-  const episodios = resolverEpisodiosAcuerdos(paymentLink.rows);
-  const acuerdosPeriodoEfectivos = episodios.rows;
-  const recaudacionPeriodo = await calcularDesgloseRecaudacionAcuerdos({
-    acuerdosPeriodo: acuerdosPeriodoEfectivos,
-    desdeDate: d1,
-    hastaDate: d2,
-    operadorFilter: match.usuario,
-    entidadFilter: fEntidad,
-    dniFilter: fDni,
-  });
-  const paymentMeta = {
-    ...paymentLink.meta,
-    ...episodios.meta,
-    episodios: episodios.meta,
-    recaudacionPeriodo,
-  };
-  let acuerdosEfectivos = acuerdosPeriodoEfectivos;
-  let acuerdosAnulados = (episodios.descartados || []).map((row) => ({
+  const episodiosGlobal = resolverEpisodiosAcuerdos(paymentLink.rows || []);
+  const acuerdosEfectivosClasificados = (episodiosGlobal.rows || []).map((row) => ({
+    ...row,
+    ...clasificarSituacionAcuerdo(row),
+  }));
+
+  const acuerdosPeriodoEfectivos = acuerdosEfectivosClasificados.filter(acuerdoSigueEnUniversoActual);
+  const acuerdosBajadosEfectivosBase = acuerdosEfectivosClasificados.filter((row) => !acuerdoSigueEnUniversoActual(row));
+  const acuerdosAnuladosBase = (episodiosGlobal.descartados || []).map((row) => ({
     ...row,
     estadoVencimientoOriginal: row?.estadoVencimientoOriginal || row?.estadoVencimiento || "",
     estadoVencimiento: "ANULADO X NUEVO",
     estadoAcuerdo: "ANULADO X NUEVO",
     acuerdoAnuladoPorNuevo: true,
+    situacionAcuerdo: "ANULADO",
+    acuerdoBajado: true,
+    acuerdoAnulado: true,
+    acuerdoPagadoBajado: false,
+    acuerdoContabilizable: false,
+    acuerdoProyectable: false,
+    motivoBajaAcuerdo: "Anulado x nuevo (sin pagos)",
   }));
+
+  const acuerdosActivosGeneradosPeriodo = [...acuerdosPeriodoEfectivos];
+  const recaudacionPeriodo = necesitaEstadisticas
+    ? await calcularDesgloseRecaudacionAcuerdos({
+        acuerdosPeriodo: acuerdosActivosGeneradosPeriodo,
+        desdeDate: d1,
+        hastaDate: d2,
+        operadorFilter: match.usuario,
+        entidadFilter: fEntidad,
+        dniFilter: fDni,
+      })
+    : { recaudadoAcuerdosPeriodo: 0, recaudadoCarteraAnterior: 0, total: 0 };
+  const paymentMeta = {
+    ...paymentLink.meta,
+    ...episodiosGlobal.meta,
+    episodios: episodiosGlobal.meta,
+    recaudacionPeriodo,
+    excluidosEstadoCuentaActual: acuerdosBajadosEfectivosBase.length,
+    acuerdosBajadosCrudos: acuerdosBajadosEfectivosBase.length + acuerdosAnuladosBase.length,
+    acuerdosBajadosEfectivos: acuerdosBajadosEfectivosBase.length,
+    acuerdosAnuladosPorNuevo: acuerdosAnuladosBase.length,
+    acuerdosPagadoBajado: acuerdosPeriodoEfectivos.filter((row) => row.acuerdoPagadoBajado).length,
+    acuerdosArrastradosPeriodo: 0,
+  };
+
+  let acuerdosEfectivosActivos = [...acuerdosPeriodoEfectivos];
+  let acuerdosEfectivosBajados = [...acuerdosBajadosEfectivosBase];
+  let acuerdosAnuladosBajados = [...acuerdosAnuladosBase];
 
   const tiposSolicitados = splitCSV(tipoAcuerdo).map((value) => value.toLocaleLowerCase("es"));
   if (tiposSolicitados.length) {
     const tiposSet = new Set(tiposSolicitados);
-    acuerdosEfectivos = acuerdosEfectivos.filter((row) => tiposSet.has(String(row.tipoAcuerdo || "").toLocaleLowerCase("es")));
-    acuerdosAnulados = acuerdosAnulados.filter((row) => tiposSet.has(String(row.tipoAcuerdo || "").toLocaleLowerCase("es")));
+    const porTipo = (row) => tiposSet.has(String(row.tipoAcuerdo || "").toLocaleLowerCase("es"));
+    acuerdosEfectivosActivos = acuerdosEfectivosActivos.filter(porTipo);
+    acuerdosEfectivosBajados = acuerdosEfectivosBajados.filter(porTipo);
+    acuerdosAnuladosBajados = acuerdosAnuladosBajados.filter(porTipo);
   }
 
   const estadosSolicitados = splitCSV(estadoVencimiento).map((value) => value.toLocaleUpperCase("es"));
   if (estadosSolicitados.length) {
     const estadosSet = new Set(estadosSolicitados);
-    acuerdosEfectivos = acuerdosEfectivos.filter((row) => estadosSet.has(String(row.estadoVencimiento || "").toLocaleUpperCase("es")));
-    acuerdosAnulados = acuerdosAnulados.filter((row) => estadosSet.has(String(row.estadoVencimiento || "").toLocaleUpperCase("es")));
-  }
-  if (soloVencidos) {
-    acuerdosEfectivos = acuerdosEfectivos.filter((row) => row.estadoVencimiento === "VENCIDO");
-    acuerdosAnulados = [];
+    const porVencimiento = (row) => estadosSet.has(String(row.estadoVencimiento || "").toLocaleUpperCase("es"));
+    acuerdosEfectivosActivos = acuerdosEfectivosActivos.filter(porVencimiento);
+    acuerdosEfectivosBajados = acuerdosEfectivosBajados.filter(porVencimiento);
+    acuerdosAnuladosBajados = acuerdosAnuladosBajados.filter(porVencimiento);
   }
 
-  const acuerdos = [...acuerdosEfectivos, ...acuerdosAnulados];
+  if (soloVencidos) {
+    acuerdosEfectivosActivos = acuerdosEfectivosActivos.filter((row) => row.estadoVencimiento === "VENCIDO");
+  }
+
+  // ANULADO X NUEVO (sin pagos) ya no pertenece a Activos: se conserva en
+  // Bajados / Anulados / Recuperables para auditoría y eventual recupero.
+  const acuerdosActivosVista = [...acuerdosEfectivosActivos];
+  const acuerdosBajadosVista = [
+    ...acuerdosEfectivosBajados,
+    ...acuerdosAnuladosBajados,
+  ];
+  const acuerdos = soloVencidos
+    ? acuerdosActivosVista
+    : situacionVista === "bajados"
+    ? acuerdosBajadosVista
+    : acuerdosActivosVista;
+
   const appliedSort = ordenarAcuerdos(acuerdos, sortKey, sortDir);
-  const summary = resumirAcuerdos(acuerdosEfectivos, totalGestiones, gestionesPorOperador, paymentMeta);
-  summary.registrosAnuladosPorNuevo = acuerdosAnulados.length;
+  // Los KPIs SIEMPRE se calculan solo con acuerdos activos. Los bajados se
+  // conservan para recupero/seguimiento, pero nunca suman dinero ni productividad.
+  const acuerdosEfectivosActivosGeneradosPeriodo = [...acuerdosEfectivosActivos];
+  const episodiosSoloPeriodo = resolverEpisodiosAcuerdos(paymentLink.rows || []);
+  const efectivosActivosSoloPeriodo = (episodiosSoloPeriodo.rows || [])
+    .map((row) => ({ ...row, ...clasificarSituacionAcuerdo(row) }))
+    .filter(acuerdoSigueEnUniversoActual);
+  const paymentMetaResumen = {
+    ...paymentMeta,
+    ...episodiosSoloPeriodo.meta,
+    acuerdosEfectivos: efectivosActivosSoloPeriodo.length,
+    episodios: { ...episodiosSoloPeriodo.meta, acuerdosEfectivos: efectivosActivosSoloPeriodo.length },
+    recaudacionPeriodo,
+  };
+  const summary = necesitaEstadisticas
+    ? resumirAcuerdos(acuerdosEfectivosActivosGeneradosPeriodo, totalGestiones, gestionesPorOperador, paymentMetaResumen)
+    : {
+        totalGestiones: 0,
+        totalAcuerdos: 0,
+        porOperador: [],
+        porEntidad: [],
+        porTipo: [],
+        porDia: [],
+        integracionPagos: paymentMeta,
+        estadisticasDisponibles: false,
+      };
+  summary.registrosAnuladosPorNuevo = acuerdosAnuladosBajados.length;
+  summary.situacionVista = situacionVista;
+  summary.totalActivosVista = acuerdosActivosVista.length;
+  summary.totalBajadosVista = acuerdosBajadosVista.length;
+  summary.acuerdosBajadosEfectivos = acuerdosEfectivosBajados.length;
   // El control preventivo de reacuerdos de 90 días es una consulta adicional y
   // costosa (vuelve a cruzar acuerdos + pagos). Ya no bloquea la carga principal:
   // el frontend lo pide en segundo plano mediante su endpoint específico.
   const acuerdosVisibles = filtrarFilasReportesControl(acuerdos, (row) => row?.usuario);
+  const acuerdosActivosVisibles = filtrarFilasReportesControl(acuerdosActivosVista, (row) => row?.usuario);
+  const acuerdosBajadosVisibles = filtrarFilasReportesControl(acuerdosBajadosVista, (row) => row?.usuario);
+  summary.totalActivosVista = acuerdosActivosVisibles.length;
+  summary.totalBajadosVista = acuerdosBajadosVisibles.length;
 
-  if (paginate && desde && hasta) {
+  if (necesitaEstadisticas && paginate && desde && hasta) {
     const anteriorDesde = desplazarISOUnMesAtras(desde);
     const anteriorHasta = desplazarISOUnMesAtras(hasta);
     const anteriorD1 = diaInicioUTC(anteriorDesde);
@@ -4324,9 +4354,12 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
       let previousAgreementsBase = previousRawRows
         .map((row) => transformarGestionEnAcuerdo(row))
         .filter(Boolean);
+      previousAgreementsBase = await vincularUltimaGestionMango(previousAgreementsBase, req);
       const previousPaymentLink = await vincularPagosConAcuerdosSinRomper(previousAgreementsBase, { fechaHasta: anteriorHasta });
-      const previousEpisodes = resolverEpisodiosAcuerdos(previousPaymentLink.rows);
-      let previousAgreements = previousEpisodes.rows;
+      const previousEpisodes = resolverEpisodiosAcuerdos(previousPaymentLink.rows || []);
+      let previousAgreements = (previousEpisodes.rows || [])
+        .map((row) => ({ ...row, ...clasificarSituacionAcuerdo(row) }))
+        .filter(acuerdoSigueEnUniversoActual);
 
       if (tiposSolicitados.length) {
         const tiposSet = new Set(tiposSolicitados);
@@ -4355,8 +4388,8 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     }
   }
 
-  const dueRows = acuerdosVisibles
-    .filter((row) => !row.acuerdoAnuladoPorNuevo && (row.fechaPrimerPago || row.primerVencimiento))
+  const dueRows = acuerdosActivosVisibles
+    .filter((row) => !row.acuerdoAnuladoPorNuevo && row.acuerdoProyectable !== false && (row.fechaPrimerPago || row.primerVencimiento))
     .slice()
     .sort((a, b) =>
       (a.fechaPrimerPago || a.primerVencimiento || "9999-12-31").localeCompare(b.fechaPrimerPago || b.primerVencimiento || "9999-12-31") ||
@@ -4379,6 +4412,9 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     summary,
     total,
     totalIncluyendoOcultos: acuerdos.length,
+    totalActivos: acuerdosActivosVisibles.length,
+    totalBajados: acuerdosBajadosVisibles.length,
+    situacionAcuerdo: situacionVista,
     page: currentPage,
     pages,
     limit: safeLimit,
@@ -4386,6 +4422,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
       tiposAcuerdo: TIPOS_ACUERDO,
       estadosVencimiento: ["PAGADO", "PAGADO PARCIAL", "VENCIDO", "VENCE HOY", "PRÓXIMO 3 DÍAS", "PENDIENTE", "ANULADO X NUEVO"],
       estadosPagoAcuerdo: ["CON PAGO VÁLIDO", "PAGO MISMO DÍA VÁLIDO", "SIN PAGO VÁLIDO", "REQUIERE REVISIÓN"],
+      situacionesAcuerdo: ["activos", "bajados"],
     },
     integracionPagos: paymentMeta,
     params: {
@@ -4398,6 +4435,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
       dni: dni || null,
       tipoAcuerdo: tipoAcuerdo || null,
       estadoVencimiento: estadoVencimiento || null,
+      situacionAcuerdo: situacionVista,
       sortKey: appliedSort.key,
       sortDir: appliedSort.dir,
     },
@@ -4418,6 +4456,9 @@ export async function analyticsAcuerdos(req, res) {
       vencimientos: data.vencimientos,
       resumen: data.summary,
       total: data.total,
+      totalActivos: data.totalActivos,
+      totalBajados: data.totalBajados,
+      situacionAcuerdo: data.situacionAcuerdo,
       page: data.page,
       pages: data.pages,
       limit: data.limit,

@@ -892,6 +892,13 @@ export function resolverEpisodiosAcuerdos(rows = []) {
         episodioMotivo: "REEMPLAZADO_SIN_CRUCE_PAGOS",
         acuerdoReemplazadoSinPago: true,
         acuerdoAnuladoPorNuevo: true,
+        situacionAcuerdo: "ANULADO",
+        acuerdoBajado: true,
+        acuerdoAnulado: true,
+        acuerdoPagadoBajado: false,
+        acuerdoContabilizable: false,
+        acuerdoProyectable: false,
+        motivoBajaAcuerdo: "Anulado x nuevo (sin pagos)",
         reemplazadoPorAcuerdoNumero: index + 2,
         reemplazadoPorAcuerdoId: String(ordenados[index + 1]?.id || ordenados[index + 1]?._id || ""),
       }));
@@ -972,6 +979,13 @@ export function resolverEpisodiosAcuerdos(rows = []) {
           episodioMotivo: "REEMPLAZADO_SIN_PAGO",
           acuerdoReemplazadoSinPago: true,
           acuerdoAnuladoPorNuevo: true,
+          situacionAcuerdo: "ANULADO",
+          acuerdoBajado: true,
+          acuerdoAnulado: true,
+          acuerdoPagadoBajado: false,
+          acuerdoContabilizable: false,
+          acuerdoProyectable: false,
+          motivoBajaAcuerdo: "Anulado x nuevo (sin pagos)",
           reemplazadoPorAcuerdoNumero: numeroCronologico + 1,
           reemplazadoPorAcuerdoId: String(ordenados[index + 1]?.id || ordenados[index + 1]?._id || ""),
         });
@@ -1050,6 +1064,7 @@ function emptyOperatorSummary(nombre, totalGestiones = 0) {
   return {
     nombre: normalizarTexto(nombre) || "Sin dato",
     acuerdos: 0,
+    acuerdosProyectables: 0,
     dnis: 0,
     primerPago: 0,
     primerPagoCobrado: 0,
@@ -1081,6 +1096,7 @@ function groupRows(rows, key, totalGestionesMap = null) {
       map.set(value, {
         nombre: value,
         acuerdos: 0,
+        acuerdosProyectables: 0,
         dnis: new Set(),
         primerPago: 0,
         primerPagoCobrado: 0,
@@ -1101,6 +1117,7 @@ function groupRows(rows, key, totalGestionesMap = null) {
     }
     const item = map.get(value);
     item.acuerdos += 1;
+    if (row.acuerdoProyectable !== false) item.acuerdosProyectables += 1;
     if (row.dni) item.dnis.add(row.dni);
     item.primerPago += Number(row.primerPago || 0);
     item.primerPagoCobrado += Number(row.montoPrimerPagoCobrado || 0);
@@ -1134,7 +1151,7 @@ function groupRows(rows, key, totalGestionesMap = null) {
         dnis: item.dnis.size,
         totalGestiones,
         tasaAcuerdo: totalGestiones ? (item.acuerdos * 100) / totalGestiones : 0,
-        ticketPromedio: item.acuerdos ? item.primerPago / item.acuerdos : 0,
+        ticketPromedio: item.acuerdosProyectables ? item.primerPago / item.acuerdosProyectables : 0,
         tasaPagoPosterior: item.acuerdos ? (item.conPagoPosterior * 100) / item.acuerdos : 0,
       };
     })
@@ -1142,9 +1159,16 @@ function groupRows(rows, key, totalGestionesMap = null) {
 }
 
 export function resumirAcuerdos(rows, totalGestiones = 0, gestionesPorOperador = [], integracionPagos = {}) {
+  // Un acuerdo PAGADO_BAJADO sigue contando como acuerdo efectivo y conserva
+  // sus cobros reales, pero no debe seguir inflando compromisos futuros.
+  const rowsProyectables = rows.filter((row) => row?.acuerdoProyectable !== false);
+  const rowsParaMetricas = rows.map((row) => row?.acuerdoProyectable === false
+    ? { ...row, primerPago: 0, montoTotalAcuerdo: 0, deudaMaxima: 0 }
+    : row
+  );
   // Los totales generales se calculan con TODA la actividad. Solo las vistas
   // identificadas por operador respetan la lista central de ocultos de control.
-  const rowsVisiblesControl = rows.filter((row) =>
+  const rowsVisiblesControl = rowsParaMetricas.filter((row) =>
     esUsuarioVisibleEnReportesControl(row?.usuario)
   );
   const gestionesPorOperadorVisibles = gestionesPorOperador.filter((row) =>
@@ -1155,15 +1179,15 @@ export function resumirAcuerdos(rows, totalGestiones = 0, gestionesPorOperador =
   );
   const totalAgreements = rows.length;
   const uniqueDnis = new Set(rows.map((row) => row.dni).filter(Boolean)).size;
-  const totalFirstPayment = sum(rows, "primerPago");
+  const totalFirstPayment = sum(rowsProyectables, "primerPago");
   const totalFirstPaymentCollected = sum(rows, "montoPrimerPagoCobrado");
   const agreementsFirstPaymentCovered = rows.filter((row) => Boolean(row.primerPagoCubierto)).length;
   const effectiveReagreements = rows.filter((row) => Boolean(row.esReacuerdoEfectivo)).length;
-  const totalAmount = sum(rows, "montoTotalAcuerdo");
-  const totalMaxDebt = sum(rows, "deudaMaxima");
-  const overdue = rows.filter((row) => row.estadoVencimiento === "VENCIDO");
-  const dueToday = rows.filter((row) => row.estadoVencimiento === "VENCE HOY");
-  const upcoming = rows.filter((row) => row.estadoVencimiento === "PRÓXIMO 3 DÍAS");
+  const totalAmount = sum(rowsProyectables, "montoTotalAcuerdo");
+  const totalMaxDebt = sum(rowsProyectables, "deudaMaxima");
+  const overdue = rowsProyectables.filter((row) => row.estadoVencimiento === "VENCIDO");
+  const dueToday = rowsProyectables.filter((row) => row.estadoVencimiento === "VENCE HOY");
+  const upcoming = rowsProyectables.filter((row) => row.estadoVencimiento === "PRÓXIMO 3 DÍAS");
   const paymentAvailable = Boolean(integracionPagos?.disponible);
   const estadosConPagoValido = new Set([
     "CON PAGO POSTERIOR",
@@ -1249,7 +1273,7 @@ export function resumirAcuerdos(rows, totalGestiones = 0, gestionesPorOperador =
 
   const porDiaMap = new Map();
   const operadorDiaMap = new Map();
-  rows.forEach((row) => {
+  rowsParaMetricas.forEach((row) => {
     const key = row.fecha || "Sin fecha";
     if (!porDiaMap.has(key)) porDiaMap.set(key, { fecha: key, acuerdos: 0, primerPago: 0, montoTotal: 0 });
     const item = porDiaMap.get(key);
@@ -1305,7 +1329,7 @@ export function resumirAcuerdos(rows, totalGestiones = 0, gestionesPorOperador =
     totalPrimerPagoCobrado: totalFirstPaymentCollected,
     acuerdosPrimerPagoCubierto: agreementsFirstPaymentCovered,
     reacuerdosEfectivos: effectiveReagreements,
-    ticketPromedioPrimerPago: totalAgreements ? totalFirstPayment / totalAgreements : 0,
+    ticketPromedioPrimerPago: rowsProyectables.length ? totalFirstPayment / rowsProyectables.length : 0,
     montoTotalAcuerdos: totalAmount,
     deudaMaximaInformada: totalMaxDebt,
     coberturaSobreDeuda: totalMaxDebt ? (totalAmount * 100) / totalMaxDebt : 0,
@@ -1881,10 +1905,11 @@ const AGREEMENT_DETAIL_COLUMNS = [
   ["FECHA 1ER PAGO COBRADO", 21], ["1ER PAGO CUBIERTO", 18], ["ÚLTIMO PAGO VÁLIDO", 19],
   ["ÚLTIMO PAGO ANTERIOR", 20], ["IMPORTE PAGO ANTERIOR", 21], ["DÍAS ANTES DEL ACUERDO", 16],
   ["OBSERVACIÓN CRUCE PAGOS", 34],
-  ["TIPO CONTACTO", 21], ["RESULTADO GESTIÓN", 27], ["ESTADO CUENTA", 24], ["TEL / MAIL MARCADO", 22],
+  ["TIPO CONTACTO", 21], ["RESULTADO GESTIÓN", 27], ["ESTADO CUENTA AL ACUERDO", 26], ["TEL / MAIL MARCADO", 22],
   ["OBSERVACIÓN ORIGINAL", 55],
   ["SEGUIMIENTO", 21], ["FECHA SEGUIMIENTO", 19], ["HORA SEGUIMIENTO", 17], ["ÚLTIMO GESTOR", 20],
-  ["RESULTADO SEGUIMIENTO", 28], ["OBSERVACIÓN SEGUIMIENTO", 38],
+  ["RESULTADO SEGUIMIENTO", 28], ["ESTADO CUENTA ACTUAL", 24], ["OBSERVACIÓN SEGUIMIENTO", 38],
+  ["SITUACIÓN ACUERDO", 18],
 ];
 
 const AGREEMENT_DETAIL_GROUPS = [
@@ -1892,7 +1917,7 @@ const AGREEMENT_DETAIL_GROUPS = [
   { from: 14, to: 21, label: "PLAN ACORDADO", color: "FF087A50" },
   { from: 22, to: 34, label: "CRUCE CON PAGOS", color: "FF0876A8" },
   { from: 35, to: 39, label: "GESTIÓN ORIGINAL", color: "FF8C2384" },
-  { from: 40, to: 45, label: "SEGUIMIENTO POSTERIOR", color: "FF6D2BFF" },
+  { from: 40, to: 47, label: "SEGUIMIENTO POSTERIOR", color: "FF6D2BFF" },
 ];
 
 function agreementDays(item) {
@@ -1956,7 +1981,9 @@ function agreementDetailValues(item) {
     excelTime(item.ultimaGestionMangoHora),
     item.ultimaGestionMangoUsuario,
     item.ultimaGestionMangoResultado,
+    item.estadoCuentaActual || item.ultimaGestionMangoEstadoCuenta || item.estadoCuenta,
     item.ultimaGestionMangoObservacion,
+    item.situacionAcuerdo || (item.acuerdoBajado ? "BAJADO" : "ACTIVO"),
   ];
 }
 
@@ -2045,6 +2072,24 @@ function styleAgreementDetailRow(row, item) {
     [27, 28, 29].forEach((col) => {
       row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF91DFB5" } };
       row.getCell(col).font = { bold: true, color: { argb: "FF075D43" } };
+    });
+  }
+
+  const situacionCell = row.getCell(47);
+  const situacion = String(item.situacionAcuerdo || "").toUpperCase();
+  const pagadoBajado = item.acuerdoPagadoBajado || situacion === "PAGADO_BAJADO";
+  const bajado = item.acuerdoBajado || ["BAJADO", "ANULADO"].includes(situacion);
+  const fillSituacion = pagadoBajado ? "FFDFF3EA" : bajado ? "FFFFD9C2" : "FFDFF3EA";
+  situacionCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: fillSituacion } };
+  situacionCell.font = { bold: true, color: { argb: bajado ? COLORS.red : "FF075D43" } };
+  if (bajado) {
+    // Marca suave de recupero sin tapar los colores de estado/pago ya existentes.
+    [2, 3, 4, 5, 46].forEach((col) => {
+      row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF1E8" } };
+    });
+  } else if (pagadoBajado) {
+    [2, 3, 4, 5, 46].forEach((col) => {
+      row.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF0FAF5" } };
     });
   }
 }

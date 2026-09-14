@@ -28,14 +28,25 @@ import {
 } from "../utils/contactadosTiempo.js";
 
 const ROLES_SOLO_PROPIOS = new Set(["operador", "operador-vip", "capacitador", "capacitadora", "cuotero", "cuotera"]);
-const PAGO_A_IMPUTAR_RX = /pago\s+a\s+imputar/i;
-const ACUERDO_PAGO_RX = /^\s*acuerdo\s+de\s+pago(?:\s*[-–—:]?\s*cumplido)?\s*$/i;
+const CONTACTADO_ESTADO_RX = /^\s*contactad[oa]\s*$/i;
+const PAGO_A_IMPUTAR_RX = /^\s*pagos?\s+a\s+imputar\s*$/i;
+const INCOBRABLE_RX = /^\s*incobrable\s*$/i;
+const ACUERDO_PAGO_RX = /^\s*acuerdo\s+de\s+pago\s*$/i;
+const ACUERDO_CUMPLIDO_RX = /^\s*acuerdo(?:\s+de\s+pago)?\s+cumplido\s*$/i;
+const NO_VOLUNTAD_ARREGLO_RX = /^\s*no\s+tiene\s+voluntad\s+de\s+arreglo\s*$/i;
 const FILTRO_SIN_ESTADOS_TERMINALES = {
   $nor: [
-    { calificacionInicio: PAGO_A_IMPUTAR_RX },
+    // Salvaguarda para datos legacy y para el intervalo breve previo a la
+    // sincronización: ninguno de estos estados debe aparecer como activo.
+    { estadoActual: PAGO_A_IMPUTAR_RX },
+    { estadoActual: INCOBRABLE_RX },
+    { estadoActual: ACUERDO_PAGO_RX },
+    { estadoActual: ACUERDO_CUMPLIDO_RX },
     { estadoCuentaInicio: PAGO_A_IMPUTAR_RX },
-    { calificacionInicio: ACUERDO_PAGO_RX },
+    { estadoCuentaInicio: INCOBRABLE_RX },
     { estadoCuentaInicio: ACUERDO_PAGO_RX },
+    { estadoCuentaInicio: ACUERDO_CUMPLIDO_RX },
+    { calificacionInicio: NO_VOLUNTAD_ARREGLO_RX },
   ],
 };
 
@@ -51,7 +62,10 @@ function dniExcel(value) {
 function fechaExcel(value) {
   if (!value) return null;
   const d = value instanceof Date ? value : new Date(value);
-  return Number.isNaN(d.getTime()) ? null : d;
+  if (Number.isNaN(d.getTime())) return null;
+  // ExcelJS serializa el instante UTC. Para que la planilla muestre la hora
+  // argentina real (y no +3 h), grabamos la hora de pared UTC-03.
+  return new Date(d.getTime() - 3 * 60 * 60 * 1000);
 }
 function normUser(value) {
   return norm(value).toLowerCase();
@@ -120,7 +134,11 @@ function filtroVencimientoMes(mes) {
 
 function filtroVencimientoMesHastaAhora(mes, now = new Date()) {
   const { desde, hasta } = rangoMes(mes);
-  const limite = new Date(Math.min(hasta.getTime(), now.getTime()));
+  // V8: el histórico sólo contiene días YA FINALIZADOS en Argentina.
+  // Si la fecha de vencimiento es hoy, el caso sigue activo hasta las 23:59:59,
+  // incluso para registros legacy cuyo venceAt haya quedado con una hora intermedia.
+  const finAyer = new Date(inicioDiaArgentina(now).getTime() - 1);
+  const limite = new Date(Math.min(hasta.getTime(), finAyer.getTime()));
   return { venceAt: { $gte: desde, $lte: limite } };
 }
 
@@ -186,8 +204,9 @@ function visibleEnTabla(req, operador) {
 
 function normalizarOrden(query = {}, defaultKey = "venceAt", defaultDirection = "asc") {
   const permitidas = new Set([
-    "semaforo", "cliente", "telefono", "operador", "entidad",
-    "iniciaAt", "venceAt", "toquesMes", "validacion", "postSeguimiento",
+    "semaforo", "dni", "cliente", "tipoContacto", "telefono", "operador", "entidad",
+    "iniciaAt", "ultimaGestionDuenoAt", "venceAt", "toquesMes", "postSeguimiento",
+    "estadoActual", "ultimoOperador",
   ]);
   const key = permitidas.has(norm(query.sortKey)) ? norm(query.sortKey) : defaultKey;
   const requestedDirection = norm(query.sortDir).toLowerCase();
@@ -202,26 +221,23 @@ function ordenMongoVentanas(sort, { vencidas = false } = {}) {
     // En Estado, ascendente conserva la lectura operativa Vigente → Por vencer → Crítico.
     // Como todas las ventanas duran 72 h hábiles, esa prioridad equivale a venceAt descendente.
     case "semaforo": return { venceAt: dir === 1 ? -1 : 1, ...desempate };
-    case "cliente": return { nombreDeudor: dir, dni: dir, ...desempate };
+    case "dni": return { dni: dir, nombreDeudor: 1, operador: 1 };
+    case "cliente": return { nombreDeudor: dir, dni: 1, operador: 1 };
+    case "tipoContacto": return { tipoContactoInicio: dir, nombreDeudor: 1, dni: 1 };
     case "telefono": return { telefonoVisible: dir, telefonoOriginal: dir, ...desempate };
     case "operador": return { operador: dir, dni: 1 };
+    case "estadoActual": return { estadoActual: dir, operador: 1, dni: 1 };
+    case "ultimoOperador": return { ultimoOperador: dir, operador: 1, dni: 1 };
     case "entidad": return { entidad: dir, operador: 1, dni: 1 };
-    case "iniciaAt": return { iniciaAt: dir, ...desempate };
+    case "iniciaAt":
+    case "ultimaGestionDuenoAt": return { iniciaAt: dir, ...desempate };
     case "venceAt": return { venceAt: dir, ...desempate };
     default: return vencidas ? { venceAt: -1, ...desempate } : { venceAt: 1, ...desempate };
   }
 }
 
-function valorOrdenEspecial(row, key, now, toquesMap) {
+function valorOrdenEspecial(row, key, _now, toquesMap) {
   if (key === "toquesMes") return Number(toquesMap?.get(`${normUser(row.operador)}|${row.dni}`) || 0);
-  if (key === "validacion") {
-    const rank = {
-      "no-requerido": 1, pendiente: 2, "pendiente-validacion": 3,
-      validado: 4, cumplida: 4, "gestion-sin-check": 5,
-      "check-sin-gestion": 6, vencido: 7,
-    };
-    return rank[estadoValidacion(row, now)] || 99;
-  }
   return 0;
 }
 
@@ -238,7 +254,10 @@ function ordenarEspecial(rows, sort, now, toquesMap) {
 }
 
 function semaforoVentana(row, now = new Date()) {
-  if (now >= new Date(row.venceAt)) return "vencido";
+  // La fecha visible manda: un caso que vence hoy nunca se considera vencido
+  // hasta que termine el día argentino. Normalizar acá también corrige legacy.
+  const venceOperativo = finDiaArgentina(row.venceAt);
+  if (now > venceOperativo) return "vencido";
   if (now >= new Date(row.criticoAt)) return "critico";
   if (now >= new Date(row.alertaAt)) return "por-vencer";
   return "vigente";
@@ -277,6 +296,20 @@ async function mapaToquesMes(rows, mes) {
   ]).allowDiskUse(true);
 
   return new Map(agrupado.map((r) => [`${normUser(r._id.operador)}|${r._id.dni}`, Number(r.dias || 0)]));
+}
+
+async function mapaOrigenContactado(rows) {
+  const series = [...new Set((rows || []).map((r) => r.serieId).filter(Boolean))];
+  if (!series.length) return new Map();
+
+  // Una serie conserva el mismo serieId en todas las renovaciones del dueño.
+  // La menor iniciaAt es, por definición, el Contactado real que originó la serie.
+  const origenes = await ContactadoVentana.aggregate([
+    { $match: { serieId: { $in: series } } },
+    { $group: { _id: "$serieId", origenContactadoAt: { $min: "$iniciaAt" } } },
+  ]).allowDiskUse(true);
+
+  return new Map(origenes.map((r) => [String(r._id), r.origenContactadoAt || null]));
 }
 
 async function mapaUltimasObservaciones(rows) {
@@ -349,7 +382,7 @@ async function mapaSeguimientoPosterior(rows) {
 
   const out = new Map();
   for (const ventana of ventanas) {
-    const venceMs = new Date(ventana.venceAt).getTime();
+    const venceMs = finDiaArgentina(ventana.venceAt).getTime();
     const lista = porDni.get(String(ventana.dni || "")) || [];
     const encontrada = lista.find((gestion) => gestion.at.getTime() > venceMs && mismaEntidad(ventana, gestion)) || null;
     out.set(String(ventana._id), encontrada ? {
@@ -370,14 +403,17 @@ function valorOrdenFila(row, key, { now = new Date(), toquesMap = null, postMap 
     const rank = { vigente: 1, "por-vencer": 2, critico: 3, vencido: 4 };
     return rank[semaforoVentana(row, now)] || 99;
   }
+  if (key === "dni") return String(row.dni || "").padStart(20, "0");
   if (key === "cliente") return `${norm(row.nombreDeudor).toLowerCase()}|${String(row.dni || "")}`;
+  if (key === "tipoContacto") return norm(row.tipoContactoInicio).toLowerCase();
   if (key === "telefono") return norm(row.telefonoVisible || row.telefonoOriginal);
   if (key === "operador") return normUser(row.operador);
+  if (key === "estadoActual") return norm(row.estadoActual).toLowerCase();
+  if (key === "ultimoOperador") return normUser(row.ultimoOperador);
   if (key === "entidad") return norm(row.entidad).toLowerCase();
-  if (key === "iniciaAt") return new Date(row.iniciaAt || 0).getTime();
+  if (key === "iniciaAt" || key === "ultimaGestionDuenoAt") return new Date(row.iniciaAt || 0).getTime();
   if (key === "venceAt") return new Date(row.venceAt || 0).getTime();
   if (key === "toquesMes") return Number(toquesMap?.get(`${normUser(row.operador)}|${row.dni}`) || 0);
-  if (key === "validacion") return valorOrdenEspecial(row, "validacion", now, toquesMap);
   if (key === "postSeguimiento") return postMap?.get(String(row._id))?.tiene ? 1 : 0;
   return "";
 }
@@ -395,9 +431,13 @@ function ordenarFilasMemoria(rows, sort, helpers = {}) {
   });
 }
 
-function serializarVentana(row, { toques = 0, observaciones = null, seguimientoPosterior = null, now = new Date() } = {}) {
-  const restante = Math.max(0, horasHabilesEntreArgentina(now, row.venceAt));
-  const transcurridas = Math.min(72, Math.max(0, 72 - restante));
+function serializarVentana(row, { toques = 0, seguimientoPosterior = null, origenContactadoAt = null, now = new Date() } = {}) {
+  // venceAt se extiende hasta el fin de la jornada para que el caso no desaparezca
+  // a mitad del día. El contador, en cambio, representa las 72 h hábiles reales:
+  // cuando ya se cumplieron muestra 0 y el front indica “vigente hasta fin del día”.
+  const transcurridasReal = Math.max(0, horasHabilesEntreArgentina(row.iniciaAt, now));
+  const transcurridas = Math.min(72, transcurridasReal);
+  const restante = Math.max(0, 72 - transcurridas);
   return {
     id: String(row._id),
     serieId: row.serieId,
@@ -411,9 +451,14 @@ function serializarVentana(row, { toques = 0, observaciones = null, seguimientoP
     whatsappNumero: row.whatsappNumero || "",
     whatsappDisponible: Boolean(row.whatsappDisponible),
     iniciaAt: row.iniciaAt,
+    // Inicio real de la serie: no cambia aunque el dueño renueve sus 72 h.
+    origenContactadoAt: origenContactadoAt || row.iniciaAt,
+    // La ventana actual siempre nace en la última gestión del operador dueño:
+    // cada toque del dueño cierra la ventana anterior y abre otras 72 h.
+    ultimaGestionDuenoAt: row.iniciaAt,
     alertaAt: row.alertaAt,
     criticoAt: row.criticoAt,
-    venceAt: row.venceAt,
+    venceAt: finDiaArgentina(row.venceAt),
     estado: row.estado,
     semaforo: semaforoVentana(row, now),
     horasHabilesRestantes: Math.round(restante * 10) / 10,
@@ -422,18 +467,11 @@ function serializarVentana(row, { toques = 0, observaciones = null, seguimientoP
     tipoContactoInicio: row.tipoContactoInicio || "",
     estadoCuentaInicio: row.estadoCuentaInicio || "",
     observacionGestionInicio: row.observacionGestionInicio || "",
+    estadoActual: row.estadoActual || row.estadoCuentaInicio || "",
+    ultimoOperador: row.ultimoOperador || row.operador || "",
+    ultimaGestionAt: row.ultimaGestionAt || row.iniciaAt || null,
     clickRealizadoAt: row.clickRealizadoAt || null,
-    validacion: estadoValidacion(row, now),
     toquesMes: Number(toques || 0),
-    observaciones: {
-      cantidad: observaciones?.cantidad || 0,
-      operador: observaciones?.operador
-        ? { texto: observaciones.operador.texto, autor: observaciones.operador.autorUsername, fecha: observaciones.operador.createdAt }
-        : null,
-      supervision: observaciones?.supervision
-        ? { texto: observaciones.supervision.texto, autor: observaciones.supervision.autorUsername, fecha: observaciones.supervision.createdAt }
-        : null,
-    },
     seguimientoPosterior: seguimientoPosterior || null,
   };
 }
@@ -453,7 +491,7 @@ async function obtenerSeguimientoData(req, { exportar = false } = {}) {
   const filtro = {
     ...filtroBaseMes,
     estado: "abierta",
-    venceAt: { $gt: now },
+    venceAt: { $gte: inicioDiaArgentina(now) },
   };
   const semaforo = norm(req.query.semaforo);
   if (semaforo === "vigente") filtro.alertaAt = { $gt: now };
@@ -463,7 +501,7 @@ async function obtenerSeguimientoData(req, { exportar = false } = {}) {
   }
   if (semaforo === "critico") {
     filtro.criticoAt = { $lte: now };
-    filtro.venceAt = { $gt: now };
+    filtro.venceAt = { $gte: inicioDiaArgentina(now) };
   }
   const soloPendientes = String(req.query.soloPendientes || "").toLowerCase() === "true";
   if (soloPendientes) {
@@ -473,6 +511,8 @@ async function obtenerSeguimientoData(req, { exportar = false } = {}) {
   const tocado = norm(req.query.tocado).toLowerCase();
   if (tocado === "si") filtro.clickRealizadoAt = { $ne: null };
   if (tocado === "no") filtro.clickRealizadoAt = null;
+  const soloContactado = String(req.query.soloContactado || "").toLowerCase() === "true";
+  if (soloContactado) filtro.estadoActual = CONTACTADO_ESTADO_RX;
 
   const page = exportar ? 1 : Math.max(1, Number(req.query.page || 1));
   const limit = exportar ? 10000 : Math.min(250, Math.max(10, Number(req.query.limit || 80)));
@@ -481,11 +521,12 @@ async function obtenerSeguimientoData(req, { exportar = false } = {}) {
   const origenesPromise = ContactadoVentana.countDocuments({
     ...filtroBaseMes,
     estado: "abierta",
-    venceAt: { $gt: now },
+    venceAt: { $gte: inicioDiaArgentina(now) },
     esOrigenContactado: true,
+    ...(soloContactado ? { estadoActual: CONTACTADO_ESTADO_RX } : {}),
   });
   let rows;
-  if (["toquesMes", "validacion"].includes(sort.key)) {
+  if (sort.key === "toquesMes") {
     const allRows = await ContactadoVentana.find(filtro).lean();
     const allToques = sort.key === "toquesMes" ? await mapaToquesMes(allRows, mes) : null;
     rows = ordenarEspecial(allRows, sort, now, allToques).slice((page - 1) * limit, page * limit);
@@ -496,15 +537,15 @@ async function obtenerSeguimientoData(req, { exportar = false } = {}) {
       .limit(limit)
       .lean();
   }
-  const [total, origenesMes, toquesMap, obsMap] = await Promise.all([
+  const [total, origenesMes, toquesMap, origenMap] = await Promise.all([
     totalPromise,
     origenesPromise,
     mapaToquesMes(rows, mes),
-    mapaUltimasObservaciones(rows),
+    mapaOrigenContactado(rows),
   ]);
   const items = rows.map((row) => serializarVentana(row, {
     toques: toquesMap.get(`${normUser(row.operador)}|${row.dni}`) || 0,
-    observaciones: obsMap.get(row.serieId),
+    origenContactadoAt: origenMap.get(String(row.serieId)) || row.iniciaAt,
     now,
   }));
   return { items, total, origenesMes, page, limit, mes, sort, canViewAll: esMandoMedio(req), sync: syncMeta() };
@@ -543,7 +584,7 @@ async function obtenerVencidosData(req, { hoy = false, exportar = false } = {}) 
     ...FILTRO_SIN_ESTADOS_TERMINALES,
     estado: expiracionPersistida ? "vencida" : { $in: ["abierta", "vencida"] },
     ...(hoy
-      ? { venceAt: { $gte: inicioDiaArgentina(now), $lte: now } }
+      ? { venceAt: { $lt: inicioDiaArgentina(now), $gte: inicioDiaArgentina(new Date(now.getTime() - 86_400_000)) } }
       : filtroVencimientoMesHastaAhora(mes, now)),
   };
 
@@ -551,7 +592,7 @@ async function obtenerVencidosData(req, { hoy = false, exportar = false } = {}) 
   const limit = exportar ? 10000 : Math.min(250, Math.max(10, Number(req.query.limit || 80)));
   const sort = normalizarOrden(req.query, "venceAt", "desc");
   const postFiltro = ["con", "sin"].includes(norm(req.query.postSeguimiento)) ? norm(req.query.postSeguimiento) : "";
-  const necesitaUniversoCompleto = Boolean(postFiltro) || ["toquesMes", "validacion", "postSeguimiento"].includes(sort.key);
+  const necesitaUniversoCompleto = Boolean(postFiltro) || ["toquesMes", "postSeguimiento"].includes(sort.key);
 
   let rows = [];
   let total = 0;
@@ -582,17 +623,17 @@ async function obtenerVencidosData(req, { hoy = false, exportar = false } = {}) 
       .lean();
   }
 
-  const [toquesMap, obsMap, postMapPagina] = await Promise.all([
+  const [toquesMap, postMapPagina, origenMap] = await Promise.all([
     allToques || mapaToquesMes(rows, mes),
-    mapaUltimasObservaciones(rows),
     allPost || mapaSeguimientoPosterior(rows),
+    mapaOrigenContactado(rows),
   ]);
 
   return {
     items: rows.map((row) => serializarVentana(row, {
       toques: toquesMap.get(`${normUser(row.operador)}|${row.dni}`) || 0,
-      observaciones: obsMap.get(row.serieId),
       seguimientoPosterior: postMapPagina.get(String(row._id)) || { tiene: false, fecha: null },
+      origenContactadoAt: origenMap.get(String(row.serieId)) || row.iniciaAt,
       now,
     })),
     total,
@@ -624,7 +665,7 @@ export async function resumenAlerta(req, res) {
     }
 
     const operador = usernameActual(req);
-    const base = { ...FILTRO_SIN_ESTADOS_TERMINALES, estado: "abierta", operador, alertaAt: { $lte: now }, venceAt: { $gt: now } };
+    const base = { ...FILTRO_SIN_ESTADOS_TERMINALES, estado: "abierta", operador, alertaAt: { $lte: now }, venceAt: { $gte: inicioDiaArgentina(now) } };
     const [pendientes, criticos, realizadosPendientesValidar] = await Promise.all([
       ContactadoVentana.countDocuments({ ...base, clickRealizadoAt: null }),
       ContactadoVentana.countDocuments({ ...base, criticoAt: { $lte: now }, clickRealizadoAt: null }),
@@ -667,7 +708,7 @@ export async function marcarRealizado(req, res) {
     await asegurarLimpiezaEstadosTerminalesMes(mesActualArgentina());
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ error: "Caso inválido" });
     const now = new Date();
-    const row = await ContactadoVentana.findOne({ _id: req.params.id, ...FILTRO_SIN_ESTADOS_TERMINALES, estado: "abierta", venceAt: { $gt: now } });
+    const row = await ContactadoVentana.findOne({ _id: req.params.id, ...FILTRO_SIN_ESTADOS_TERMINALES, estado: "abierta", venceAt: { $gte: inicioDiaArgentina(now) } });
     if (!row) return res.status(404).json({ error: "El Contactado ya no está activo" });
     if (normUser(row.operador) !== usernameActual(req)) return res.status(403).json({ error: "Solo el operador asignado puede marcar este caso" });
 
@@ -764,7 +805,7 @@ export async function calcularEstadisticasActivos(req) {
   const cumplimientoPct = cerradasEvaluables.length ? (cumplidas.length * 100) / cerradasEvaluables.length : 0;
 
   const origenes = await ContactadoVentana.countDocuments({ ...filtroStats, esOrigenContactado: true });
-  const activas = await ContactadoVentana.find({ ...filtroStats, estado: "abierta", venceAt: { $gt: now } }).select("alertaAt criticoAt venceAt operador").lean();
+  const activas = await ContactadoVentana.find({ ...filtroStats, estado: "abierta", venceAt: { $gte: inicioDiaArgentina(now) } }).select("alertaAt criticoAt venceAt operador").lean();
   const semaforos = { vigente: 0, porVencer: 0, critico: 0 };
   activas.forEach((r) => {
     const sem = semaforoVentana(r, now);
@@ -849,7 +890,6 @@ async function calcularEstadisticasVencidos(req, { hoy = false } = {}) {
         sinGestionPosterior: 0,
         conCheck: 0,
         sinCheck: 0,
-        conObservacionOperador: 0,
         retomadosPct: 0,
       },
       rendimiento: [],
@@ -865,7 +905,7 @@ async function calcularEstadisticasVencidos(req, { hoy = false } = {}) {
     ...FILTRO_SIN_ESTADOS_TERMINALES,
     estado: expiracionPersistida ? "vencida" : { $in: ["abierta", "vencida"] },
     ...(hoy
-      ? { venceAt: { $gte: inicioDiaArgentina(now), $lte: now } }
+      ? { venceAt: { $lt: inicioDiaArgentina(now), $gte: inicioDiaArgentina(new Date(now.getTime() - 86_400_000)) } }
       : filtroVencimientoMesHastaAhora(mes, now)),
   };
 
@@ -881,14 +921,12 @@ async function calcularEstadisticasVencidos(req, { hoy = false } = {}) {
     });
   }
 
-  const obsMap = await mapaUltimasObservaciones(rows);
   const porOperador = new Map();
   const calidadMap = new Map();
   let conGestionPosterior = 0;
   let sinGestionPosterior = 0;
   let conCheck = 0;
   let sinCheck = 0;
-  let conObservacionOperador = 0;
 
   for (const row of rows) {
     const post = postMap.get(String(row._id));
@@ -897,7 +935,6 @@ async function calcularEstadisticasVencidos(req, { hoy = false } = {}) {
     else sinGestionPosterior += 1;
     if (row.clickRealizadoAt) conCheck += 1;
     else sinCheck += 1;
-    if (obsMap.get(row.serieId)?.operador) conObservacionOperador += 1;
 
     const op = row.operador || "sin-operador";
     const item = porOperador.get(op) || {
@@ -940,7 +977,6 @@ async function calcularEstadisticasVencidos(req, { hoy = false } = {}) {
       sinGestionPosterior,
       conCheck,
       sinCheck,
-      conObservacionOperador,
       retomadosPct: rows.length ? Math.round((conGestionPosterior * 1000) / rows.length) / 10 : 0,
     },
     rendimiento: rendimiento.filter((r) => visibleEnTabla(req, r.operador)),
@@ -1260,30 +1296,84 @@ export async function exportarExcel(req, res) {
         : vista === "historico"
           ? await obtenerVencidosData(req, { hoy: false, exportar: true })
           : await obtenerSeguimientoData(req, { exportar: true });
+      const esVencidos = vista === "vencidos-hoy" || vista === "historico";
+      const canViewAll = esMandoMedio(req);
+
+      // V8: el Excel replica exactamente el orden y los datos visibles de la tabla.
+      // DNI, Cliente y Tipo se exportan en columnas separadas.
       ws.columns = [
-        { header: "DNI", key: "dni", width: 16 }, { header: "Cliente", key: "nombre", width: 30 },
-        { header: "Operador", key: "operador", width: 22 }, { header: "Entidad", key: "entidad", width: 20 },
-        { header: "Teléfono", key: "telefono", width: 22 }, { header: "Inicio", key: "inicio", width: 20 },
-        { header: "Alerta 48 h hábiles", key: "alerta", width: 22 }, { header: "Vence 72 h hábiles", key: "vence", width: 22 },
-        { header: "Semáforo", key: "semaforo", width: 16 }, { header: "Toques del mes", key: "toques", width: 16 },
-        { header: "Validación", key: "validacion", width: 24 }, { header: "Calificación", key: "calificacion", width: 28 },
-        { header: "Seguimiento posterior", key: "post", width: 24 }, { header: "Fecha gestión posterior", key: "postFecha", width: 22 },
-        { header: "Resultado posterior", key: "postResultado", width: 28 },
-        { header: "Obs. operador", key: "obsOp", width: 36 }, { header: "Obs. supervisión", key: "obsSup", width: 36 },
+        { header: "Estado", key: "estado", width: 16 },
+        { header: "DNI", key: "dni", width: 16 },
+        { header: "Cliente", key: "cliente", width: 28 },
+        { header: "Tipo", key: "tipoContacto", width: 22 },
+        { header: "Tel. / mail", key: "contacto", width: 24 },
+        ...(canViewAll ? [{ header: "Operador dueño", key: "operador", width: 22 }] : []),
+        { header: "Estado actual", key: "estadoActual", width: 24 },
+        { header: "Último operador", key: "ultimoOperador", width: 34 },
+        { header: "Entidad", key: "entidad", width: 18 },
+        { header: "Inicio Contactado", key: "inicioContactado", width: 20 },
+        { header: "Última gestión dueño", key: "ultimaGestionDueno", width: 22 },
+        { header: "Vence", key: "vence", width: 18 },
+        { header: "Toques", key: "toques", width: 12 },
+        ...(esVencidos ? [
+          { header: "Seguimiento", key: "seguimiento", width: 38 },
+        ] : []),
+        ...(!canViewAll && !esVencidos ? [{ header: "Acciones", key: "acciones", width: 18 }] : []),
       ];
-      data.items.forEach((c) => ws.addRow({
-        dni: dniExcel(c.dni), nombre: c.nombreDeudor, operador: c.operador, entidad: c.entidad, telefono: c.telefono,
-        inicio: fechaExcel(c.iniciaAt), alerta: fechaExcel(c.alertaAt), vence: fechaExcel(c.venceAt),
-        semaforo: c.semaforo, toques: Number(c.toquesMes || 0),
-        validacion: c.validacion, calificacion: c.calificacionInicio,
-        post: c.seguimientoPosterior?.tiene ? "Con gestión posterior" : (vista === "historico" || vista === "vencidos-hoy" ? "Sin gestión posterior" : ""),
-        postFecha: fechaExcel(c.seguimientoPosterior?.fecha),
-        postResultado: c.seguimientoPosterior?.resultadoGestion || c.seguimientoPosterior?.estadoCuenta || "",
-        obsOp: c.observaciones?.operador?.texto || "", obsSup: c.observaciones?.supervision?.texto || "",
-      }));
+
+      data.items.forEach((c) => {
+        const estadoLabel = c.semaforo === "por-vencer" ? "Por vencer"
+          : c.semaforo === "critico" ? "Crítico"
+            : c.semaforo === "vencido" ? "Vencido" : "";
+        const ultimoOperador = c.ultimaGestionAt
+          ? `${c.ultimoOperador || c.operador || ""} · ${new Intl.DateTimeFormat("es-AR", {
+              timeZone: "America/Argentina/Buenos_Aires", day: "2-digit", month: "2-digit", year: "numeric",
+              hour: "2-digit", minute: "2-digit",
+            }).format(new Date(c.ultimaGestionAt))}`
+          : (c.ultimoOperador || c.operador || "");
+        const seguimiento = esVencidos
+          ? (c.seguimientoPosterior?.tiene
+              ? `Retomado ${new Intl.DateTimeFormat("es-AR", {
+                  timeZone: "America/Argentina/Buenos_Aires", day: "2-digit", month: "2-digit", year: "numeric",
+                }).format(new Date(c.seguimientoPosterior.fecha))}${c.seguimientoPosterior.operador ? ` · ${c.seguimientoPosterior.operador}` : ""}`
+              : "Sin gestión posterior")
+          : "";
+
+        const excelRow = ws.addRow({
+          estado: estadoLabel,
+          dni: dniExcel(c.dni),
+          cliente: c.nombreDeudor || "Sin nombre",
+          tipoContacto: c.tipoContactoInicio || "",
+          contacto: c.contactoOriginal || c.telefono || "",
+          ...(canViewAll ? { operador: c.operador || "" } : {}),
+          estadoActual: c.estadoActual || "",
+          ultimoOperador,
+          entidad: c.entidad || "",
+          inicioContactado: fechaExcel(c.origenContactadoAt || c.iniciaAt),
+          ultimaGestionDueno: fechaExcel(c.ultimaGestionDuenoAt || c.iniciaAt),
+          vence: fechaExcel(c.venceAt),
+          toques: Number(c.toquesMes || 0),
+          ...(esVencidos ? { seguimiento } : {}),
+          ...(!canViewAll && !esVencidos ? { acciones: c.clickRealizadoAt ? "Realizado" : "Pendiente" } : {}),
+        });
+
+        const dueno = normUser(c.operador);
+        const ultimo = normUser(c.ultimoOperador || c.operador);
+        if (dueno && ultimo && dueno !== ultimo) {
+          for (const key of ["estadoActual", "ultimoOperador"]) {
+            const cell = excelRow.getCell(ws.getColumn(key).number);
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
+            cell.font = { ...(cell.font || {}), color: { argb: "FF8A5A00" }, bold: true };
+          }
+        }
+      });
+
       ws.getColumn("dni").numFmt = "0";
-      ["inicio", "alerta", "vence", "postFecha"].forEach((key) => {
-        ws.getColumn(key).numFmt = "dd/mm/yyyy hh:mm";
+      ws.getColumn("inicioContactado").numFmt = "dd/mm/yyyy hh:mm";
+      ws.getColumn("ultimaGestionDueno").numFmt = "dd/mm/yyyy hh:mm";
+      ws.getColumn("vence").numFmt = "dd/mm/yyyy";
+      ws.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+        if (rowNumber > 1) row.alignment = { vertical: "middle", wrapText: true };
       });
     }
 

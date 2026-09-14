@@ -1,5 +1,5 @@
 import { feriadosArgentinaParaAnio } from "../config/feriadosArgentina.js";
-import { agregarHorasHabilesArgentina, horasHabilesEntreArgentina } from "../utils/contactadosTiempo.js";
+import { agregarHorasHabilesArgentina, horasHabilesEntreArgentina, finDiaArgentina } from "../utils/contactadosTiempo.js";
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -19,8 +19,13 @@ const vence = agregarHorasHabilesArgentina(inicio, 72);
 
 assert(alerta.toISOString() === "2026-08-19T21:00:00.000Z", `Alerta incorrecta: ${alerta.toISOString()}`);
 assert(critico.toISOString() === "2026-08-20T09:00:00.000Z", `Crítico incorrecto: ${critico.toISOString()}`);
-assert(vence.toISOString() === "2026-08-20T21:00:00.000Z", `Vencimiento incorrecto: ${vence.toISOString()}`);
+assert(vence.toISOString() === "2026-08-20T21:00:00.000Z", `Vencimiento base incorrecto: ${vence.toISOString()}`);
 assert(horasHabilesEntreArgentina(inicio, vence) === 72, "El intervalo hábil no suma 72 horas");
+const venceFinDia = finDiaArgentina(vence);
+assert(
+  venceFinDia.toISOString() === "2026-08-21T02:59:59.999Z",
+  `Fin de jornada argentino incorrecto: ${venceFinDia.toISOString()}`
+);
 
 // Regresión de corte de mes: una gestión del 27/08 puede vencer el 01/09.
 // Ese caso debe conservar su serie, pero operativamente pertenece a septiembre.

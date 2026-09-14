@@ -12,6 +12,11 @@ import Asistencia from "../models/Asistencia.js";
 import mongoose from "mongoose";
 import { ROLES, normalizeStoredRole } from "../config/roles.js";
 import { transformarGestionEnAcuerdo, resolverEpisodiosAcuerdos, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
+import {
+  acuerdoSigueEnUniversoActual,
+  clasificarSituacionAcuerdo,
+  enriquecerAcuerdosConEstadoCuentaActual,
+} from "../services/acuerdosEstadoActualService.js";
 import { actividadDeUsuarioEnFecha, resumirActividadMensual } from "../utils/actividadGestiones.js";
 import { novedadSolapaRango } from "../utils/calculoAsistencia.js";
 
@@ -103,12 +108,15 @@ async function resolverEpisodiosDashboard(acuerdos = [], fechaHasta = new Date()
       ? await Entidad.find({ numero: { $in: numeros } }).select("numero nombre").lean()
       : [];
     const vinculados = vincularPagosPosteriores(acuerdos, pagos, entidades, { disponible: true });
-    return resolverEpisodiosAcuerdos(vinculados).rows;
+    return resolverEpisodiosAcuerdos(vinculados).rows
+      .map((row) => ({ ...row, ...clasificarSituacionAcuerdo(row) }))
+      .filter(acuerdoSigueEnUniversoActual);
   } catch (error) {
     console.warn("Dashboard: no se pudo resolver episodios de acuerdos con Pagos:", error?.message || error);
-    return resolverEpisodiosAcuerdos(
-      vincularPagosPosteriores(acuerdos, [], [], { disponible: false, motivo: "ERROR_CRUCE_PAGOS" })
-    ).rows;
+    const vinculados = vincularPagosPosteriores(acuerdos, [], [], { disponible: false, motivo: "ERROR_CRUCE_PAGOS" });
+    return resolverEpisodiosAcuerdos(vinculados).rows
+      .map((row) => ({ ...row, ...clasificarSituacionAcuerdo(row) }))
+      .filter(acuerdoSigueEnUniversoActual);
   }
 }
 
@@ -198,7 +206,8 @@ export async function resumenDashboard(req, res) {
 
       const actividadHoy = actividadDeUsuarioEnFecha(gestionesHoyRows, hoy).get(username) || {};
       const acuerdosHoyBase = gestionesHoyRows.map(transformarGestionEnAcuerdo).filter(Boolean);
-      const acuerdosHoy = await resolverEpisodiosDashboard(acuerdosHoyBase, finHoy);
+      const acuerdosHoyUniverso = await enriquecerAcuerdosConEstadoCuentaActual(acuerdosHoyBase);
+      const acuerdosHoy = await resolverEpisodiosDashboard(acuerdosHoyUniverso, finHoy);
       const pagosMesCantidad = Number(pagosMesAgg[0]?.cantidad || 0);
       const pagosMesMonto = Number(pagosMesAgg[0]?.monto || 0);
       const fichaje = resumenFichaje(asistenciaHoy);
@@ -304,7 +313,8 @@ export async function resumenDashboard(req, res) {
     ]);
 
     const acuerdosBase = gestionesAcuerdo.map(transformarGestionEnAcuerdo).filter(Boolean);
-    const acuerdos = await resolverEpisodiosDashboard(acuerdosBase, now);
+    const acuerdosUniverso = await enriquecerAcuerdosConEstadoCuentaActual(acuerdosBase);
+    const acuerdos = await resolverEpisodiosDashboard(acuerdosUniverso, now);
     const desdeMesClave = `${mes}-01`;
     const hastaMesClave = new Date(hastaMes.getTime() - 1).toISOString().slice(0, 10);
     const novedadesPeriodo = novedades.filter((item) => novedadSolapaRango(item, desdeMesClave, hastaMesClave));

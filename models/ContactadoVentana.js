@@ -15,6 +15,9 @@ const ContactadoVentanaSchema = new Schema(
     gestionResolucionId: { type: Schema.Types.ObjectId, ref: "ReporteGestion", default: null },
 
     dni: { type: String, required: true, index: true, trim: true },
+    // V5: identidad operativa del caso. Evita que otro operador cree una ventana
+    // paralela por el mismo DNI/deuda mientras el dueño original sigue vigente.
+    casoKey: { type: String, default: "", index: true, trim: true, maxlength: 260 },
     nombreDeudor: { type: String, default: "", trim: true, maxlength: 240 },
     operador: { type: String, required: true, index: true, trim: true, lowercase: true },
     entidad: { type: String, default: "", index: true, trim: true, maxlength: 120 },
@@ -33,7 +36,7 @@ const ContactadoVentanaSchema = new Schema(
 
     estado: {
       type: String,
-      enum: ["abierta", "renovada_anticipada", "cumplida", "vencida", "reasignada"],
+      enum: ["abierta", "renovada_anticipada", "cumplida", "vencida", "reasignada", "cerrada_terminal"],
       default: "abierta",
       index: true,
     },
@@ -48,6 +51,13 @@ const ContactadoVentanaSchema = new Schema(
     tipoContactoResolucion: { type: String, default: "", maxlength: 180 },
     estadoCuentaResolucion: { type: String, default: "", maxlength: 180 },
 
+    // Foto actual del caso en Reporte de Gestiones. Puede haber sido modificada
+    // por otro operador sin alterar el dueño ni renovar la vigencia.
+    estadoActual: { type: String, default: "", index: true, maxlength: 180 },
+    ultimoOperador: { type: String, default: "", index: true, trim: true, lowercase: true, maxlength: 120 },
+    ultimaGestionAt: { type: Date, default: null, index: true },
+    ultimaGestionKey: { type: String, default: "", maxlength: 80 },
+
     clickRealizadoAt: { type: Date, default: null, index: true },
     clickRealizadoPor: { type: String, default: "", trim: true, lowercase: true, maxlength: 120 },
   },
@@ -58,6 +68,7 @@ ContactadoVentanaSchema.index({ mesOrigen: 1, estado: 1, operador: 1, venceAt: 1
 ContactadoVentanaSchema.index({ estado: 1, operador: 1, venceAt: 1 });
 ContactadoVentanaSchema.index({ estado: 1, venceAt: 1, operador: 1 });
 ContactadoVentanaSchema.index({ dni: 1, operador: 1, iniciaAt: -1 });
+ContactadoVentanaSchema.index({ casoKey: 1, estado: 1, venceAt: -1 });
 ContactadoVentanaSchema.index({ serieId: 1, iniciaAt: 1 });
 ContactadoVentanaSchema.index({ estado: 1, cerradaAt: -1 });
 ContactadoVentanaSchema.index({ mesOrigen: 1, esOrigenContactado: 1, iniciaAt: 1 });

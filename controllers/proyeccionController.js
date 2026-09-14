@@ -18,6 +18,12 @@ import Pago from "../models/Pago.js";
 import PagoInformadoMango from "../models/PagoInformadoMango.js";
 import { transformarGestionEnAcuerdo, resolverEpisodiosAcuerdos, vincularPagosPosteriores } from "../services/acuerdosGestionesService.js";
 import {
+  acuerdoSigueEnUniversoActual,
+  clasificarSituacionAcuerdo,
+  enriquecerAcuerdosConEstadoCuentaActual,
+} from "../services/acuerdosEstadoActualService.js";
+import { USUARIOS_OCULTOS_REPORTES_CONTROL } from "../utils/controlEquipo.js";
+import {
   claveFechaCalendario,
   fechaClaveArgentina,
   finDiaArgentinaUTC,
@@ -261,6 +267,7 @@ const mapearGestionAacuerdoMango = (gestion = {}, numeroPorNombre = new Map()) =
     anticipoVto: transformado.fechaAnticipo || null,
     montoCuota: transformado.montoCuota,
     primerVto: transformado.primerVencimiento || null,
+    primerVencimientoCuota: transformado.primerVencimientoCuota || null,
     cuotasCantidad: transformado.cuotas,
     primerPago: transformado.primerPago,
     montoTotalAcuerdo: transformado.montoTotalAcuerdo,
@@ -325,10 +332,18 @@ const buscarAcuerdosMangoDeProyecciones = async (proyecciones = []) => {
     .maxTimeMS(30000)
     .lean();
 
+  let acuerdos = gestiones
+    .map((gestion) => mapearGestionAacuerdoMango(gestion, numeroPorNombre))
+    .filter(Boolean);
+
+  acuerdos = await enriquecerAcuerdosMangoConEstadoCuentaActual(acuerdos);
+  acuerdos = await vincularAcuerdosMangoConPagos(acuerdos);
+  acuerdos = resolverEpisodiosAcuerdos(acuerdos).rows
+    .map((row) => ({ ...row, ...clasificarSituacionAcuerdo(row) }))
+    .filter(acuerdoSigueEnUniversoActual);
+
   const mapa = new Map();
-  for (const gestion of gestiones) {
-    const acuerdo = mapearGestionAacuerdoMango(gestion, numeroPorNombre);
-    if (!acuerdo) continue;
+  for (const acuerdo of acuerdos) {
     const clave = claveDniEntidad(acuerdo.dni, acuerdo.entidadNumero);
     if (!clave) continue;
     const lista = mapa.get(clave) || [];
@@ -1683,6 +1698,7 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
       acuerdosMango = gestionesMango
         .map((gestion) => mapearGestionAacuerdoMango(gestion, numeroPorNombreTemporal))
         .filter(Boolean);
+      acuerdosMango = await enriquecerAcuerdosMangoConEstadoCuentaActual(acuerdosMango);
     }
 
     const numeroPorNombre = new Map(
@@ -1700,7 +1716,9 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
 
     const variantesObjetivo = await variantesOperadorObjetivo(req, usuarioId);
     const acuerdosMangoVinculadosTodos = await vincularAcuerdosMangoConPagos(acuerdosMango);
-    const acuerdosMangoEpisodios = resolverEpisodiosAcuerdos(acuerdosMangoVinculadosTodos).rows;
+    const acuerdosMangoEpisodios = resolverEpisodiosAcuerdos(acuerdosMangoVinculadosTodos).rows
+      .map((row) => ({ ...row, ...clasificarSituacionAcuerdo(row) }))
+      .filter(acuerdoSigueEnUniversoActual);
     const acuerdosMangoVinculados = acuerdosMangoEpisodios
       .filter((acuerdo) => acuerdoPerteneceAOperador(acuerdo, variantesObjetivo));
 
@@ -1759,7 +1777,7 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
         };
       }),
       ...acuerdosMangoConPagos.map((acuerdo) => {
-        const importe = Number(
+        const importeComprometido = Number(
           acuerdo.primerPago ||
             acuerdo.anticipoMonto ||
             acuerdo.montoCuota ||
@@ -1767,13 +1785,16 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
             acuerdo.deudaMin ||
             0
         );
+        // PAGADO_BAJADO conserva el dinero real cobrado, pero ya no proyecta
+        // compromisos futuros porque el Estado de Cuenta actual bajó el acuerdo.
+        const importe = acuerdo.acuerdoProyectable === false ? 0 : importeComprometido;
         const importePagado = Number(
           acuerdo.montoPagosValidos || acuerdo.montoPagosPosteriores || 0
         );
         const fechaAcuerdo = acuerdo.fecha || acuerdo.fechaHora || null;
         const fechaVencimiento = claveVencimientoAcuerdoMango(acuerdo) || fechaAcuerdo;
         const estado = importePagado > 0
-          ? (importe > 0 && importePagado >= importe ? "Pagado" : "Pagado parcial")
+          ? (importeComprometido > 0 && importePagado >= importeComprometido ? "Pagado" : "Pagado parcial")
           : acuerdo.requiereRevisionPagos
           ? "Requiere revisión"
           : "Acuerdo Mango";
@@ -1785,7 +1806,7 @@ export const obtenerProyeccionesParaResumen = async (req, res) => {
           importePagado,
           estado,
           concepto: acuerdo.tipoAcuerdo || acuerdo.resultado || "Acuerdo",
-          fechaPromesa: fechaVencimiento,
+          fechaPromesa: acuerdo.acuerdoProyectable === false ? null : fechaVencimiento,
           creado: fechaAcuerdo,
           empleadoId: { username: acuerdo.operador || acuerdo.usuario || acuerdo.operadorGestion || acuerdo.operadorPago || "Sin usuario" },
           entidadId: {
@@ -3638,9 +3659,14 @@ export const buscarCoincidenciasAcuerdosMango = async (req, res) => {
       construirMapasEntidades(),
     ]);
 
-    const acuerdos = gestionesAcuerdo
+    let acuerdos = gestionesAcuerdo
       .map((gestion) => mapearGestionAacuerdoMango(gestion, mapasEntidad.numeroPorNombre))
-      .filter(Boolean)
+      .filter(Boolean);
+    acuerdos = await enriquecerAcuerdosMangoConEstadoCuentaActual(acuerdos);
+    acuerdos = await vincularAcuerdosMangoConPagos(acuerdos);
+    acuerdos = resolverEpisodiosAcuerdos(acuerdos).rows
+      .map((row) => ({ ...row, ...clasificarSituacionAcuerdo(row) }))
+      .filter(acuerdoSigueEnUniversoActual)
       .slice(0, 5);
 
     return res.json({
@@ -3797,6 +3823,9 @@ const normalizarEstadoMango = (valor = "") =>
     .trim()
     .toLowerCase();
 
+const enriquecerAcuerdosMangoConEstadoCuentaActual = async (acuerdos = []) =>
+  enriquecerAcuerdosConEstadoCuentaActual(acuerdos, { maxTimeMS: 30000 });
+
 /**
  * Traduce un acuerdo confirmado de Mango a los mismos estados operativos que
  * usa la tabla de acuerdos manuales. Los pagos informados no intervienen: solo
@@ -3869,11 +3898,25 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
 
   const desde = String(req.query?.fechaDesde || req.query?.desde || "").trim();
   const hasta = String(req.query?.fechaHasta || req.query?.hasta || "").trim();
+  const fechaISOValida = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
+  // Regla V17: Mango usa la FECHA DE CARGA del acuerdo como período. No se
+  // incorporan acuerdos de meses anteriores por tener vencimientos en el mes.
   if (desde || hasta) {
     const rango = {};
-    if (/^\d{4}-\d{2}-\d{2}$/.test(desde)) rango.$gte = crearFechaLocal(desde);
-    if (/^\d{4}-\d{2}-\d{2}$/.test(hasta)) rango.$lte = crearFechaLocal(hasta, true);
+    if (fechaISOValida(desde)) rango.$gte = crearFechaLocal(desde);
+    if (fechaISOValida(hasta)) rango.$lte = crearFechaLocal(hasta, true);
     if (Object.keys(rango).length) condiciones.push({ fecha: rango });
+  }
+
+  // Mismo universo visible que Reporte de Acuerdos: incluye operadores dados
+  // de baja y `residual`; sólo excluye cuentas técnicas/de prueba.
+  const usuariosTecnicos = [...USUARIOS_OCULTOS_REPORTES_CONTROL];
+  if (usuariosTecnicos.length) {
+    condiciones.push({
+      $nor: usuariosTecnicos.map((username) => ({
+        usuario: new RegExp(`^${escapeRegexSafe(username)}$`, "i"),
+      })),
+    });
   }
 
   const entidadId = String(req.query?.entidadId || "").trim();
@@ -3958,7 +4001,8 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
 
   let acuerdos = gestiones
     .map((gestion) => mapearGestionAacuerdoMango(gestion, mapas.numeroPorNombre))
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((acuerdo) => ({ ...acuerdo, esArrastrePeriodo: false, dentroPeriodoCarga: true }));
 
   if (!acuerdos.length) {
     return {
@@ -3969,35 +4013,67 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
     };
   }
 
-  acuerdos = resolverEpisodiosAcuerdos(await vincularAcuerdosMangoConPagos(acuerdos)).rows;
+  acuerdos = await enriquecerAcuerdosMangoConEstadoCuentaActual(acuerdos);
+  const situacionVista = String(req.query?.situacionAcuerdo || "activos").trim().toLowerCase() === "bajados"
+    ? "bajados"
+    : "activos";
+
+  // Primero resolvemos la secuencia COMPLETA de acuerdos del caso y después
+  // clasificamos. Así un acuerdo anterior sin pagos queda ANULADO X NUEVO aunque
+  // el acuerdo posterior termine como PAGADO_BAJADO o BAJADO.
+  const acuerdosVinculados = await vincularAcuerdosMangoConPagos(acuerdos);
+  const episodiosGlobal = resolverEpisodiosAcuerdos(acuerdosVinculados);
+  const efectivosClasificados = (episodiosGlobal.rows || []).map((row) => ({
+    ...row,
+    ...clasificarSituacionAcuerdo(row),
+  }));
+  let acuerdosActivos = efectivosClasificados.filter(acuerdoSigueEnUniversoActual);
+  let acuerdosBajados = [
+    ...efectivosClasificados.filter((row) => !acuerdoSigueEnUniversoActual(row)),
+    ...(episodiosGlobal.descartados || []).map((row) => ({
+      ...row,
+      estadoVencimientoOriginal: row?.estadoVencimientoOriginal || row?.estadoVencimiento || "",
+      estadoVencimiento: "ANULADO X NUEVO",
+      estadoAcuerdo: "ANULADO X NUEVO",
+      acuerdoAnuladoPorNuevo: true,
+      ...clasificarSituacionAcuerdo({ ...row, acuerdoAnuladoPorNuevo: true, estadoVencimiento: "ANULADO X NUEVO" }),
+    })),
+  ];
 
   const variantesObjetivo = await variantesOperadorObjetivo(req, usuarioId);
-  acuerdos = acuerdos.filter((acuerdo) => acuerdoPerteneceAOperador(acuerdo, variantesObjetivo));
+  const aplicarFiltrosPost = (rows = []) => {
+    let salida = rows.filter((acuerdo) => acuerdoPerteneceAOperador(acuerdo, variantesObjetivo));
+    if (subCesionId) {
+      salida = salida.filter((acuerdo) =>
+        (acuerdo.pagosValidos || []).some((pago) => String(pago.subCesionId || "") === subCesionId)
+      );
+    }
+    return salida
+      .map((acuerdo) => ({
+        ...acuerdo,
+        estadoSeguimiento: calcularEstadoSeguimientoMango(acuerdo),
+      }))
+      .filter((acuerdo) => coincideEstadoMango(acuerdo, estadoFiltro));
+  };
 
-  if (subCesionId) {
-    acuerdos = acuerdos.filter((acuerdo) =>
-      (acuerdo.pagosValidos || []).some((pago) => String(pago.subCesionId || "") === subCesionId)
-    );
-  }
-
-  acuerdos = acuerdos
-    .map((acuerdo) => ({
-      ...acuerdo,
-      estadoSeguimiento: calcularEstadoSeguimientoMango(acuerdo),
-    }))
-    .filter((acuerdo) => coincideEstadoMango(acuerdo, estadoFiltro));
-
+  acuerdosActivos = aplicarFiltrosPost(acuerdosActivos);
+  acuerdosBajados = aplicarFiltrosPost(acuerdosBajados);
+  const totalActivos = acuerdosActivos.length;
+  const totalBajados = acuerdosBajados.length;
+  acuerdos = situacionVista === "bajados" ? acuerdosBajados : acuerdosActivos;
   acuerdos = await enriquecerAcuerdosMangoConPagosInformados(acuerdos);
 
   // Orden solicitado desde la tabla. Se aplica después del cruce con pagos porque
   // varias columnas (pagado válido, estado y último pago) son valores derivados.
-  const sortKey = String(req.query?.sortKey || "fecha");
-  const sortDir = String(req.query?.sortDir || "desc").toLowerCase() === "asc" ? 1 : -1;
+  const sortKey = String(req.query?.sortKey || "cargado");
+  const sortDir = String(req.query?.sortDir || "asc").toLowerCase() === "desc" ? -1 : 1;
   const sortValue = (item, key) => {
     switch (key) {
-      case "fecha": return new Date(item.fecha || 0).getTime() || 0;
+      case "fecha":
+      case "cargado": return new Date(item.fechaHora || `${item.fecha || "1970-01-01"}T${item.hora || "00:00:00"}.000Z`).getTime() || 0;
       case "estado": return String(item.estadoSeguimiento || "").toLocaleLowerCase("es");
       case "titular": return `${String(item.nombreDeudor || "").toLocaleLowerCase("es")} ${String(item.dni || "")}`;
+      case "dni": return String(item.dni || "").padStart(12, "0");
       case "entidad": return `${String(item.entidadNumero || "").padStart(5, "0")} ${String(item.entidad || "").toLocaleLowerCase("es")}`;
       case "tipoAcuerdo": return String(item.tipoAcuerdo || item.resultado || "").toLocaleLowerCase("es");
       case "pagoEsperado": return Number(item.primerPago || item.anticipoMonto || item.montoCuota || 0);
@@ -4006,6 +4082,8 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
       case "estadoPago": return String(item.estadoPagoAcuerdo || "").toLocaleLowerCase("es");
       case "ultimoPago": return item.ultimoPagoValido ? new Date(item.ultimoPagoValido).getTime() : 0;
       case "operador": return String(item.operador || item.usuario || "").toLocaleLowerCase("es");
+      case "estadoCuentaActual": return String(item.estadoCuentaActual || "").toLocaleLowerCase("es");
+      case "vencimiento": return new Date(item.anticipoVto || item.primerVto || 0).getTime() || 0;
       default: return new Date(item.fecha || 0).getTime() || 0;
     }
   };
@@ -4019,6 +4097,9 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
   return {
     acuerdos,
     total: acuerdos.length,
+    totalActivos,
+    totalBajados,
+    situacionAcuerdo: situacionVista,
     paginadoEnMongo: false,
     filtrosNoCompatibles: [],
   };
@@ -4076,6 +4157,9 @@ export const listarAcuerdosMangoParaProyecciones = async (req, res) => {
       acuerdos,
       filtrosNoCompatibles,
       total: totalCalculado,
+      totalActivos = 0,
+      totalBajados = 0,
+      situacionAcuerdo = "activos",
       paginadoEnMongo,
     } = await obtenerAcuerdosMangoFiltrados(req, { page, limit, paginar: true });
     const total = Number(totalCalculado ?? acuerdos.length);
@@ -4093,6 +4177,9 @@ export const listarAcuerdosMangoParaProyecciones = async (req, res) => {
       filtrosNoCompatibles,
       items,
       total,
+      totalActivos: Number(totalActivos || 0),
+      totalBajados: Number(totalBajados || 0),
+      situacionAcuerdo,
       page,
       pages: Math.max(1, Math.ceil(total / limit)),
       limit,
@@ -4106,7 +4193,7 @@ export const listarAcuerdosMangoParaProyecciones = async (req, res) => {
   }
 };
 
-const obtenerAcuerdoMangoAutorizado = async (req, acuerdoId) => {
+const obtenerAcuerdoMangoAutorizado = async (req, acuerdoId, { permitirBajado = false } = {}) => {
   if (!mongoose.isValidObjectId(acuerdoId)) return { error: "Acuerdo Mango inválido", status: 400 };
   const gestion = await ReporteGestion.findOne({
     _id: acuerdoId,
@@ -4122,7 +4209,72 @@ const obtenerAcuerdoMangoAutorizado = async (req, acuerdoId) => {
   const { numeroPorNombre } = await construirMapasEntidades();
   let acuerdo = mapearGestionAacuerdoMango(gestion, numeroPorNombre);
   if (!acuerdo) return { error: "No se pudo interpretar el acuerdo Mango", status: 422 };
-  [acuerdo] = await vincularAcuerdosMangoConPagos([acuerdo]);
+
+  // Para autorizar una acción no alcanza con mirar el acuerdo aislado: hay que
+  // conocer si luego fue reemplazado por otro acuerdo del mismo DNI + entidad.
+  const dniNormalizado = normalizarDni(acuerdo.dni);
+  const dniNumero = Number(dniNormalizado);
+  const entidadNumero = Number(acuerdo.entidadNumero || 0);
+  const entidadNombre = String(acuerdo.entidad || gestion.entidad || "").trim();
+  const condicionesEntidad = [];
+  if (entidadNumero > 0) condicionesEntidad.push({ entidadNumero });
+  if (entidadNombre) condicionesEntidad.push({ entidad: new RegExp(`^${escapeRegexSafe(entidadNombre)}$`, "i") });
+  const dnisCaso = Number.isSafeInteger(dniNumero) ? [dniNormalizado, dniNumero] : [dniNormalizado];
+
+  const gestionesCaso = dniNormalizado && condicionesEntidad.length
+    ? await ReporteGestion.find({
+        borrado: { $ne: true },
+        resultadoGestion: /acuerdo/i,
+        dni: { $in: dnisCaso },
+        $or: condicionesEntidad,
+      })
+        .sort({ fecha: 1, hora: 1, _id: 1 })
+        .select("dni entidad entidadNumero nombreDeudor usuario fecha hora tipoContacto resultadoGestion estadoCuenta telMailMarcado observacionGestion")
+        .lean()
+        .maxTimeMS(15000)
+    : [gestion];
+
+  let acuerdosCaso = gestionesCaso
+    .map((row) => mapearGestionAacuerdoMango(row, numeroPorNombre))
+    .filter(Boolean);
+  acuerdosCaso = await enriquecerAcuerdosMangoConEstadoCuentaActual(acuerdosCaso);
+  acuerdosCaso = await vincularAcuerdosMangoConPagos(acuerdosCaso);
+  const episodiosCaso = resolverEpisodiosAcuerdos(acuerdosCaso);
+  const targetId = String(acuerdoId);
+  const efectivo = (episodiosCaso.rows || []).find((row) => String(row?._id || row?.id || "") === targetId);
+  const anulado = (episodiosCaso.descartados || []).find((row) => String(row?._id || row?.id || "") === targetId);
+
+  if (anulado) {
+    acuerdo = {
+      ...anulado,
+      situacionAcuerdo: "ANULADO",
+      acuerdoBajado: true,
+      acuerdoAnulado: true,
+      acuerdoAnuladoPorNuevo: true,
+      acuerdoPagadoBajado: false,
+      acuerdoContabilizable: false,
+      acuerdoProyectable: false,
+      motivoBajaAcuerdo: "Anulado x nuevo (sin pagos)",
+    };
+  } else if (efectivo) {
+    acuerdo = { ...efectivo, ...clasificarSituacionAcuerdo(efectivo) };
+  } else {
+    // Fallback defensivo para datos históricos incompletos.
+    [acuerdo] = await enriquecerAcuerdosMangoConEstadoCuentaActual([acuerdo]);
+    [acuerdo] = await vincularAcuerdosMangoConPagos([acuerdo]);
+    acuerdo = { ...acuerdo, ...clasificarSituacionAcuerdo(acuerdo) };
+  }
+
+  if ((!acuerdoSigueEnUniversoActual(acuerdo) || acuerdo.acuerdoProyectable === false) && !permitirBajado) {
+    return {
+      error: acuerdo.acuerdoAnuladoPorNuevo
+        ? "El acuerdo fue ANULADO X NUEVO sin pagos y ya no admite acciones operativas."
+        : acuerdo.acuerdoPagadoBajado
+        ? `El acuerdo conserva sus pagos en reportería, pero está operativamente bajado (Estado de Cuenta actual: ${acuerdo.estadoCuentaActual || "sin estado"}).`
+        : `El acuerdo está bajado y no puede recibir acciones operativas (Estado de Cuenta actual: ${acuerdo.estadoCuentaActual || "sin estado"}).`,
+      status: 409,
+    };
+  }
 
   if (esAmbitoPropio(req)) {
     const variantes = await variantesOperadorObjetivo(req);
@@ -4182,7 +4334,7 @@ export const informarPagoAcuerdoMango = async (req, res) => {
 export const listarPagosInformadosAcuerdoMango = async (req, res) => {
   try {
     if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso" });
-    const acceso = await obtenerAcuerdoMangoAutorizado(req, req.params.id);
+    const acceso = await obtenerAcuerdoMangoAutorizado(req, req.params.id, { permitirBajado: true });
     if (acceso.error) return res.status(acceso.status).json({ error: acceso.error });
 
     const pagos = await PagoInformadoMango.find({ acuerdoGestionId: req.params.id })
@@ -4235,23 +4387,29 @@ export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet("Acuerdos Mango");
     worksheet.columns = [
-      { header: "Fecha acuerdo", key: "fecha", width: 15 },
-      { header: "Hora", key: "hora", width: 10 },
+      { header: "Estado", key: "estadoSeguimiento", width: 18 },
       { header: "DNI", key: "dni", width: 15 },
       { header: "Titular", key: "titular", width: 30 },
-      { header: "Entidad ID", key: "entidadNumero", width: 12 },
       { header: "Entidad", key: "entidad", width: 25 },
-      { header: "Tipo de acuerdo", key: "tipo", width: 30 },
+      { header: "Entidad ID", key: "entidadNumero", width: 12 },
+      { header: "Operador", key: "operador", width: 22 },
+      { header: "Fecha acuerdo", key: "fecha", width: 15 },
+      { header: "Hora", key: "hora", width: 10 },
+      { header: "Tipo de acuerdo", key: "tipo", width: 34 },
+      { header: "Vence primer pago", key: "vencePrimerPago", width: 18 },
+      { header: "Vence primera cuota", key: "vencePrimeraCuota", width: 18 },
+      { header: "Pago esperado", key: "pagoEsperado", width: 16 },
       { header: "Anticipo", key: "anticipo", width: 14 },
       { header: "Cuota", key: "cuota", width: 14 },
       { header: "Total acuerdo", key: "total", width: 16 },
-      { header: "Operador", key: "operador", width: 22 },
-      { header: "Estado cuenta", key: "estadoCuenta", width: 22 },
-      { header: "Estado pago", key: "estadoPago", width: 24 },
       { header: "Pagado válido", key: "pagadoValido", width: 16 },
+      { header: "Estado pago", key: "estadoPago", width: 24 },
+      { header: "Último pago válido", key: "ultimoPago", width: 18 },
+      { header: "Estado cuenta al acuerdo", key: "estadoCuenta", width: 24 },
+      { header: "Estado cuenta actual", key: "estadoCuentaActual", width: 27 },
+      { header: "Situación acuerdo", key: "situacionAcuerdo", width: 18 },
       { header: "Pago mismo día", key: "pagoMismoDia", width: 16 },
       { header: "Pagos posteriores", key: "pagosPosteriores", width: 17 },
-      { header: "Último pago válido", key: "ultimoPago", width: 18 },
       { header: "Coincidencia", key: "coincidencia", width: 18 },
       { header: "Revisión", key: "revision", width: 38 },
       { header: "Observación Mango", key: "observacion", width: 45 },
@@ -4271,45 +4429,71 @@ export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
       return digits && Number.isSafeInteger(number) ? number : null;
     };
 
-    acuerdos.forEach((item) => worksheet.addRow({
-      fecha: toDateOnly(item.fecha),
-      hora: horaExcelMango(item.hora),
-      dni: dniExcelMango(item.dni),
-      titular: item.nombreDeudor || "",
-      entidadNumero: item.entidadNumero || "",
-      entidad: item.entidad || "",
-      tipo: item.tipoAcuerdo || item.resultado || "Acuerdo",
-      anticipo: Number(item.anticipoMonto || 0),
-      cuota: Number(item.montoCuota || 0),
-      total: Number(item.montoTotalAcuerdo || 0),
-      operador: item.operador || "",
-      estadoCuenta: item.estadoCuenta || "",
-      estadoPago: item.estadoPagoAcuerdo || "",
-      pagadoValido: Number(item.montoPagosValidos || item.montoPagosPosteriores || 0),
-      pagoMismoDia: Number(item.montoPagosMismoDia || 0),
-      pagosPosteriores: Number(item.montoPagosEstrictamentePosteriores || 0),
-      ultimoPago: item.ultimoPagoValido ? new Date(`${item.ultimoPagoValido}T12:00:00`) : "",
-      coincidencia: item.coincidenciaPagoPor || "",
-      revision: item.motivoRevisionPagos || "",
-      observacion: item.observacionGestion || item.observacionResumen || "",
-    }));
+    acuerdos.forEach((item) => {
+      const situacion = item.situacionAcuerdo || (item.acuerdoBajado ? "BAJADO" : "ACTIVO");
+      const row = worksheet.addRow({
+        estadoSeguimiento: item.estadoSeguimiento || "",
+        fecha: toDateOnly(item.fecha),
+        hora: horaExcelMango(item.hora),
+        dni: dniExcelMango(item.dni),
+        titular: item.nombreDeudor || "",
+        entidadNumero: item.entidadNumero || "",
+        entidad: item.entidad || "",
+        tipo: item.tipoAcuerdo || item.resultado || "Acuerdo",
+        vencePrimerPago: item.anticipoVto || item.primerVto ? toDateOnly(item.anticipoVto || item.primerVto) : "",
+        vencePrimeraCuota: item.primerVencimientoCuota ? toDateOnly(item.primerVencimientoCuota) : "",
+        pagoEsperado: Number(item.primerPago || item.anticipoMonto || item.montoCuota || 0),
+        anticipo: Number(item.anticipoMonto || 0),
+        cuota: Number(item.montoCuota || 0),
+        total: Number(item.montoTotalAcuerdo || 0),
+        operador: item.operador || "",
+        estadoCuenta: item.estadoCuenta || "",
+        estadoCuentaActual: item.estadoCuentaActual || item.estadoCuenta || "",
+        situacionAcuerdo: situacion,
+        estadoPago: item.estadoPagoAcuerdo || "",
+        pagadoValido: Number(item.montoPagosValidos || item.montoPagosPosteriores || 0),
+        pagoMismoDia: Number(item.montoPagosMismoDia || 0),
+        pagosPosteriores: Number(item.montoPagosEstrictamentePosteriores || 0),
+        ultimoPago: item.ultimoPagoValido ? new Date(`${item.ultimoPagoValido}T12:00:00`) : "",
+        coincidencia: item.coincidenciaPagoPor || "",
+        revision: item.motivoRevisionPagos || "",
+        observacion: item.observacionGestion || item.observacionResumen || "",
+      });
+      const situacionKey = String(situacion).toUpperCase();
+      if (["BAJADO", "ANULADO"].includes(situacionKey)) {
+        row.eachCell({ includeEmpty: true }, (cell) => {
+          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF3E0" } };
+        });
+        row.getCell("situacionAcuerdo").font = { bold: true, color: { argb: "FFB45309" } };
+        row.getCell("estadoCuentaActual").font = { bold: true, color: { argb: "FFB45309" } };
+      } else if (situacionKey === "PAGADO_BAJADO") {
+        row.eachCell({ includeEmpty: true }, (cell) => {
+          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEAF7F0" } };
+        });
+        row.getCell("situacionAcuerdo").font = { bold: true, color: { argb: "FF146044" } };
+        row.getCell("pagadoValido").font = { bold: true, color: { argb: "FF087653" } };
+      }
+    });
 
     worksheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
     worksheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF29154F" } };
     worksheet.views = [{ state: "frozen", ySplit: 1 }];
-    ["anticipo", "cuota", "total", "pagadoValido", "pagoMismoDia", "pagosPosteriores"].forEach((key) => {
+    ["pagoEsperado", "anticipo", "cuota", "total", "pagadoValido", "pagoMismoDia", "pagosPosteriores"].forEach((key) => {
       worksheet.getColumn(key).numFmt = '$ #,##0.00';
     });
     worksheet.getColumn("fecha").numFmt = "dd/mm/yyyy";
+    worksheet.getColumn("vencePrimerPago").numFmt = "dd/mm/yyyy";
+    worksheet.getColumn("vencePrimeraCuota").numFmt = "dd/mm/yyyy";
     worksheet.getColumn("hora").numFmt = "hh:mm:ss";
     worksheet.getColumn("dni").numFmt = "0";
     worksheet.getColumn("ultimoPago").numFmt = "dd/mm/yyyy";
-    worksheet.autoFilter = { from: "A1", to: "T1" };
+    worksheet.autoFilter = { from: "A1", to: "Z1" };
 
     const buffer = await workbook.xlsx.writeBuffer();
     const suffix = fechaClaveArgentina();
+    const situacionArchivo = String(req.query?.situacionAcuerdo || "activos").trim().toLowerCase() === "bajados" ? "bajados" : "activos";
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename=acuerdos_mango_${suffix}.xlsx`);
+    res.setHeader("Content-Disposition", `attachment; filename=acuerdos_mango_${situacionArchivo}_${suffix}.xlsx`);
     return res.send(Buffer.from(buffer));
   } catch (error) {
     console.error("❌ Error exportando acuerdos Mango:", error);
