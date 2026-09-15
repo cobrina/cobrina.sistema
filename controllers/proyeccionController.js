@@ -3946,6 +3946,8 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
   // calcula después de cruzar fecha de vencimiento y pagos válidos, igual que
   // en acuerdos manuales. Por eso no se aplica como regex sobre MongoDB.
   const estadoFiltro = String(req.query?.estado || "").trim();
+  const filtrarPromesaHoy = req.query?.promesaHoy === "true";
+  const hoyClavePromesaMango = fechaClaveArgentina();
 
   const buscar = String(req.query?.buscar || "").trim();
   if (buscar) {
@@ -4047,6 +4049,9 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
       salida = salida.filter((acuerdo) =>
         (acuerdo.pagosValidos || []).some((pago) => String(pago.subCesionId || "") === subCesionId)
       );
+    }
+    if (filtrarPromesaHoy) {
+      salida = salida.filter((acuerdo) => claveVencimientoAcuerdoMango(acuerdo) === hoyClavePromesaMango);
     }
     return salida
       .map((acuerdo) => ({

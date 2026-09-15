@@ -33,6 +33,8 @@ const PAGO_A_IMPUTAR_RX = /^\s*pagos?\s+a\s+imputar\s*$/i;
 const INCOBRABLE_RX = /^\s*incobrable\s*$/i;
 const ACUERDO_PAGO_RX = /^\s*acuerdo\s+de\s+pago\s*$/i;
 const ACUERDO_CUMPLIDO_RX = /^\s*acuerdo(?:\s+de\s+pago)?\s+cumplido\s*$/i;
+const FALLECIDO_RX = /^\s*fallecid[oa]\s*$/i;
+const CANCELADO_RX = /^\s*cancelad[oa](?:\s+en\s+otra\s+entidad)?\s*$/i;
 const NO_VOLUNTAD_ARREGLO_RX = /^\s*no\s+tiene\s+voluntad\s+de\s+arreglo\s*$/i;
 const FILTRO_SIN_ESTADOS_TERMINALES = {
   $nor: [
@@ -42,10 +44,14 @@ const FILTRO_SIN_ESTADOS_TERMINALES = {
     { estadoActual: INCOBRABLE_RX },
     { estadoActual: ACUERDO_PAGO_RX },
     { estadoActual: ACUERDO_CUMPLIDO_RX },
+    { estadoActual: FALLECIDO_RX },
+    { estadoActual: CANCELADO_RX },
     { estadoCuentaInicio: PAGO_A_IMPUTAR_RX },
     { estadoCuentaInicio: INCOBRABLE_RX },
     { estadoCuentaInicio: ACUERDO_PAGO_RX },
     { estadoCuentaInicio: ACUERDO_CUMPLIDO_RX },
+    { estadoCuentaInicio: FALLECIDO_RX },
+    { estadoCuentaInicio: CANCELADO_RX },
     { calificacionInicio: NO_VOLUNTAD_ARREGLO_RX },
   ],
 };
@@ -512,7 +518,12 @@ async function obtenerSeguimientoData(req, { exportar = false } = {}) {
   if (tocado === "si") filtro.clickRealizadoAt = { $ne: null };
   if (tocado === "no") filtro.clickRealizadoAt = null;
   const soloContactado = String(req.query.soloContactado || "").toLowerCase() === "true";
-  if (soloContactado) filtro.estadoActual = CONTACTADO_ESTADO_RX;
+  const cambioCalificacion = String(req.query.cambioCalificacion || "").toLowerCase() === "true";
+  if (cambioCalificacion) {
+    filtro.estadoActual = { $not: CONTACTADO_ESTADO_RX, $nin: [null, ""] };
+  } else if (soloContactado) {
+    filtro.estadoActual = CONTACTADO_ESTADO_RX;
+  }
 
   const page = exportar ? 1 : Math.max(1, Number(req.query.page || 1));
   const limit = exportar ? 10000 : Math.min(250, Math.max(10, Number(req.query.limit || 80)));
@@ -523,7 +534,11 @@ async function obtenerSeguimientoData(req, { exportar = false } = {}) {
     estado: "abierta",
     venceAt: { $gte: inicioDiaArgentina(now) },
     esOrigenContactado: true,
-    ...(soloContactado ? { estadoActual: CONTACTADO_ESTADO_RX } : {}),
+    ...(cambioCalificacion
+      ? { estadoActual: { $not: CONTACTADO_ESTADO_RX, $nin: [null, ""] } }
+      : soloContactado
+        ? { estadoActual: CONTACTADO_ESTADO_RX }
+        : {}),
   });
   let rows;
   if (sort.key === "toquesMes") {
@@ -1322,9 +1337,16 @@ export async function exportarExcel(req, res) {
       ];
 
       data.items.forEach((c) => {
+        // La columna Estado representa el semáforo operativo de la ventana, no el
+        // Estado de la Cuenta. En activos, cualquier ventana que no esté en
+        // Por vencer/Crítico debe mostrarse explícitamente como Vigente, incluso
+        // en la vista "Con cambio de calificación". Así evitamos celdas vacías
+        // si semaforo llega nulo/undefined por datos históricos.
         const estadoLabel = c.semaforo === "por-vencer" ? "Por vencer"
           : c.semaforo === "critico" ? "Crítico"
-            : c.semaforo === "vencido" ? "Vencido" : "";
+            : c.semaforo === "vencido" ? "Vencido"
+              : (!esVencidos && c.estado === "abierta") ? "Vigente"
+                : c.semaforo === "vigente" ? "Vigente" : (c.estado || "Vigente");
         const ultimoOperador = c.ultimaGestionAt
           ? `${c.ultimoOperador || c.operador || ""} · ${new Intl.DateTimeFormat("es-AR", {
               timeZone: "America/Argentina/Buenos_Aires", day: "2-digit", month: "2-digit", year: "numeric",

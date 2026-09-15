@@ -19,6 +19,8 @@ const PAGO_A_IMPUTAR_RX = /^\s*pagos?\s+a\s+imputar\s*$/i;
 const INCOBRABLE_RX = /^\s*incobrable\s*$/i;
 const ACUERDO_PAGO_RX = /^\s*acuerdo\s+de\s+pago\s*$/i;
 const ACUERDO_CUMPLIDO_RX = /^\s*acuerdo(?:\s+de\s+pago)?\s+cumplido\s*$/i;
+const FALLECIDO_RX = /^\s*fallecid[oa]\s*$/i;
+const CANCELADO_RX = /^\s*cancelad[oa](?:\s+en\s+otra\s+entidad)?\s*$/i;
 const NO_VOLUNTAD_ARREGLO_RX = /^\s*no\s+tiene\s+voluntad\s+de\s+arreglo\s*$/i;
 const DIA_MS = 86_400_000;
 const SOLAPE_SYNC_MS = 5 * 60 * 1000;
@@ -112,6 +114,14 @@ export function esGestionIncobrable(gestion = {}) {
   return INCOBRABLE_RX.test(txt(gestion.estadoCuenta));
 }
 
+export function esGestionFallecido(gestion = {}) {
+  return FALLECIDO_RX.test(txt(gestion.estadoCuenta));
+}
+
+export function esGestionCancelado(gestion = {}) {
+  return CANCELADO_RX.test(txt(gestion.estadoCuenta));
+}
+
 export function esResultadoSinVoluntadArreglo(gestion = {}) {
   return NO_VOLUNTAD_ARREGLO_RX.test(txt(gestion.resultadoGestion));
 }
@@ -127,7 +137,9 @@ export function esEstadoCuentaSalidaContactados(gestion = {}) {
   return esGestionPagoAImputar(gestion)
     || esGestionIncobrable(gestion)
     || esGestionAcuerdoPago(gestion)
-    || esGestionAcuerdoCumplido(gestion);
+    || esGestionAcuerdoCumplido(gestion)
+    || esGestionFallecido(gestion)
+    || esGestionCancelado(gestion);
 }
 
 // Para reconstrucciones/legacy también consideramos "No tiene voluntad de
@@ -1433,7 +1445,7 @@ async function limpiarContinuacionesEstadosTerminales(mesClave) {
 
 export async function asegurarLimpiezaEstadosTerminalesMes(mesClave) {
   if (limpiezaTerminalMesConfirmada.has(mesClave)) return 0;
-  const key = `contactados:cleanup-terminales-v3:${mesClave}`;
+  const key = `contactados:cleanup-terminales-v4:${mesClave}`;
   const hecha = await ContactadoSyncState.findOne({ key }).select("_id").lean();
   if (hecha) {
     limpiezaTerminalMesConfirmada.add(mesClave);
