@@ -51,14 +51,16 @@ function serializarPago(pago) {
 
 /**
  * Busca pagos reales sin permitir nunca una coincidencia por DNI solo.
- * - Con subcesión: DNI + número de entidad + subcesión.
- * - Sin subcesión: DNI + número de entidad, únicamente si los resultados
- *   pertenecen a una sola subcesión. Si hay más, requiere revisión.
+ * - Modo estándar: con subcesión usa DNI + entidad + subcesión; sin subcesión
+ *   exige que los pagos de DNI + entidad pertenezcan a una sola subcesión.
+ * - Modo ignorarSubCesion (usado por Colchón): DNI + entidad es la clave de
+ *   imputación y la subcesión queda únicamente como dato informativo.
  */
 export async function buscarPagosReales({
   dni,
   entidadNumero,
   subCesionId = "",
+  ignorarSubCesion = false,
   fechaDesde = null,
   fechaHasta = null,
   fechaCorte = null,
@@ -80,7 +82,7 @@ export async function buscarPagosReales({
   }
 
   const query = { dni: dniNormalizado, entidadId: numero };
-  if (sub) query.subCesionId = new mongoose.Types.ObjectId(sub);
+  if (!ignorarSubCesion && sub) query.subCesionId = new mongoose.Types.ObjectId(sub);
 
   const desde = fechaDesde ? inicioDia(fechaDesde) : null;
   const hasta = fechaHasta ? finDia(fechaHasta) : null;
@@ -95,7 +97,7 @@ export async function buscarPagosReales({
     .limit(Math.max(1, Math.min(Number(limite) || 500, 2000)))
     .lean({ virtuals: true });
 
-  if (!sub && pagos.length) {
+  if (!ignorarSubCesion && !sub && pagos.length) {
     const subcesiones = [...new Set(pagos.map((p) => String(p.subCesionId || "")).filter(Boolean))];
     if (subcesiones.length > 1) {
       return {
@@ -127,14 +129,18 @@ export async function buscarPagosReales({
   }
 
   return {
-    estadoVinculacion: pagos.length ? "coincidencia-exacta" : "sin-pagos",
+    estadoVinculacion: pagos.length
+      ? (ignorarSubCesion ? "coincidencia-dni-entidad" : "coincidencia-exacta")
+      : "sin-pagos",
     mensaje: pagos.length
-      ? "Coincidencia por DNI, número de entidad y subcesión."
+      ? (ignorarSubCesion
+          ? "Coincidencia por DNI y número de entidad; la subcesión es informativa."
+          : "Coincidencia por DNI, número de entidad y subcesión.")
       : "No se encontraron pagos reales con la clave indicada.",
     clave: {
       dni: dniNormalizado,
       entidadNumero: numero,
-      subCesionId: sub || null,
+      subCesionId: ignorarSubCesion ? null : (sub || null),
     },
     pagosAplicables,
     pagosMismoDia,

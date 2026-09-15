@@ -1556,7 +1556,7 @@ function performanceFill(agreements, maxAgreements) {
 
 function stylePerformanceCells(row, agreements, maxAgreements) {
   const tone = performanceFill(agreements, maxAgreements);
-  [1, 3].forEach((col) => {
+  [1, 2].forEach((col) => {
     const cell = row.getCell(col);
     cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: tone.fill } };
     cell.font = { ...cell.font, color: { argb: tone.font }, bold: true };
@@ -1632,8 +1632,8 @@ function addStatisticsSheet(workbook, summary, metadata) {
         ["Acuerdos con pago válido", summary.seguimientoPagos?.conPagoValido ?? summary.seguimientoPagos?.conPagoPosterior ?? 0, `${Number(summary.seguimientoPagos?.tasaConPagoValido ?? summary.seguimientoPagos?.tasaConPagoPosterior ?? 0).toFixed(1)}% de los acuerdos`],
         ["Primer pago cobrado", summary.totalPrimerPagoCobrado || 0, `${summary.acuerdosPrimerPagoCubierto || 0} primer(os) pago(s) cubierto(s)`],
         ["Cobrado válido", summary.seguimientoPagos?.montoPagosValidos ?? summary.seguimientoPagos?.montoPagosPosteriores ?? 0, `${summary.seguimientoPagos?.cantidadPagosValidos ?? summary.seguimientoPagos?.cantidadPagosPosteriores ?? 0} pago(s) válido(s)`],
-        ["Cobro acuerdos del período", summary.recaudacionPeriodo?.recaudadoAcuerdosPeriodo || 0, `${summary.recaudacionPeriodo?.cantidadPagosAcuerdosPeriodo || 0} pago(s) real(es) imputados a acuerdos generados en el período`],
-        ["Cobro acuerdos anteriores", summary.recaudacionPeriodo?.recaudadoCarteraAnterior || 0, `${summary.recaudacionPeriodo?.cantidadPagosCarteraAnterior || 0} cuota(s) / pago(s) de acuerdos anteriores`],
+        ["Cobros de acuerdos del período", summary.recaudacionPeriodo?.recaudadoAcuerdosPeriodo || 0, `${summary.recaudacionPeriodo?.cantidadPagosAcuerdosPeriodo || 0} pago(s) real(es) vinculados a acuerdos efectivos generados en el período`],
+        ["Otros cobros del período", summary.recaudacionPeriodo?.recaudadoCarteraAnterior || 0, `${summary.recaudacionPeriodo?.cantidadPagosCarteraAnterior || 0} pago(s) reales del operador no vinculados a un acuerdo efectivo generado en el período; pueden corresponder a acuerdos previos`],
         ["Recaudado total período", summary.recaudacionPeriodo?.recaudadoMes || 0, `${summary.recaudacionPeriodo?.cantidadPagos || 0} pago(s) reales en total`],
         ["Incluyen pago el mismo día", summary.seguimientoPagos?.pagoMismoDia || 0, "Se considera válido y también se identifica por separado"],
         ["Sin pago válido", summary.seguimientoPagos?.sinPagoValido ?? summary.seguimientoPagos?.sinPagoPosterior ?? 0, "Sin cobro desde la fecha del acuerdo dentro de la ventana"],
@@ -1641,17 +1641,14 @@ function addStatisticsSheet(workbook, summary, metadata) {
     : [["Cruce con Pagos", "Sin datos cargados", summary.integracionPagos?.motivo || "La empresa no utiliza o no tiene cargado el módulo Pagos"]];
   paymentSummaryRows.forEach((data) => {
     const row = ws.addRow(data);
-    const moneyRow = ["Primer pago cobrado", "Cobrado válido", "Cobro acuerdos del período", "Cobro acuerdos anteriores", "Recaudado total período"].includes(String(data?.[0] || ""));
+    const moneyRow = ["Primer pago cobrado", "Cobrado válido", "Cobros de acuerdos del período", "Otros cobros del período", "Recaudado total período"].includes(String(data?.[0] || ""));
     styleDataRow(row, { center: [2], moneyCols: moneyRow && summary.integracionPagos?.disponible ? [2] : [] });
   });
 
   ws.addRow([]);
   ws.addRow([
-    "OPERADOR", "TOTAL GESTIONES", "ACUERDOS EFECTIVOS", "1ER PAGO PROYECTADO", "1ER PAGO COBRADO",
-    "TICKET PROMEDIO 1ER PAGO", "MONTO CONTRACTUAL", "REACUERDOS EFECTIVOS",
-    "ACUERDOS CON PAGO", "COBRADO VINCULADO", "COBRO ACUERDOS DEL PERÍODO", "COBRO ACUERDOS ANTERIORES",
-    "RECAUDADO TOTAL PERÍODO", "CANCELACIÓN", "CANCELACIÓN CON ANTICIPO",
-    "ACUERDO EN CUOTAS CON ANTICIPO", "ACUERDO EN CUOTAS SIN ANTICIPO", "PARCIAL",
+    "OPERADOR", "ACUERDOS T.", "ACUERDOS C/PAGOS", "TICKET PROM.",
+    "TOTAL PROYECTADO", "TOTAL COBRADO DE PROYECCIONES", "COBRADO COLCHÓN / OTROS PAGOS", "TOTAL RECAUDADO",
   ]);
   const operatorHeader = ws.lastRow.number;
   styleHeader(ws.getRow(operatorHeader));
@@ -1659,26 +1656,16 @@ function addStatisticsSheet(workbook, summary, metadata) {
   summary.porOperador.forEach((item) => {
     const row = ws.addRow([
       item.nombre,
-      item.totalGestiones,
       item.acuerdos,
-      item.primerPago,
-      item.primerPagoCobrado,
-      item.ticketPromedio,
-      item.montoTotal,
-      item.reacuerdosEfectivos,
       item.conPagoPosterior,
-      item.montoPagosPosteriores,
+      item.ticketPromedio,
+      item.primerPago,
       item.recaudadoAcuerdosPeriodo,
       item.recaudadoCarteraAnterior,
       item.recaudadoMes,
-      item.cancelacion,
-      item.cancelacionConAnticipo,
-      item.cuotasConAnticipo,
-      item.cuotasSinAnticipo,
-      item.parcial,
     ]);
-    styleDataRow(row, { center: [2, 3, 8, 9, 14, 15, 16, 17, 18], moneyCols: [4, 5, 6, 7, 10, 11, 12, 13] });
-    [4, 5, 6, 7, 10, 11, 12, 13].forEach((col) => { row.getCell(col).numFmt = '$ #,##0'; });
+    styleDataRow(row, { center: [2, 3], moneyCols: [4, 5, 6, 7, 8] });
+    [4, 5, 6, 7, 8].forEach((col) => { row.getCell(col).numFmt = '$ #,##0'; });
     stylePerformanceCells(row, item.acuerdos, maxAgreements);
   });
 
@@ -1723,16 +1710,13 @@ function addProductivitySheet(workbook, summary) {
   const ws = workbook.addWorksheet("Productividad");
   titleSheet(
     ws,
-    "RESUMEN DE ACUERDOS POR OPERADOR",
-    "Verde = mejor rendimiento del período | amarillo = medio | naranja = bajo | rojo = activos sin acuerdos",
-    18
+    "RENDIMIENTO POR OPERADOR",
+    "Acuerdos, primer pago proyectado y recaudación real del período",
+    8
   );
   ws.addRow([
-    "OPERADOR", "TOTAL GESTIONES", "ACUERDOS EFECTIVOS", "1ER PAGO PROYECTADO", "1ER PAGO COBRADO",
-    "TICKET PROMEDIO 1ER PAGO", "MONTO CONTRACTUAL", "REACUERDOS EFECTIVOS",
-    "ACUERDOS CON PAGO", "COBRADO VINCULADO", "COBRO ACUERDOS DEL PERÍODO", "COBRO ACUERDOS ANTERIORES",
-    "RECAUDADO TOTAL PERÍODO", "CANCELACIÓN", "CANCELACIÓN CON ANTICIPO",
-    "ACUERDO EN CUOTAS CON ANTICIPO", "ACUERDO EN CUOTAS SIN ANTICIPO", "PARCIAL",
+    "OPERADOR", "ACUERDOS T.", "ACUERDOS C/PAGOS", "TICKET PROM.",
+    "TOTAL PROYECTADO", "TOTAL COBRADO DE PROYECCIONES", "COBRADO COLCHÓN / OTROS PAGOS", "TOTAL RECAUDADO",
   ]);
   styleHeader(ws.getRow(4));
 
@@ -1741,30 +1725,20 @@ function addProductivitySheet(workbook, summary) {
   operators.forEach((item) => {
     const row = ws.addRow([
       item.nombre,
-      item.totalGestiones,
       item.acuerdos,
-      item.primerPago,
-      item.primerPagoCobrado,
-      item.ticketPromedio,
-      item.montoTotal,
-      item.reacuerdosEfectivos,
       item.conPagoPosterior,
-      item.montoPagosPosteriores,
+      item.ticketPromedio,
+      item.primerPago,
       item.recaudadoAcuerdosPeriodo,
       item.recaudadoCarteraAnterior,
       item.recaudadoMes,
-      item.cancelacion,
-      item.cancelacionConAnticipo,
-      item.cuotasConAnticipo,
-      item.cuotasSinAnticipo,
-      item.parcial,
     ]);
-    styleDataRow(row, { center: [2, 3, 8, 9, 14, 15, 16, 17, 18], moneyCols: [4, 5, 6, 7, 10, 11, 12, 13] });
-    [4, 5, 6, 7, 10, 11, 12, 13].forEach((col) => { row.getCell(col).numFmt = '$ #,##0'; });
+    styleDataRow(row, { center: [2, 3], moneyCols: [4, 5, 6, 7, 8] });
+    [4, 5, 6, 7, 8].forEach((col) => { row.getCell(col).numFmt = '$ #,##0'; });
     stylePerformanceCells(row, item.acuerdos, maxAgreements);
   });
-  ws.autoFilter = { from: "A4", to: `R${Math.max(4, operators.length + 4)}` };
-  setWidths(ws, [26, 16, 15, 20, 20, 23, 21, 18, 20, 21, 23, 23, 22, 15, 23, 29, 29, 12]);
+  ws.autoFilter = { from: "A4", to: `H${Math.max(4, operators.length + 4)}` };
+  setWidths(ws, [26, 15, 18, 18, 20, 28, 28, 22]);
   ws.views = [{ state: "frozen", xSplit: 1, ySplit: 4, showGridLines: false }];
   ws.pageSetup = { orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
 }
@@ -1907,8 +1881,8 @@ const AGREEMENT_DETAIL_COLUMNS = [
   ["OBSERVACIÓN CRUCE PAGOS", 34],
   ["TIPO CONTACTO", 21], ["RESULTADO GESTIÓN", 27], ["ESTADO CUENTA AL ACUERDO", 26], ["TEL / MAIL MARCADO", 22],
   ["OBSERVACIÓN ORIGINAL", 55],
-  ["SEGUIMIENTO", 21], ["FECHA SEGUIMIENTO", 19], ["HORA SEGUIMIENTO", 17], ["ÚLTIMO GESTOR", 20],
-  ["RESULTADO SEGUIMIENTO", 28], ["ESTADO CUENTA ACTUAL", 24], ["OBSERVACIÓN SEGUIMIENTO", 38],
+  ["GESTIÓN POSTERIOR", 21], ["FECHA ÚLTIMA GESTIÓN", 19], ["HORA ÚLTIMA GESTIÓN", 17], ["ÚLTIMO GESTOR", 20],
+  ["RESULTADO ÚLTIMA GESTIÓN", 28], ["ESTADO CUENTA ACTUAL", 24], ["OBSERVACIÓN ÚLTIMA GESTIÓN", 38],
   ["SITUACIÓN ACUERDO", 18],
 ];
 
@@ -1917,7 +1891,7 @@ const AGREEMENT_DETAIL_GROUPS = [
   { from: 14, to: 21, label: "PLAN ACORDADO", color: "FF087A50" },
   { from: 22, to: 34, label: "CRUCE CON PAGOS", color: "FF0876A8" },
   { from: 35, to: 39, label: "GESTIÓN ORIGINAL", color: "FF8C2384" },
-  { from: 40, to: 47, label: "SEGUIMIENTO POSTERIOR", color: "FF6D2BFF" },
+  { from: 40, to: 47, label: "ÚLTIMA GESTIÓN DEL CASO", color: "FF6D2BFF" },
 ];
 
 function agreementDays(item) {

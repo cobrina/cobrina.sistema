@@ -95,7 +95,8 @@ const montoEnCentavos = (value) => Math.round(Number(value || 0) * 100);
 /**
  * Un aviso de operador/cuotería nunca descuenta saldo por sí mismo. Solo cambia
  * a "aplicado" cuando se puede enlazar de forma inequívoca con un Pago real de
- * la misma cuota (la cuota ya garantiza DNI + entidad + subcesión).
+ * la misma cuenta por DNI + entidad. En Colchón la subcesión es un dato
+ * informativo y no condiciona la imputación del pago real.
  */
 const conciliarPagosInformados = (pagosInformados = [], pagosReales = []) => {
   const usados = new Set();
@@ -558,7 +559,6 @@ function etapasPagosAplicadosMes(desde, hasta) {
         let: {
           dniCuota: "$dniTextoPago",
           entidadNumero: "$entidadNumeroEfectivo",
-          subCesion: "$subCesionId",
         },
         pipeline: [
           {
@@ -567,7 +567,6 @@ function etapasPagosAplicadosMes(desde, hasta) {
                 $and: [
                   { $eq: ["$dni", "$$dniCuota"] },
                   { $eq: ["$entidadId", "$$entidadNumero"] },
-                  { $eq: ["$subCesionId", "$$subCesion"] },
                   { $gte: ["$fechaPago", desde] },
                   { $lte: ["$fechaPago", hasta] },
                 ],
@@ -849,7 +848,7 @@ export const filtrarCuotas = async (req, res) => {
         const conciliacion = await buscarPagosMesVigente({
           dni: cuota.dni,
           entidadNumero,
-          subCesionId: cuota?.subCesionId?._id,
+          ignorarSubCesion: true,
         });
         estadoVinculacionPagos = conciliacion?.estadoVinculacion || "sin-pagos";
         if (estadoVinculacionPagos !== "requiere-revision") {
@@ -1331,18 +1330,45 @@ export const exportarExcel = async (req, res) => {
       return "";
     };
 
+    // La exportación usa la misma fuente y la misma clave que pantalla/estadísticas:
+    // módulo Pagos + DNI + entidad. Subcesión queda sólo como dato informativo.
+    const { desde: pagosDesde, hasta: pagosHasta } = rangoPagosMesVigente();
+    const dnisExport = [...new Set(cuotas.map((c) => String(c?.dni || "").replace(/\D/g, "")).filter(Boolean))];
+    const entidadesExport = [...new Set(cuotas.map((c) => Number(c?.entidadId?.numero || c?.entidadNumero || 0)).filter((n) => n > 0))];
+    const pagosExport = dnisExport.length && entidadesExport.length
+      ? await Pago.find({
+          fechaPago: { $gte: pagosDesde, $lte: pagosHasta },
+          dni: { $in: dnisExport },
+          entidadId: { $in: entidadesExport },
+        })
+          .select("dni entidadId monto fechaPago idPago subCesionId operadorUsername")
+          .lean()
+      : [];
+    const pagosExportPorCuenta = new Map();
+    for (const pago of pagosExport) {
+      const key = `${String(pago?.dni || "").replace(/\D/g, "")}|${Number(pago?.entidadId || 0)}`;
+      if (!pagosExportPorCuenta.has(key)) pagosExportPorCuenta.set(key, []);
+      pagosExportPorCuenta.get(key).push(pago);
+    }
+
     cuotas = cuotas
       .map((cuota) => {
+        const dniClave = String(cuota?.dni || "").replace(/\D/g, "");
+        const entidadNumero = Number(cuota?.entidadId?.numero || cuota?.entidadNumero || 0);
+        const key = dniClave && entidadNumero > 0 ? `${dniClave}|${entidadNumero}` : "";
+        const pagosReales = key ? (pagosExportPorCuenta.get(key) || []) : [];
         const estadoBase = cuota.estadoOriginal || cuota.estado || "A cuota";
-        const estadoFinal = cuota.pagos?.length > 0 ? "A cuota" : estadoBase;
-        const pagadoReal = sumar(cuota.pagos);
+        const pagadoReal = sumar(pagosReales);
+        const estadoFinal = pagadoReal > 0 ? "A cuota" : estadoBase;
         const informado = sumar(informadosValidos(cuota));
+        const saldoPendiente = Math.max(0, Number(cuota.saldoPendiente || 0) - pagadoReal);
         return {
           ...cuota,
           estado: estadoFinal,
           pagadoReal,
           informado,
           cobradoTotal: pagadoReal + informado,
+          saldoPendiente,
         };
       })
       .filter((cuota) => !estado || cuota.estado === estado);
@@ -2433,26 +2459,22 @@ export const obtenerEstadisticasColchon = async (req, res) => {
     const claveCuota = (cuota) => {
       const dniClave = String(cuota?.dni || "").replace(/\D/g, "");
       const entidadNumero = Number(cuota?.entidadId?.numero || cuota?.entidadNumero || 0);
-      const subId = String(cuota?.subCesionId?._id || cuota?.subCesionId || "");
-      return dniClave && entidadNumero > 0 && mongoose.Types.ObjectId.isValid(subId)
-        ? `${dniClave}|${entidadNumero}|${subId}`
+      return dniClave && entidadNumero > 0
+        ? `${dniClave}|${entidadNumero}`
         : "";
     };
 
     // Fuente única: TODOS los importes aplicados salen del módulo Pagos.
-    // Se hace un único batch por el universo filtrado y luego se cruza por
-    // DNI + número de entidad + subcesión, exactamente igual que el listado.
+    // En Colchón el cruce se hace por DNI + número de entidad. La subcesión
+    // permanece visible como dato informativo, pero no condiciona la imputación.
     const dnis = [...new Set(cuotasBrutas.map((c) => String(c?.dni || "").replace(/\D/g, "")).filter(Boolean))];
     const entidadesNumero = [...new Set(cuotasBrutas.map((c) => Number(c?.entidadId?.numero || c?.entidadNumero || 0)).filter((n) => n > 0))];
-    const subCesiones = [...new Set(cuotasBrutas.map((c) => String(c?.subCesionId?._id || c?.subCesionId || "")).filter((id) => mongoose.Types.ObjectId.isValid(id)))]
-      .map((id) => new mongoose.Types.ObjectId(id));
 
-    const pagosCobrina = dnis.length && entidadesNumero.length && subCesiones.length
+    const pagosCobrina = dnis.length && entidadesNumero.length
       ? await Pago.find({
           fechaPago: { $gte: pagosDesde, $lte: pagosHasta },
           dni: { $in: dnis },
           entidadId: { $in: entidadesNumero },
-          subCesionId: { $in: subCesiones },
         })
           .select("_id idPago dni entidadId subCesionId fechaPago monto operadorUsername conceptoCodigo")
           .lean()
@@ -2460,7 +2482,7 @@ export const obtenerEstadisticasColchon = async (req, res) => {
 
     const pagosPorCuota = new Map();
     for (const pago of pagosCobrina) {
-      const key = `${String(pago.dni || "").replace(/\D/g, "")}|${Number(pago.entidadId || 0)}|${String(pago.subCesionId || "")}`;
+      const key = `${String(pago.dni || "").replace(/\D/g, "")}|${Number(pago.entidadId || 0)}`;
       if (!pagosPorCuota.has(key)) pagosPorCuota.set(key, []);
       pagosPorCuota.get(key).push(pago);
     }
@@ -2760,7 +2782,7 @@ export const obtenerConciliacionPagosCuota = async (req, res) => {
     const conciliacion = await buscarPagosMesVigente({
       dni: cuota.dni,
       entidadNumero,
-      subCesionId: cuota.subCesionId,
+      ignorarSubCesion: true,
     });
 
     const filtroUltimaGestion = {

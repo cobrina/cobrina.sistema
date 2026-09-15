@@ -4090,6 +4090,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     dni,
     tipoAcuerdo,
     estadoVencimiento,
+    sinPagosAplicados,
     situacionAcuerdo = "activos",
     sortKey = "fecha",
     sortDir = "asc",
@@ -4256,6 +4257,19 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     acuerdosEfectivosActivos = acuerdosEfectivosActivos.filter(porVencimiento);
     acuerdosEfectivosBajados = acuerdosEfectivosBajados.filter(porVencimiento);
     acuerdosAnuladosBajados = acuerdosAnuladosBajados.filter(porVencimiento);
+  }
+
+  // Filtro operativo rápido: acuerdos sin ningún pago real aplicado. Se evalúa
+  // después del cruce con Pagos para usar exactamente la misma definición de
+  // pago válido que el resto del reporte y sus exportaciones.
+  const filtrarSinPagosAplicados = String(sinPagosAplicados || "").toLowerCase() === "true";
+  if (filtrarSinPagosAplicados) {
+    const sinPago = (row) =>
+      Number(row?.cantidadPagosValidos ?? row?.cantidadPagosPosteriores ?? 0) <= 0 &&
+      Number(row?.montoPagosValidos ?? row?.montoPagosPosteriores ?? 0) <= 0;
+    acuerdosEfectivosActivos = acuerdosEfectivosActivos.filter(sinPago);
+    acuerdosEfectivosBajados = acuerdosEfectivosBajados.filter(sinPago);
+    acuerdosAnuladosBajados = acuerdosAnuladosBajados.filter(sinPago);
   }
 
   if (soloVencidos) {
@@ -4435,6 +4449,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
       dni: dni || null,
       tipoAcuerdo: tipoAcuerdo || null,
       estadoVencimiento: estadoVencimiento || null,
+      sinPagosAplicados: String(sinPagosAplicados || "").toLowerCase() === "true",
       situacionAcuerdo: situacionVista,
       sortKey: appliedSort.key,
       sortDir: appliedSort.dir,
