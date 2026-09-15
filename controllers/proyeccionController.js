@@ -3831,7 +3831,19 @@ const enriquecerAcuerdosMangoConEstadoCuentaActual = async (acuerdos = []) =>
  * usa la tabla de acuerdos manuales. Los pagos informados no intervienen: solo
  * cuentan los pagos válidos conciliados con COBRINA.
  */
+const ESTADOS_SEGUIMIENTO_MANGO = [
+  "Promesa activa",
+  "Promesa caída",
+  "Pagado parcial",
+  "Pagado",
+  "Pagado / bajado",
+];
+
 const calcularEstadoSeguimientoMango = (acuerdo = {}) => {
+  if (acuerdo?.acuerdoPagadoBajado || String(acuerdo?.situacionAcuerdo || "").toUpperCase() === "PAGADO_BAJADO") {
+    return "Pagado / bajado";
+  }
+
   const esperado = Number(
     acuerdo.primerPago || acuerdo.anticipoMonto || acuerdo.montoCuota || 0
   );
@@ -3878,6 +3890,8 @@ const coincideEstadoMango = (acuerdo = {}, estadoSolicitado = "") => {
     "promesa vencida": "promesa caida",
     activo: "promesa activa",
     parcial: "pagado parcial",
+    "pagado bajado": "pagado / bajado",
+    "pagado-bajado": "pagado / bajado",
   };
   const esperado = alias[solicitado] || solicitado;
   return normalizarEstadoMango(calcularEstadoSeguimientoMango(acuerdo)) === esperado;
@@ -3898,13 +3912,19 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
 
   const desde = String(req.query?.fechaDesde || req.query?.desde || "").trim();
   const hasta = String(req.query?.fechaHasta || req.query?.hasta || "").trim();
+  const tipoFecha = ["fechaPromesa", "vencimiento"].includes(String(req.query?.tipoFecha || "").trim())
+    ? "fechaPromesa"
+    : "creado";
   const fechaISOValida = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
-  // Regla V17: Mango usa la FECHA DE CARGA del acuerdo como período. No se
-  // incorporan acuerdos de meses anteriores por tener vencimientos en el mes.
-  if (desde || hasta) {
+  const desdeValido = fechaISOValida(desde) ? desde : "";
+  const hastaValido = fechaISOValida(hasta) ? hasta : "";
+  // La fecha de creación existe como campo Mongo y se filtra antes de resolver
+  // acuerdos. La fecha de vencimiento se deriva del acuerdo parseado y se aplica
+  // después, sin modificar Reporte de Gestiones ni materializar datos nuevos.
+  if (tipoFecha === "creado" && (desdeValido || hastaValido)) {
     const rango = {};
-    if (fechaISOValida(desde)) rango.$gte = crearFechaLocal(desde);
-    if (fechaISOValida(hasta)) rango.$lte = crearFechaLocal(hasta, true);
+    if (desdeValido) rango.$gte = crearFechaLocal(desdeValido);
+    if (hastaValido) rango.$lte = crearFechaLocal(hastaValido, true);
     if (Object.keys(rango).length) condiciones.push({ fecha: rango });
   }
 
@@ -4045,6 +4065,15 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
   const variantesObjetivo = await variantesOperadorObjetivo(req, usuarioId);
   const aplicarFiltrosPost = (rows = []) => {
     let salida = rows.filter((acuerdo) => acuerdoPerteneceAOperador(acuerdo, variantesObjetivo));
+    if (tipoFecha === "fechaPromesa" && (desdeValido || hastaValido)) {
+      salida = salida.filter((acuerdo) => {
+        const fechaVencimiento = claveVencimientoAcuerdoMango(acuerdo);
+        if (!fechaVencimiento) return false;
+        if (desdeValido && fechaVencimiento < desdeValido) return false;
+        if (hastaValido && fechaVencimiento > hastaValido) return false;
+        return true;
+      });
+    }
     if (subCesionId) {
       salida = salida.filter((acuerdo) =>
         (acuerdo.pagosValidos || []).some((pago) => String(pago.subCesionId || "") === subCesionId)
@@ -4189,12 +4218,30 @@ export const listarAcuerdosMangoParaProyecciones = async (req, res) => {
       pages: Math.max(1, Math.ceil(total / limit)),
       limit,
       paginadoOptimizado: Boolean(paginadoEnMongo),
+      catalogos: { estados: ESTADOS_SEGUIMIENTO_MANGO },
+      criterioFecha: String(req.query?.tipoFecha || "creado") === "fechaPromesa" ? "fechaPromesa" : "creado",
     };
     guardarCacheAcuerdosMango(cacheKey, payload);
     return res.json(payload);
   } catch (error) {
     console.error("❌ Error listando acuerdos Mango en Proyecciones:", error);
     return res.status(500).json({ error: "No se pudieron cargar los acuerdos confirmados de Mango" });
+  }
+};
+
+export const catalogosAcuerdosMangoProyecciones = async (req, res) => {
+  try {
+    if (!tieneAccesoProyecciones(req)) return res.status(403).json({ error: "Sin acceso a Proyecciones" });
+    return res.json({
+      ok: true,
+      estados: ESTADOS_SEGUIMIENTO_MANGO,
+      tiposFecha: [
+        { value: "creado", label: "Fecha de creación de la promesa" },
+        { value: "fechaPromesa", label: "Fecha de vencimiento" },
+      ],
+    });
+  } catch (error) {
+    return res.status(500).json({ error: "No se pudieron cargar los catálogos de acuerdos Mango" });
   }
 };
 
@@ -4412,6 +4459,10 @@ export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
       { header: "Último pago válido", key: "ultimoPago", width: 18 },
       { header: "Estado cuenta al acuerdo", key: "estadoCuenta", width: 24 },
       { header: "Estado cuenta actual", key: "estadoCuentaActual", width: 27 },
+      { header: "Fecha última gestión", key: "ultimaGestionFecha", width: 20 },
+      { header: "Operador última gestión", key: "ultimaGestionOperador", width: 24 },
+      { header: "Resultado última gestión", key: "ultimaGestionResultado", width: 30 },
+      { header: "Estado última gestión", key: "ultimaGestionEstado", width: 27 },
       { header: "Situación acuerdo", key: "situacionAcuerdo", width: 18 },
       { header: "Pago mismo día", key: "pagoMismoDia", width: 16 },
       { header: "Pagos posteriores", key: "pagosPosteriores", width: 17 },
@@ -4454,6 +4505,10 @@ export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
         operador: item.operador || "",
         estadoCuenta: item.estadoCuenta || "",
         estadoCuentaActual: item.estadoCuentaActual || item.estadoCuenta || "",
+        ultimaGestionFecha: item.ultimaGestionMangoFecha ? toDateOnly(item.ultimaGestionMangoFecha) : "",
+        ultimaGestionOperador: item.ultimaGestionMangoUsuario || "",
+        ultimaGestionResultado: item.ultimaGestionMangoResultado || "",
+        ultimaGestionEstado: item.ultimaGestionMangoEstadoCuenta || item.estadoCuentaActual || "",
         situacionAcuerdo: situacion,
         estadoPago: item.estadoPagoAcuerdo || "",
         pagadoValido: Number(item.montoPagosValidos || item.montoPagosPosteriores || 0),

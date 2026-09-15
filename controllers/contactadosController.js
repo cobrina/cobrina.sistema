@@ -342,9 +342,9 @@ function diaCalendarioUtcDesdeArgentina(value) {
 }
 
 /**
- * Busca, en una sola consulta, la primera gestión REAL posterior al vencimiento
+ * Busca, en una sola consulta, la gestión REAL más reciente posterior al vencimiento
  * de cada ventana. Sirve para distinguir "venció dentro de 72 h" de "después
- * fue retomado" y poder volver a repartir únicamente lo que sigue sin trabajo.
+ * fue retomado" y, además, mostrar el último seguimiento real disponible.
  */
 async function mapaSeguimientoPosterior(rows) {
   const ventanas = (rows || []).filter((r) => r?._id && r?.dni && r?.venceAt);
@@ -390,7 +390,8 @@ async function mapaSeguimientoPosterior(rows) {
   for (const ventana of ventanas) {
     const venceMs = finDiaArgentina(ventana.venceAt).getTime();
     const lista = porDni.get(String(ventana.dni || "")) || [];
-    const encontrada = lista.find((gestion) => gestion.at.getTime() > venceMs && mismaEntidad(ventana, gestion)) || null;
+    const posteriores = lista.filter((gestion) => gestion.at.getTime() > venceMs && mismaEntidad(ventana, gestion));
+    const encontrada = posteriores.length ? posteriores[posteriores.length - 1] : null;
     out.set(String(ventana._id), encontrada ? {
       tiene: true,
       fecha: encontrada.at,
@@ -1109,6 +1110,10 @@ async function calcularRecuperados(req) {
   }
 
   const vencidasScope = todasVencidas.filter(cumpleFiltro);
+  const [seguimientoMap, origenMap] = await Promise.all([
+    mapaSeguimientoPosterior(vencidasScope),
+    mapaOrigenContactado(vencidasScope),
+  ]);
   const casos = vencidasScope.map((v) => {
     const ps = asignaciones.get(String(v._id)) || [];
     let montoPorOtros = 0;
@@ -1123,10 +1128,30 @@ async function calcularRecuperados(req) {
       }
     });
     const tipo = montoPorOtros > 0 ? "otro" : montoMismo > 0 ? "mismo" : "sin-recupero";
+    const pagosOrdenados = [...ps].sort((a, b) => new Date(a.fechaPago) - new Date(b.fechaPago));
+    const pagoRecupero = pagosOrdenados[0] || null;
+    const ultimoPago = pagosOrdenados[pagosOrdenados.length - 1] || null;
+    const seguimiento = seguimientoMap.get(String(v._id)) || { tiene: false, fecha: null, operador: "" };
+    const montoCobrado = montoPorOtros + montoMismo;
     return {
       id: String(v._id), serieId: v.serieId, dni: v.dni, nombreDeudor: v.nombreDeudor || "",
-      operador: v.operador, entidad: v.entidad || "", venceAt: v.venceAt, tipo,
-      montoPorOtros, montoMismo, operadoresQueCobraron: [...otros], pagos: ps.length,
+      operador: v.operador, entidad: v.entidad || "",
+      iniciaAt: v.iniciaAt || null,
+      origenContactadoAt: origenMap.get(String(v.serieId)) || v.iniciaAt || null,
+      venceAt: v.venceAt, tipo,
+      montoPorOtros, montoMismo, montoCobrado, operadoresQueCobraron: [...otros], pagos: ps.length,
+      operadorRecupero: pagoRecupero?.operadorUsername ? normUser(pagoRecupero.operadorUsername) : "",
+      fechaRecupero: pagoRecupero?.fechaPago || null,
+      ultimoPagoFecha: ultimoPago?.fechaPago || null,
+      ultimoPagoOperador: ultimoPago?.operadorUsername ? normUser(ultimoPago.operadorUsername) : "",
+      conceptoPago: pagoRecupero?.conceptoCodigo || ultimoPago?.conceptoCodigo || "",
+      seguimientoPosterior: seguimiento,
+      estadoActual: seguimiento?.estadoCuenta || v.estadoActual || v.estadoCuentaInicio || "",
+      gestionRecupero: seguimiento?.resultadoGestion || seguimiento?.tipoContacto || "",
+      ultimaGestionFecha: seguimiento?.fecha || null,
+      ultimaGestionOperador: seguimiento?.operador || "",
+      ultimaGestionEstado: seguimiento?.estadoCuenta || "",
+      ultimaGestionResultado: seguimiento?.resultadoGestion || "",
     };
   });
 
@@ -1280,20 +1305,32 @@ export async function exportarExcel(req, res) {
       if (esMandoMedio(req)) {
         ws.columns = [
           { header: "DNI", key: "dni", width: 16 }, { header: "Cliente", key: "nombre", width: 30 },
-          { header: "Operador que lo perdió", key: "operador", width: 22 }, { header: "Entidad", key: "entidad", width: 20 },
-          { header: "Venció", key: "vence", width: 20 }, { header: "Resultado posterior", key: "tipo", width: 22 },
-          { header: "Cobrado por otros", key: "otros", width: 18 }, { header: "Cobrado por el mismo", key: "mismo", width: 20 },
-          { header: "Operadores que cobraron", key: "operadores", width: 30 },
+          { header: "Entidad", key: "entidad", width: 20 }, { header: "Operador original", key: "operador", width: 22 },
+          { header: "Generación Contactado", key: "generado", width: 21 }, { header: "Vencimiento", key: "vence", width: 20 },
+          { header: "Operador que recuperó", key: "operadorRecupero", width: 24 }, { header: "Fecha recupero", key: "fechaRecupero", width: 18 },
+          { header: "Última gestión posterior", key: "ultimaGestion", width: 34 }, { header: "Fecha última gestión", key: "fechaUltimaGestion", width: 20 },
+          { header: "Operador última gestión", key: "operadorUltimaGestion", width: 24 }, { header: "Estado actual", key: "estadoActual", width: 24 },
+          { header: "Pago/cobro real", key: "montoCobrado", width: 18 }, { header: "Cobrado por otros", key: "otros", width: 18 },
+          { header: "Cobrado por el mismo", key: "mismo", width: 20 }, { header: "Operadores que cobraron", key: "operadores", width: 30 },
         ];
-        data.casos.forEach((c) => ws.addRow({
-          dni: dniExcel(c.dni), nombre: c.nombreDeudor, operador: c.operador, entidad: c.entidad,
-          vence: fechaExcel(c.venceAt), tipo: c.tipo, otros: Number(c.montoPorOtros || 0),
+        data.casos.filter((c) => c.tipo !== "sin-recupero").forEach((c) => ws.addRow({
+          dni: dniExcel(c.dni), nombre: c.nombreDeudor, entidad: c.entidad, operador: c.operador,
+          generado: fechaExcel(c.origenContactadoAt || c.iniciaAt), vence: fechaExcel(c.venceAt),
+          operadorRecupero: c.operadorRecupero || c.operadoresQueCobraron?.[0] || c.operador || "",
+          fechaRecupero: fechaExcel(c.fechaRecupero),
+          ultimaGestion: c.ultimaGestionResultado || c.gestionRecupero || c.ultimaGestionEstado || "Sin gestión posterior",
+          fechaUltimaGestion: fechaExcel(c.ultimaGestionFecha),
+          operadorUltimaGestion: c.ultimaGestionOperador || "", estadoActual: c.estadoActual || "",
+          montoCobrado: Number(c.montoCobrado || 0), otros: Number(c.montoPorOtros || 0),
           mismo: Number(c.montoMismo || 0), operadores: c.operadoresQueCobraron.join(", "),
         }));
         ws.getColumn("dni").numFmt = "0";
-        ws.getColumn("vence").numFmt = "dd/mm/yyyy hh:mm";
-        ws.getColumn("otros").numFmt = '"$" #,##0';
-        ws.getColumn("mismo").numFmt = '"$" #,##0';
+        ["generado", "vence", "fechaRecupero", "fechaUltimaGestion"].forEach((key) => {
+          if (ws.getColumn(key)) ws.getColumn(key).numFmt = "dd/mm/yyyy hh:mm";
+        });
+        ["montoCobrado", "otros", "mismo"].forEach((key) => {
+          if (ws.getColumn(key)) ws.getColumn(key).numFmt = '"$" #,##0';
+        });
       } else {
         const r = data.resumen || {};
         ws.name = "Resumen recuperos";
@@ -1331,7 +1368,9 @@ export async function exportarExcel(req, res) {
         { header: "Vence", key: "vence", width: 18 },
         { header: "Toques", key: "toques", width: 12 },
         ...(esVencidos ? [
-          { header: "Seguimiento", key: "seguimiento", width: 38 },
+          { header: "Última gestión posterior", key: "seguimientoGestion", width: 34 },
+          { header: "Fecha última gestión", key: "seguimientoFecha", width: 22 },
+          { header: "Operador última gestión", key: "seguimientoOperador", width: 24 },
         ] : []),
         ...(!canViewAll && !esVencidos ? [{ header: "Acciones", key: "acciones", width: 18 }] : []),
       ];
@@ -1353,12 +1392,16 @@ export async function exportarExcel(req, res) {
               hour: "2-digit", minute: "2-digit",
             }).format(new Date(c.ultimaGestionAt))}`
           : (c.ultimoOperador || c.operador || "");
-        const seguimiento = esVencidos
+        const seguimientoGestion = esVencidos
           ? (c.seguimientoPosterior?.tiene
-              ? `Retomado ${new Intl.DateTimeFormat("es-AR", {
-                  timeZone: "America/Argentina/Buenos_Aires", day: "2-digit", month: "2-digit", year: "numeric",
-                }).format(new Date(c.seguimientoPosterior.fecha))}${c.seguimientoPosterior.operador ? ` · ${c.seguimientoPosterior.operador}` : ""}`
+              ? (c.seguimientoPosterior.resultadoGestion || c.seguimientoPosterior.tipoContacto || c.seguimientoPosterior.estadoCuenta || "Gestión posterior")
               : "Sin gestión posterior")
+          : "";
+        const seguimientoFecha = esVencidos && c.seguimientoPosterior?.tiene
+          ? fechaExcel(c.seguimientoPosterior.fecha)
+          : null;
+        const seguimientoOperador = esVencidos && c.seguimientoPosterior?.tiene
+          ? (c.seguimientoPosterior.operador || "")
           : "";
 
         const excelRow = ws.addRow({
@@ -1375,7 +1418,7 @@ export async function exportarExcel(req, res) {
           ultimaGestionDueno: fechaExcel(c.ultimaGestionDuenoAt || c.iniciaAt),
           vence: fechaExcel(c.venceAt),
           toques: Number(c.toquesMes || 0),
-          ...(esVencidos ? { seguimiento } : {}),
+          ...(esVencidos ? { seguimientoGestion, seguimientoFecha, seguimientoOperador } : {}),
           ...(!canViewAll && !esVencidos ? { acciones: c.clickRealizadoAt ? "Realizado" : "Pendiente" } : {}),
         });
 

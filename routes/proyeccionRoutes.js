@@ -24,6 +24,7 @@ import {
   eliminarProyeccionesMasivo,
   buscarCoincidenciasAcuerdosMango,
   listarAcuerdosMangoParaProyecciones,
+  catalogosAcuerdosMangoProyecciones,
   exportarAcuerdosMangoProyeccionesExcel,
   obtenerConciliacionPagosProyeccion,
   cerrarProyeccionPorAcuerdoMango,
@@ -73,6 +74,11 @@ router.get(
   "/coincidencias-mango",
   ...accesoProyecciones,
   buscarCoincidenciasAcuerdosMango
+);
+router.get(
+  "/acuerdos-mango/catalogos",
+  ...accesoProyecciones,
+  catalogosAcuerdosMangoProyecciones
 );
 router.get(
   "/acuerdos-mango",
