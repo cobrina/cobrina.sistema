@@ -1574,7 +1574,7 @@ function addStatisticsSheet(workbook, summary, metadata) {
 
   const labels = [
     "GESTIONES", "ACUERDOS EFECTIVOS", "TASA DE ACUERDO", "DNIs CON ACUERDO",
-    "1ER PAGO PROYECTADO", "1ER PAGO COBRADO", "TICKET PROMEDIO", "MONTO CONTRACTUAL",
+    "1ER PAGO PROYECTADO", "1ER PAGO COBRADO", "TICKET PROMEDIO", "TOTAL DEL PLAN (INFORMATIVO)",
     "REACUERDOS EFECTIVOS", "VENCIDOS",
   ];
   ws.addRow(labels);
@@ -1672,7 +1672,7 @@ function addStatisticsSheet(workbook, summary, metadata) {
   const typeStart = ws.lastRow.number + 2;
   ws.getCell(typeStart, 1).value = "TIPOS DE ACUERDO";
   ws.getCell(typeStart, 1).font = { bold: true, color: { argb: COLORS.purple }, size: 11 };
-  ws.getRow(typeStart + 1).values = ["TIPO", "ACUERDOS", "DNIs", "1ER PAGO PROYECTADO", "MONTO CONTRACTUAL", "VENCIDOS"];
+  ws.getRow(typeStart + 1).values = ["TIPO", "ACUERDOS", "DNIs", "1ER PAGO PROYECTADO", "TOTAL DEL PLAN (INFORMATIVO)", "VENCIDOS"];
   styleHeader(ws.getRow(typeStart + 1), COLORS.purple);
   summary.porTipo.forEach((item) => {
     const row = ws.addRow([item.nombre, item.acuerdos, item.dnis, item.primerPago, item.montoTotal, item.vencidos]);
@@ -1682,7 +1682,7 @@ function addStatisticsSheet(workbook, summary, metadata) {
   const entityStart = ws.lastRow.number + 2;
   ws.getCell(entityStart, 1).value = "ENTIDADES";
   ws.getCell(entityStart, 1).font = { bold: true, color: { argb: COLORS.purple }, size: 11 };
-  ws.getRow(entityStart + 1).values = ["ENTIDAD", "ACUERDOS", "DNIs", "1ER PAGO PROYECTADO", "TICKET PROMEDIO 1ER PAGO", "MONTO CONTRACTUAL", "VENCIDOS"];
+  ws.getRow(entityStart + 1).values = ["ENTIDAD", "ACUERDOS", "DNIs", "1ER PAGO PROYECTADO", "TICKET PROMEDIO 1ER PAGO", "TOTAL DEL PLAN (INFORMATIVO)", "VENCIDOS"];
   styleHeader(ws.getRow(entityStart + 1), COLORS.dark);
   summary.porEntidad.forEach((item) => {
     const row = ws.addRow([item.nombre, item.acuerdos, item.dnis, item.primerPago, item.ticketPromedio, item.montoTotal, item.vencidos]);
@@ -1746,7 +1746,7 @@ function addProductivitySheet(workbook, summary) {
 function addDailySheet(workbook, summary) {
   const ws = workbook.addWorksheet("Acuerdos_por_dia");
   titleSheet(ws, "ACUERDOS POR DÍA", "Cantidad de episodios efectivos, 1er pago proyectado y monto contractual por jornada", 4);
-  ws.addRow(["FECHA", "ACUERDOS EFECTIVOS", "1ER PAGO PROYECTADO", "MONTO CONTRACTUAL"]);
+  ws.addRow(["FECHA", "ACUERDOS EFECTIVOS", "1ER PAGO PROYECTADO", "TOTAL DEL PLAN (INFORMATIVO)"]);
   styleHeader(ws.getRow(4));
   summary.porDia.forEach((item) => {
     const row = ws.addRow([excelDate(item.fecha), item.acuerdos, item.primerPago, item.montoTotal]);
@@ -1873,7 +1873,7 @@ const AGREEMENT_DETAIL_COLUMNS = [
   ["N° DE ACUERDO", 15], ["REACUERDO EFECTIVO", 18],
   ["FECHA ANTICIPO", 17], ["IMPORTE ANTICIPO", 19], ["CANTIDAD CUOTAS", 16],
   ["IMPORTE CUOTA", 18], ["PRIMER VENCIMIENTO CUOTA", 20], ["1ER PAGO PROYECTADO", 20],
-  ["MONTO CONTRACTUAL", 20], ["DEUDA MÁXIMA", 18],
+  ["TOTAL DEL PLAN (INFORMATIVO)", 20], ["DEUDA MÁXIMA", 18],
   ["ESTADO DEL CRUCE", 24], ["CANTIDAD PAGOS VÁLIDOS", 17], ["IMPORTE PAGOS VÁLIDOS", 21],
   ["PAGOS MISMO DÍA", 16], ["IMPORTE MISMO DÍA", 19], ["1ER PAGO COBRADO", 19],
   ["FECHA 1ER PAGO COBRADO", 21], ["1ER PAGO CUBIERTO", 18], ["ÚLTIMO PAGO VÁLIDO", 19],

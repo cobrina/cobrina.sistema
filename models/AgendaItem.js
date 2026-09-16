@@ -82,7 +82,7 @@ const AgendaItemSchema = new mongoose.Schema(
     },
     recurrencia: {
       type: String,
-      enum: ["", "semanal", "mensual"],
+      enum: ["", "diaria", "semanal", "mensual"],
       default: "",
       index: true,
     },

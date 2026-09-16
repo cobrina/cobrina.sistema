@@ -1,5 +1,6 @@
 // controllers/pagosController.js
 import Pago, { CONCEPTOS_MAP, PAGO_ESTADOS } from "../models/Pago.js";
+import Colchon from "../models/Colchon.js";
 import Entidad from "../models/Entidad.js";
 import SubCesion from "../models/SubCesion.js";
 import Empleado from "../models/Empleado.js";
@@ -2129,6 +2130,64 @@ export const analyticsResumen = async (req, res) => {
     const sinRemesa = f.sinRemesa?.[0]?.count || 0;
     const sinCuenta = f.sinCuenta?.[0]?.count || 0;
 
+    // Ranking por operador del rango completo, separando pagos de cuentas que
+    // actualmente existen en Colchón de los pagos del resto de la cartera.
+    // Se calcula sobre el mismo `match` de analytics (no sobre la página visible).
+    const pagosRanking = await Pago.find(match)
+      .select("dni entidadId monto operadorUsername")
+      .lean();
+
+    const dnisRanking = [...new Set(
+      pagosRanking
+        .map((p) => Number(String(p?.dni ?? "").replace(/\D/g, "")))
+        .filter((n) => Number.isFinite(n) && n > 0)
+    )];
+    const entidadesRanking = [...new Set(
+      pagosRanking
+        .map((p) => Number(p?.entidadId))
+        .filter((n) => Number.isFinite(n) && n > 0)
+    )];
+
+    const paresColchon = new Set();
+    if (dnisRanking.length && entidadesRanking.length) {
+      const cuentasColchon = await Colchon.find({
+        dni: { $in: dnisRanking },
+        entidadNumero: { $in: entidadesRanking },
+      })
+        .select("dni entidadNumero")
+        .lean();
+      for (const c of cuentasColchon) {
+        paresColchon.add(`${Number(c.dni)}|${Number(c.entidadNumero)}`);
+      }
+    }
+
+    const porOperadorMap = new Map();
+    for (const pago of pagosRanking) {
+      const operadorNombre = String(pago?.operadorUsername || "Sin operador").trim() || "Sin operador";
+      const monto = Number(pago?.monto) || 0;
+      const dniNumero = Number(String(pago?.dni ?? "").replace(/\D/g, ""));
+      const entidadNumero = Number(pago?.entidadId);
+      const esColchon = paresColchon.has(`${dniNumero}|${entidadNumero}`);
+      const prev = porOperadorMap.get(operadorNombre) || {
+        operador: operadorNombre,
+        count: 0,
+        colchonMonto: 0,
+        restoMonto: 0,
+        totalMonto: 0,
+      };
+      prev.count += 1;
+      prev.totalMonto += monto;
+      if (esColchon) prev.colchonMonto += monto;
+      else prev.restoMonto += monto;
+      porOperadorMap.set(operadorNombre, prev);
+    }
+    const porOperadorRanking = [...porOperadorMap.values()]
+      .map((row) => ({
+        ...row,
+        ticketPromedio: row.count > 0 ? row.totalMonto / row.count : 0,
+      }))
+      .sort((x, y) => y.totalMonto - x.totalMonto || y.count - x.count);
+
     res.json({
       ok: true,
       range: {
@@ -2188,6 +2247,7 @@ export const analyticsResumen = async (req, res) => {
           count: x.count || 0,
           sum: x.sum || 0,
         })),
+        porOperador: porOperadorRanking,
         remesas: remBuckets,
       },
     });

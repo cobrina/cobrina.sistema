@@ -1016,7 +1016,11 @@ export async function resumenSupervision(req, res) {
       "PAGO MISMO DÍA",
       "PAGO MISMO DÍA VÁLIDO",
     ]);
-    const tienePagoValido = (acuerdo) => crucePagosDisponible && estadosConPagoValido.has(String(acuerdo?.estadoPagoAcuerdo || ""));
+    const tienePagoValido = (acuerdo) => crucePagosDisponible && (
+      estadosConPagoValido.has(String(acuerdo?.estadoPagoAcuerdo || "")) ||
+      Number(acuerdo?.cantidadPagosValidos ?? acuerdo?.cantidadPagosPosteriores ?? 0) > 0 ||
+      Number(acuerdo?.montoPagosValidos ?? acuerdo?.montoPagosPosteriores ?? 0) > 0
+    );
 
     const ultimoAcuerdoMango = acuerdosValidos[0] || null;
     const ultimaFechaAcuerdoMango = ultimoAcuerdoMango?.fecha
@@ -1051,6 +1055,8 @@ export async function resumenSupervision(req, res) {
       const montoPrimerPagoCobrado = conPago ? Number(acuerdo.montoPrimerPagoCobrado || 0) : 0;
       const tipo = acuerdo.tipoAcuerdo || "Sin clasificar";
       const proyectable = acuerdo.acuerdoProyectable !== false;
+      const vencimientoPrimerPago = String(acuerdo.fechaPrimerPago || acuerdo.primerVencimiento || acuerdo.anticipoVto || acuerdo.primerVto || "").slice(0, 10);
+      const esExigible = proyectable && /^\d{4}-\d{2}-\d{2}$/.test(vencimientoPrimerPago) && vencimientoPrimerPago <= hoyClave;
 
       if (usuarioControlado) {
         const actual = acuerdosPorOperadorMap.get(usuario) || {
@@ -1097,7 +1103,7 @@ export async function resumenSupervision(req, res) {
         }
         if (proyectable && !conPago && acuerdo.estadoVencimiento === "VENCE HOY") actual.venceHoy += 1;
         if (proyectable && !conPago && acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") actual.proximos += 1;
-        if (proyectable && ["VENCIDO", "VENCE HOY"].includes(acuerdo.estadoVencimiento)) {
+        if (esExigible) {
           actual.exigibles += 1;
           actual.primerPagoExigibleTotal += Number(acuerdo.primerPago || 0);
           if (conPago) {
@@ -1124,7 +1130,7 @@ export async function resumenSupervision(req, res) {
       }
       if (proyectable && !conPago && acuerdo.estadoVencimiento === "VENCE HOY") acuerdosVenceHoy += 1;
       if (proyectable && !conPago && acuerdo.estadoVencimiento === "PRÓXIMO 3 DÍAS") acuerdosProximos += 1;
-      if (proyectable && ["VENCIDO", "VENCE HOY"].includes(acuerdo.estadoVencimiento)) {
+      if (esExigible) {
         acuerdosExigibles += 1;
         primerPagoExigibleTotal += Number(acuerdo.primerPago || 0);
         if (conPago) {

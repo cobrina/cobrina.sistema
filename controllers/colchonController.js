@@ -538,6 +538,110 @@ function rangoPagosMesVigente() {
   };
 }
 
+const claveGestionColchon = (dni, entidadNumero) =>
+  `${String(dni || "").replace(/\D/g, "")}|${Number(entidadNumero || 0)}`;
+
+// Enriquecimiento liviano para la tabla normal de Colchón.
+// Importante: se ejecuta SOLO sobre las filas ya paginadas (máx. 200),
+// evitando hacer dos $lookup contra ReporteGestion por cada cuota de toda la
+// colección antes de paginar. Ese patrón podía dejar la pantalla vacía por
+// timeout cuando el colchón tenía muchas cuentas.
+async function obtenerResumenGestionesColchon(filas = [], desde, hasta) {
+  const paresUnicos = new Map();
+
+  for (const fila of filas) {
+    const dni = String(fila?.dni || "").replace(/\D/g, "");
+    const entidadNumero = Number(fila?.entidadId?.numero || 0);
+    if (!dni || !entidadNumero) continue;
+    paresUnicos.set(claveGestionColchon(dni, entidadNumero), { dni, entidadNumero });
+  }
+
+  const pares = [...paresUnicos.values()];
+  if (!pares.length) return new Map();
+
+  const orPares = pares.map(({ dni, entidadNumero }) => ({ dni, entidadNumero }));
+
+  const [ultimas, diasMes] = await Promise.all([
+    ReporteGestion.aggregate([
+      { $match: { borrado: { $ne: true }, $or: orPares } },
+      { $sort: { fecha: -1, hora: -1, _id: -1 } },
+      {
+        $group: {
+          _id: { dni: "$dni", entidadNumero: "$entidadNumero" },
+          fecha: { $first: "$fecha" },
+          hora: { $first: "$hora" },
+          usuario: { $first: "$usuario" },
+          resultadoGestion: { $first: "$resultadoGestion" },
+        },
+      },
+    ]).allowDiskUse(true),
+    ReporteGestion.aggregate([
+      {
+        $match: {
+          borrado: { $ne: true },
+          fecha: { $gte: desde, $lte: hasta },
+          $or: orPares,
+        },
+      },
+      {
+        $group: {
+          _id: {
+            dni: "$dni",
+            entidadNumero: "$entidadNumero",
+            dia: { $dateToString: { format: "%Y-%m-%d", date: "$fecha", timezone: "UTC" } },
+          },
+        },
+      },
+      {
+        $group: {
+          _id: { dni: "$_id.dni", entidadNumero: "$_id.entidadNumero" },
+          dias: { $sum: 1 },
+        },
+      },
+    ]).allowDiskUse(true),
+  ]);
+
+  const mapa = new Map();
+  for (const item of ultimas) {
+    const key = claveGestionColchon(item?._id?.dni, item?._id?.entidadNumero);
+    mapa.set(key, {
+      ultimaGestionReporteFecha: item.fecha || null,
+      ultimaGestionReporteHora: item.hora || "",
+      ultimaGestionReporteUsuario: item.usuario || "",
+      ultimaGestionReporteResultado: item.resultadoGestion || "",
+      diasTocadosMes: 0,
+    });
+  }
+  for (const item of diasMes) {
+    const key = claveGestionColchon(item?._id?.dni, item?._id?.entidadNumero);
+    const actual = mapa.get(key) || {
+      ultimaGestionReporteFecha: null,
+      ultimaGestionReporteHora: "",
+      ultimaGestionReporteUsuario: "",
+      ultimaGestionReporteResultado: "",
+      diasTocadosMes: 0,
+    };
+    actual.diasTocadosMes = Number(item.dias || 0);
+    mapa.set(key, actual);
+  }
+
+  return mapa;
+}
+
+// Variante para exportaciones: procesa el universo completo en lotes para no
+// construir un $or gigante ni comprometer la descarga cuando hay miles de cuotas.
+async function obtenerResumenGestionesColchonExport(filas = [], desde, hasta, lote = 300) {
+  const resumen = new Map();
+  const lista = Array.isArray(filas) ? filas : [];
+
+  for (let i = 0; i < lista.length; i += lote) {
+    const parcial = await obtenerResumenGestionesColchon(lista.slice(i, i + lote), desde, hasta);
+    for (const [clave, valor] of parcial.entries()) resumen.set(clave, valor);
+  }
+
+  return resumen;
+}
+
 function etapasPagosAplicadosMes(desde, hasta) {
   return [
     {
@@ -629,6 +733,7 @@ export const filtrarCuotas = async (req, res) => {
       sinGestion,
       conPagosNoVistos,
       pagoAplicado,
+      sinGestionMes,
     } = req.query;
 
     if (!tieneAccesoColchon(req)) {
@@ -743,6 +848,9 @@ export const filtrarCuotas = async (req, res) => {
       estado: "estadoFinal",
       pagado: "pagadoTotal",
       ultimaGestion: "ultimaGestion",
+      ultimaGestionReporteFecha: "gestionReporteUltima.fecha",
+      ultimaGestionReporteUsuario: "gestionReporteUltima.usuario",
+      diasTocadosMes: "diasTocadosMes",
       empleadoId: "empleado.username",
       entidadId: "entidad.nombre",
       cartera: "subcesion.nombre",
@@ -761,6 +869,71 @@ export const filtrarCuotas = async (req, res) => {
       "subcesion.nombre",
     ].includes(sortField) || necesitaPagosAntes;
     const { desde: pagosDesde, hasta: pagosHasta } = rangoPagosMesVigente();
+
+    // Gestión real proveniente de ReporteGestion. Se cruza por DNI + entidad y
+    // permite ver la última gestión, quién la hizo y cuántos días distintos fue
+    // trabajada la cuenta durante el mes vigente.
+    const gestionStages = [
+      {
+        $lookup: {
+          from: ReporteGestion.collection.name,
+          let: { dniCuota: "$dni", entidadCuota: "$entidad.numero" },
+          pipeline: [
+            {
+              $match: {
+                borrado: { $ne: true },
+                $expr: {
+                  $and: [
+                    { $eq: [{ $convert: { input: "$dni", to: "long", onError: -1, onNull: -1 } }, { $convert: { input: "$$dniCuota", to: "long", onError: -2, onNull: -2 } }] },
+                    { $eq: [{ $convert: { input: "$entidadNumero", to: "long", onError: -1, onNull: -1 } }, { $convert: { input: "$$entidadCuota", to: "long", onError: -2, onNull: -2 } }] },
+                  ],
+                },
+              },
+            },
+            { $sort: { fecha: -1, hora: -1, _id: -1 } },
+            { $limit: 1 },
+            { $project: { _id: 0, fecha: 1, hora: 1, usuario: 1, resultadoGestion: 1 } },
+          ],
+          as: "gestionReporteUltimaArr",
+        },
+      },
+      { $set: { gestionReporteUltima: { $arrayElemAt: ["$gestionReporteUltimaArr", 0] } } },
+      {
+        $lookup: {
+          from: ReporteGestion.collection.name,
+          let: { dniCuota: "$dni", entidadCuota: "$entidad.numero" },
+          pipeline: [
+            {
+              $match: {
+                borrado: { $ne: true },
+                fecha: { $gte: pagosDesde, $lte: pagosHasta },
+                $expr: {
+                  $and: [
+                    { $eq: [{ $convert: { input: "$dni", to: "long", onError: -1, onNull: -1 } }, { $convert: { input: "$$dniCuota", to: "long", onError: -2, onNull: -2 } }] },
+                    { $eq: [{ $convert: { input: "$entidadNumero", to: "long", onError: -1, onNull: -1 } }, { $convert: { input: "$$entidadCuota", to: "long", onError: -2, onNull: -2 } }] },
+                  ],
+                },
+              },
+            },
+            { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$fecha", timezone: "UTC" } } } },
+            { $count: "dias" },
+          ],
+          as: "gestionReporteMesArr",
+        },
+      },
+      { $set: { diasTocadosMes: { $ifNull: [{ $arrayElemAt: ["$gestionReporteMesArr.dias", 0] }, 0] } } },
+    ];
+    const filtraSinGestionMes = String(sinGestionMes || "").toLowerCase() === "true";
+    const gestionMatchStages = filtraSinGestionMes
+      ? [{ $match: { diasTocadosMes: { $lte: 0 } } }]
+      : [];
+    const sortGestion = [
+      "gestionReporteUltima.fecha",
+      "gestionReporteUltima.usuario",
+      "diasTocadosMes",
+    ].includes(sortField);
+    const necesitaGestionAntes = filtraSinGestionMes || sortGestion;
+    const necesitaLookupDatosAntes = necesitaLookupAntesDeOrdenar || necesitaGestionAntes;
     const paymentStages = necesitaPagosAntes ? etapasPagosAplicadosMes(pagosDesde, pagosHasta) : [];
     const paymentMatchStages = filtroPagoAplicado
       ? [{ $match: filtroPagoAplicado === "con" ? { pagadoTotal: { $gt: 0 } } : { pagadoTotal: { $lte: 0 } } }]
@@ -768,10 +941,16 @@ export const filtrarCuotas = async (req, res) => {
     const estadoMatchStages = estado ? [{ $match: { estadoFinal: estado } }] : [];
     const sortStage = { $sort: { [sortField]: sortDir, _id: 1 } };
 
+    // En la carga normal conservamos el pipeline rápido que ya funcionaba.
+    // El cruce pesado con ReporteGestion se hace después de paginar. Solamente
+    // entra al aggregate completo cuando el usuario pide explícitamente
+    // "Sin gestión este mes" o decide ordenar por una de las nuevas columnas.
     const pipelineConteo = [
       { $match: baseMatch },
       ...derivedStages,
-      ...(necesitaPagosConteo ? lookupStages : []),
+      ...((filtraSinGestionMes || necesitaPagosConteo) ? lookupStages : []),
+      ...(filtraSinGestionMes ? gestionStages : []),
+      ...gestionMatchStages,
       ...(necesitaPagosConteo ? etapasPagosAplicadosMes(pagosDesde, pagosHasta) : []),
       ...paymentMatchStages,
       ...estadoMatchStages,
@@ -781,14 +960,16 @@ export const filtrarCuotas = async (req, res) => {
     const pipelineDatos = [
       { $match: baseMatch },
       ...derivedStages,
-      ...(necesitaLookupAntesDeOrdenar ? lookupStages : []),
+      ...(necesitaLookupDatosAntes ? lookupStages : []),
+      ...(necesitaGestionAntes ? gestionStages : []),
+      ...gestionMatchStages,
       ...paymentStages,
       ...paymentMatchStages,
       ...estadoMatchStages,
       sortStage,
       { $skip: skip },
       { $limit: pageLimit },
-      ...(!necesitaLookupAntesDeOrdenar ? lookupStages : []),
+      ...(!necesitaLookupDatosAntes ? lookupStages : []),
       {
         $project: {
           _id: 1,
@@ -805,6 +986,11 @@ export const filtrarCuotas = async (req, res) => {
           fechaUltimaTocada: 1,
           ultimaGestion: 1,
           usuarioUltimoTocado: 1,
+          ultimaGestionReporteFecha: "$gestionReporteUltima.fecha",
+          ultimaGestionReporteHora: "$gestionReporteUltima.hora",
+          ultimaGestionReporteUsuario: "$gestionReporteUltima.usuario",
+          ultimaGestionReporteResultado: "$gestionReporteUltima.resultadoGestion",
+          diasTocadosMes: 1,
           pagos: 1,
           pagosInformados: 1,
           estadoOriginal: 1,
@@ -838,8 +1024,21 @@ export const filtrarCuotas = async (req, res) => {
     ]);
 
     const totalFiltrado = conteoRes?.[0]?.count || 0;
+
+    // Las nuevas columnas de seguimiento no deben poner en riesgo la carga del
+    // Colchón. Si el reporte de gestiones falla o demora, las cuotas se muestran
+    // igual y simplemente quedan sin ese dato complementario.
+    let resumenGestiones = new Map();
+    try {
+      resumenGestiones = await obtenerResumenGestionesColchon(resultadosAgg, pagosDesde, pagosHasta);
+    } catch (error) {
+      console.warn("⚠️ No se pudo enriquecer Colchón con ReporteGestion:", error?.message);
+    }
+
     const actualizacionesConciliacion = [];
     const resultados = await Promise.all(resultadosAgg.map(async (cuota) => {
+      const claveGestion = claveGestionColchon(cuota?.dni, cuota?.entidadId?.numero);
+      const datosGestion = resumenGestiones.get(claveGestion) || {};
       let pagosReales = [];
       let totalPagadoReal = 0;
       let estadoVinculacionPagos = "sin-pagos";
@@ -907,6 +1106,7 @@ export const filtrarCuotas = async (req, res) => {
 
       return {
         ...cuota,
+        ...datosGestion,
         pagos: pagosReales,
         pagosHistoricosInformativos: Array.isArray(cuota.pagos) ? cuota.pagos : [],
         pagosInformados: conciliacionAvisos.pagosInformados,
@@ -1263,6 +1463,8 @@ export const exportarExcel = async (req, res) => {
       diaDesde,
       diaHasta,
       conPagosNoVistos,
+      pagoAplicado,
+      sinGestionMes,
     } = req.query;
 
     if (!tieneAccesoColchon(req)) {
@@ -1351,6 +1553,25 @@ export const exportarExcel = async (req, res) => {
       pagosExportPorCuenta.get(key).push(pago);
     }
 
+    // Traemos también los datos nuevos visibles en la tabla: última gestión,
+    // quién la realizó y cantidad de días distintos trabajados en el mes.
+    // Para exportaciones grandes se resuelve en lotes para no sobrecargar MongoDB.
+    let resumenGestionesExport = new Map();
+    try {
+      resumenGestionesExport = await obtenerResumenGestionesColchonExport(
+        cuotas,
+        pagosDesde,
+        pagosHasta
+      );
+    } catch (error) {
+      console.warn("⚠️ No se pudo enriquecer el Excel de Colchón con ReporteGestion:", error?.message);
+    }
+
+    const filtroPagoAplicado = ["con", "sin"].includes(String(pagoAplicado || "").trim())
+      ? String(pagoAplicado).trim()
+      : "";
+    const filtraSinGestionMes = String(sinGestionMes || "").toLowerCase() === "true";
+
     cuotas = cuotas
       .map((cuota) => {
         const dniClave = String(cuota?.dni || "").replace(/\D/g, "");
@@ -1362,16 +1583,26 @@ export const exportarExcel = async (req, res) => {
         const estadoFinal = pagadoReal > 0 ? "A cuota" : estadoBase;
         const informado = sumar(informadosValidos(cuota));
         const saldoPendiente = Math.max(0, Number(cuota.saldoPendiente || 0) - pagadoReal);
+        const gestion = key ? (resumenGestionesExport.get(key) || {}) : {};
         return {
           ...cuota,
+          ...gestion,
           estado: estadoFinal,
           pagadoReal,
           informado,
           cobradoTotal: pagadoReal + informado,
           saldoPendiente,
+          diasTocadosMes: Number(gestion?.diasTocadosMes || 0),
         };
       })
-      .filter((cuota) => !estado || cuota.estado === estado);
+      .filter((cuota) => !estado || cuota.estado === estado)
+      .filter((cuota) => {
+        if (!filtroPagoAplicado) return true;
+        return filtroPagoAplicado === "con"
+          ? Number(cuota.pagadoReal || 0) > 0
+          : Number(cuota.pagadoReal || 0) <= 0;
+      })
+      .filter((cuota) => !filtraSinGestionMes || Number(cuota.diasTocadosMes || 0) <= 0);
 
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "COBRINA";
@@ -1399,6 +1630,9 @@ export const exportarExcel = async (req, res) => {
       subCesion ? "Subcesión seleccionada" : "",
       usuarioId ? "Operador seleccionado" : "",
       conPagosNoVistos === "true" ? "Pagos informados no vistos" : "",
+      filtroPagoAplicado === "con" ? "Con pagos aplicados en COBRINA" : "",
+      filtroPagoAplicado === "sin" ? "Sin pagos aplicados en COBRINA" : "",
+      filtraSinGestionMes ? "Sin gestión este mes" : "",
     ].filter(Boolean);
 
     info.addRow(["Exportación del Colchón de Cuotas"]);
@@ -1426,6 +1660,9 @@ export const exportarExcel = async (req, res) => {
       { header: "$ Informado", key: "informado", width: 16 },
       { header: "$ Cobrado total", key: "cobradoTotal", width: 17 },
       { header: "$ Debe", key: "saldoPendiente", width: 16 },
+      { header: "Última gestión", key: "ultimaGestionReporteFecha", width: 16 },
+      { header: "Quién gestionó", key: "ultimaGestionReporteUsuario", width: 22 },
+      { header: "Días tocados mes", key: "diasTocadosMes", width: 18 },
       { header: "Teléfono", key: "telefono", width: 20 },
       { header: "Observaciones", key: "observaciones", width: 35 },
       { header: "Observaciones operador", key: "observacionesOperador", width: 35 },
@@ -1449,6 +1686,11 @@ export const exportarExcel = async (req, res) => {
         informado: Number(cuota.informado || 0),
         cobradoTotal: Number(cuota.cobradoTotal || 0),
         saldoPendiente: Number(cuota.saldoPendiente || 0),
+        ultimaGestionReporteFecha: cuota.ultimaGestionReporteFecha
+          ? new Date(cuota.ultimaGestionReporteFecha)
+          : null,
+        ultimaGestionReporteUsuario: cuota.ultimaGestionReporteUsuario || "",
+        diasTocadosMes: Number(cuota.diasTocadosMes || 0),
         telefono: cuota.telefono || "",
         observaciones: cuota.observaciones || "",
         observacionesOperador: cuota.observacionesOperador || "",
@@ -1461,11 +1703,12 @@ export const exportarExcel = async (req, res) => {
     header.alignment = { vertical: "middle", horizontal: "center" };
     header.height = 24;
     worksheet.views = [{ state: "frozen", ySplit: 1 }];
-    worksheet.autoFilter = { from: "A1", to: "Q1" };
+    worksheet.autoFilter = { from: "A1", to: "T1" };
     worksheet.getColumn("D").numFmt = "0";
     ["J", "K", "L", "M", "N"].forEach((columna) => {
       worksheet.getColumn(columna).numFmt = '$#,##0.00;[Red]-$#,##0.00';
     });
+    worksheet.getColumn("O").numFmt = "dd/mm/yyyy";
     worksheet.eachRow((row, rowNumber) => {
       if (rowNumber > 1) {
         row.alignment = { vertical: "top", wrapText: true };
@@ -2409,6 +2652,7 @@ export const obtenerEstadisticasColchon = async (req, res) => {
       diaHasta,
       conPagosNoVistos,
       pagoAplicado,
+      sinGestionMes,
     } = req.query;
 
     if (!tieneAccesoColchon(req)) {

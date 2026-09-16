@@ -3966,6 +3966,7 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
   // calcula después de cruzar fecha de vencimiento y pagos válidos, igual que
   // en acuerdos manuales. Por eso no se aplica como regex sobre MongoDB.
   const estadoFiltro = String(req.query?.estado || "").trim();
+  const filtrarSinPagosAplicados = String(req.query?.sinPagosAplicados || "").toLowerCase() === "true";
   const filtrarPromesaHoy = req.query?.promesaHoy === "true";
   const hoyClavePromesaMango = fechaClaveArgentina();
 
@@ -4081,6 +4082,12 @@ const obtenerAcuerdosMangoFiltrados = async (req, { page = 1, limit = 20, pagina
     }
     if (filtrarPromesaHoy) {
       salida = salida.filter((acuerdo) => claveVencimientoAcuerdoMango(acuerdo) === hoyClavePromesaMango);
+    }
+    if (filtrarSinPagosAplicados) {
+      salida = salida.filter((acuerdo) =>
+        Number(acuerdo?.cantidadPagosValidos ?? acuerdo?.cantidadPagosPosteriores ?? 0) <= 0 &&
+        Number(acuerdo?.montoPagosValidos ?? acuerdo?.montoPagosPosteriores ?? 0) <= 0
+      );
     }
     return salida
       .map((acuerdo) => ({
@@ -4439,7 +4446,7 @@ export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet("Acuerdos Mango");
     worksheet.columns = [
-      { header: "Estado", key: "estadoSeguimiento", width: 18 },
+      { header: "Estado del acuerdo", key: "estadoSeguimiento", width: 24 },
       { header: "DNI", key: "dni", width: 15 },
       { header: "Titular", key: "titular", width: 30 },
       { header: "Entidad", key: "entidad", width: 25 },
@@ -4483,40 +4490,54 @@ export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
       const number = Number(digits);
       return digits && Number.isSafeInteger(number) ? number : null;
     };
+    // Excel/XML no admite varios caracteres de control. Observaciones copiadas
+    // desde Mango pueden contenerlos y Excel terminaba reparando sheet1.xml.
+    const textoSeguroExcelMango = (value) =>
+      String(value ?? "")
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ")
+        .slice(0, 32767);
 
     acuerdos.forEach((item) => {
       const situacion = item.situacionAcuerdo || (item.acuerdoBajado ? "BAJADO" : "ACTIVO");
+      const situacionKeyInicial = String(situacion).toUpperCase();
+      const estadoAcuerdoExport = item.acuerdoAnuladoPorNuevo || situacionKeyInicial === "ANULADO"
+        ? "ANULADO X NUEVO"
+        : item.acuerdoPagadoBajado || situacionKeyInicial === "PAGADO_BAJADO"
+        ? "PAGADO / BAJADO"
+        : item.acuerdoBajado || situacionKeyInicial === "BAJADO"
+        ? "BAJADO"
+        : item.estadoSeguimiento || "ACTIVO";
       const row = worksheet.addRow({
-        estadoSeguimiento: item.estadoSeguimiento || "",
+        estadoSeguimiento: textoSeguroExcelMango(estadoAcuerdoExport),
         fecha: toDateOnly(item.fecha),
         hora: horaExcelMango(item.hora),
         dni: dniExcelMango(item.dni),
-        titular: item.nombreDeudor || "",
+        titular: textoSeguroExcelMango(item.nombreDeudor),
         entidadNumero: item.entidadNumero || "",
-        entidad: item.entidad || "",
-        tipo: item.tipoAcuerdo || item.resultado || "Acuerdo",
+        entidad: textoSeguroExcelMango(item.entidad),
+        tipo: textoSeguroExcelMango(item.tipoAcuerdo || item.resultado || "Acuerdo"),
         vencePrimerPago: item.anticipoVto || item.primerVto ? toDateOnly(item.anticipoVto || item.primerVto) : "",
         vencePrimeraCuota: item.primerVencimientoCuota ? toDateOnly(item.primerVencimientoCuota) : "",
         pagoEsperado: Number(item.primerPago || item.anticipoMonto || item.montoCuota || 0),
         anticipo: Number(item.anticipoMonto || 0),
         cuota: Number(item.montoCuota || 0),
         total: Number(item.montoTotalAcuerdo || 0),
-        operador: item.operador || "",
-        estadoCuenta: item.estadoCuenta || "",
-        estadoCuentaActual: item.estadoCuentaActual || item.estadoCuenta || "",
+        operador: textoSeguroExcelMango(item.operador),
+        estadoCuenta: textoSeguroExcelMango(item.estadoCuenta),
+        estadoCuentaActual: textoSeguroExcelMango(item.estadoCuentaActual || item.estadoCuenta),
         ultimaGestionFecha: item.ultimaGestionMangoFecha ? toDateOnly(item.ultimaGestionMangoFecha) : "",
-        ultimaGestionOperador: item.ultimaGestionMangoUsuario || "",
-        ultimaGestionResultado: item.ultimaGestionMangoResultado || "",
-        ultimaGestionEstado: item.ultimaGestionMangoEstadoCuenta || item.estadoCuentaActual || "",
-        situacionAcuerdo: situacion,
-        estadoPago: item.estadoPagoAcuerdo || "",
+        ultimaGestionOperador: textoSeguroExcelMango(item.ultimaGestionMangoUsuario),
+        ultimaGestionResultado: textoSeguroExcelMango(item.ultimaGestionMangoResultado),
+        ultimaGestionEstado: textoSeguroExcelMango(item.ultimaGestionMangoEstadoCuenta || item.estadoCuentaActual),
+        situacionAcuerdo: textoSeguroExcelMango(situacion),
+        estadoPago: textoSeguroExcelMango(item.estadoPagoAcuerdo),
         pagadoValido: Number(item.montoPagosValidos || item.montoPagosPosteriores || 0),
         pagoMismoDia: Number(item.montoPagosMismoDia || 0),
         pagosPosteriores: Number(item.montoPagosEstrictamentePosteriores || 0),
-        ultimoPago: item.ultimoPagoValido ? new Date(`${item.ultimoPagoValido}T12:00:00`) : "",
-        coincidencia: item.coincidenciaPagoPor || "",
-        revision: item.motivoRevisionPagos || "",
-        observacion: item.observacionGestion || item.observacionResumen || "",
+        ultimoPago: item.ultimoPagoValido && toDateOnly(item.ultimoPagoValido) ? new Date(`${toDateOnly(item.ultimoPagoValido)}T12:00:00Z`) : "",
+        coincidencia: textoSeguroExcelMango(item.coincidenciaPagoPor),
+        revision: textoSeguroExcelMango(item.motivoRevisionPagos),
+        observacion: textoSeguroExcelMango(item.observacionGestion || item.observacionResumen),
       });
       const situacionKey = String(situacion).toUpperCase();
       if (["BAJADO", "ANULADO"].includes(situacionKey)) {
@@ -4546,9 +4567,13 @@ export const exportarAcuerdosMangoProyeccionesExcel = async (req, res) => {
     worksheet.getColumn("hora").numFmt = "hh:mm:ss";
     worksheet.getColumn("dni").numFmt = "0";
     worksheet.getColumn("ultimoPago").numFmt = "dd/mm/yyyy";
-    worksheet.autoFilter = { from: "A1", to: "Z1" };
+    worksheet.autoFilter = { from: "A1", to: `${worksheet.getColumn(worksheet.columnCount).letter}1` };
 
     const buffer = await workbook.xlsx.writeBuffer();
+    // Validación interna antes de enviarlo: si ExcelJS no puede reabrirlo, no
+    // entregamos un archivo que Excel luego deba "reparar".
+    const validationWorkbook = new ExcelJS.Workbook();
+    await validationWorkbook.xlsx.load(buffer);
     const suffix = fechaClaveArgentina();
     const situacionArchivo = String(req.query?.situacionAcuerdo || "activos").trim().toLowerCase() === "bajados" ? "bajados" : "activos";
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");

@@ -1129,7 +1129,13 @@ async function calcularRecuperados(req) {
     });
     const tipo = montoPorOtros > 0 ? "otro" : montoMismo > 0 ? "mismo" : "sin-recupero";
     const pagosOrdenados = [...ps].sort((a, b) => new Date(a.fechaPago) - new Date(b.fechaPago));
-    const pagoRecupero = pagosOrdenados[0] || null;
+    // En la vista de "recuperados" interesa quién le ganó el caso al operador
+    // original. Si hubo pagos del mismo operador y de otro, tomamos como recupero
+    // el primer pago efectuado por un operador DISTINTO.
+    const pagosPorOtro = pagosOrdenados.filter(
+      (p) => normUser(p.operadorUsername) !== normUser(v.operador)
+    );
+    const pagoRecupero = pagosPorOtro[0] || pagosOrdenados[0] || null;
     const ultimoPago = pagosOrdenados[pagosOrdenados.length - 1] || null;
     const seguimiento = seguimientoMap.get(String(v._id)) || { tiene: false, fecha: null, operador: "" };
     const montoCobrado = montoPorOtros + montoMismo;
@@ -1139,7 +1145,7 @@ async function calcularRecuperados(req) {
       iniciaAt: v.iniciaAt || null,
       origenContactadoAt: origenMap.get(String(v.serieId)) || v.iniciaAt || null,
       venceAt: v.venceAt, tipo,
-      montoPorOtros, montoMismo, montoCobrado, operadoresQueCobraron: [...otros], pagos: ps.length,
+      montoPorOtros, montoMismo, montoCobrado, montoRecuperadoPorOtro: montoPorOtros, operadoresQueCobraron: [...otros], pagos: ps.length,
       operadorRecupero: pagoRecupero?.operadorUsername ? normUser(pagoRecupero.operadorUsername) : "",
       fechaRecupero: pagoRecupero?.fechaPago || null,
       ultimoPagoFecha: ultimoPago?.fechaPago || null,
@@ -1313,7 +1319,7 @@ export async function exportarExcel(req, res) {
           { header: "Pago/cobro real", key: "montoCobrado", width: 18 }, { header: "Cobrado por otros", key: "otros", width: 18 },
           { header: "Cobrado por el mismo", key: "mismo", width: 20 }, { header: "Operadores que cobraron", key: "operadores", width: 30 },
         ];
-        data.casos.filter((c) => c.tipo !== "sin-recupero").forEach((c) => ws.addRow({
+        data.casos.filter((c) => c.tipo === "otro").forEach((c) => ws.addRow({
           dni: dniExcel(c.dni), nombre: c.nombreDeudor, entidad: c.entidad, operador: c.operador,
           generado: fechaExcel(c.origenContactadoAt || c.iniciaAt), vence: fechaExcel(c.venceAt),
           operadorRecupero: c.operadorRecupero || c.operadoresQueCobraron?.[0] || c.operador || "",
@@ -1321,7 +1327,7 @@ export async function exportarExcel(req, res) {
           ultimaGestion: c.ultimaGestionResultado || c.gestionRecupero || c.ultimaGestionEstado || "Sin gestión posterior",
           fechaUltimaGestion: fechaExcel(c.ultimaGestionFecha),
           operadorUltimaGestion: c.ultimaGestionOperador || "", estadoActual: c.estadoActual || "",
-          montoCobrado: Number(c.montoCobrado || 0), otros: Number(c.montoPorOtros || 0),
+          montoCobrado: Number(c.montoPorOtros || 0), otros: Number(c.montoPorOtros || 0),
           mismo: Number(c.montoMismo || 0), operadores: c.operadoresQueCobraron.join(", "),
         }));
         ws.getColumn("dni").numFmt = "0";

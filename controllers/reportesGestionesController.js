@@ -4122,26 +4122,33 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
     error.status = 400;
     throw error;
   }
+  // IMPORTANTE: en Acuerdos el filtro principal de período corresponde al
+  // vencimiento del PRIMER PAGO, no a la fecha de la gestión que lo creó.
+  // Conservamos un match separado por fecha de gestión únicamente para el
+  // denominador histórico de productividad; los acuerdos se filtran más abajo
+  // una vez parseado su primer vencimiento.
+  const matchGestionesPeriodo = { ...match };
   if (d1 || d2) {
-    match.fecha = {};
-    if (d1) match.fecha.$gte = d1;
-    if (d2) match.fecha.$lte = d2;
+    matchGestionesPeriodo.fecha = {};
+    if (d1) matchGestionesPeriodo.fecha.$gte = d1;
+    if (d2) matchGestionesPeriodo.fecha.$lte = d2;
   }
 
   const fEntidad = rxExactMulti(entidad, (value) => value.toUpperCase());
   const fTipo = rxExactMulti(tipoContacto);
   const fEstado = rxExactMulti(estadoCuenta);
   const fDni = buildDniFilter(dni);
-  if (fEntidad) match.entidad = fEntidad;
-  if (fTipo) match.tipoContacto = fTipo;
-  if (fEstado) match.estadoCuenta = fEstado;
-  if (fDni) match.dni = fDni;
+  if (fEntidad) { match.entidad = fEntidad; matchGestionesPeriodo.entidad = fEntidad; }
+  if (fTipo) { match.tipoContacto = fTipo; matchGestionesPeriodo.tipoContacto = fTipo; }
+  if (fEstado) { match.estadoCuenta = fEstado; matchGestionesPeriodo.estadoCuenta = fEstado; }
+  if (fDni) { match.dni = fDni; matchGestionesPeriodo.dni = fDni; }
+  if (fOperadorAcuerdos) matchGestionesPeriodo.usuario = fOperadorAcuerdos;
 
   throwIfAborted(req);
 
-  // Regla V17: el período se determina EXCLUSIVAMENTE por la fecha en que
-  // se cargó/generó el acuerdo. No se arrastran acuerdos de meses anteriores
-  // aunque su vencimiento caiga dentro del período seleccionado.
+  // El universo de acuerdos se obtiene por sus filtros de negocio y luego se
+  // recorta por el vencimiento del primer pago ya normalizado. Esto evita el
+  // error histórico de usar la fecha de la última/creación de gestión.
   const agreementMatch = {
     ...match,
     resultadoGestion: /acuerdo/i,
@@ -4149,11 +4156,11 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
 
   const [totalGestiones, gestionesPorOperador, rawRows] = await Promise.all([
     necesitaEstadisticas
-      ? ReporteGestion.countDocuments(match).maxTimeMS(30000)
+      ? ReporteGestion.countDocuments(matchGestionesPeriodo).maxTimeMS(30000)
       : Promise.resolve(0),
     necesitaEstadisticas
       ? ReporteGestion.aggregate([
-          { $match: match },
+          { $match: matchGestionesPeriodo },
           { $group: { _id: "$usuario", gestiones: { $sum: 1 } } },
           { $project: { _id: 0, operador: "$_id", gestiones: 1 } },
           { $sort: { gestiones: -1, operador: 1 } },
@@ -4177,9 +4184,20 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
   // resolvemos episodios efectivos por DNI + entidad. De ese modo, si un acuerdo
   // tuvo pago y luego hubo un nuevo acuerdo, ambos cuentan; si fue reemplazado sin
   // pago, solo queda el más reciente.
+  const desdeClave = desde ? String(desde).slice(0, 10) : "";
+  const hastaClave = hasta ? String(hasta).slice(0, 10) : "";
+  const dentroRangoPrimerPago = (row, ini = desdeClave, fin = hastaClave) => {
+    const key = String(row?.fechaPrimerPago || row?.primerVencimiento || "").slice(0, 10);
+    if (!key) return false;
+    if (ini && key < ini) return false;
+    if (fin && key > fin) return false;
+    return true;
+  };
+
   let acuerdosBase = rawRows
     .map((row) => transformarGestionEnAcuerdo(row))
     .filter(Boolean)
+    .filter((row) => dentroRangoPrimerPago(row))
     .map((row) => ({ ...row, esArrastrePeriodo: false, dentroPeriodoCarga: true }));
 
   acuerdosBase = await vincularUltimaGestionMango(acuerdosBase, req);
@@ -4342,7 +4360,7 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
         fecha: { $gte: anteriorD1, $lte: anteriorD2 },
       };
       const previousAgreementMatch = {
-        ...previousMatch,
+        ...match,
         resultadoGestion: /acuerdo/i,
       };
 
@@ -4367,7 +4385,8 @@ async function obtenerDatosAcuerdos(req, { paginate = true, soloVencidos = false
 
       let previousAgreementsBase = previousRawRows
         .map((row) => transformarGestionEnAcuerdo(row))
-        .filter(Boolean);
+        .filter(Boolean)
+        .filter((row) => dentroRangoPrimerPago(row, anteriorDesde, anteriorHasta));
       previousAgreementsBase = await vincularUltimaGestionMango(previousAgreementsBase, req);
       const previousPaymentLink = await vincularPagosConAcuerdosSinRomper(previousAgreementsBase, { fechaHasta: anteriorHasta });
       const previousEpisodes = resolverEpisodiosAcuerdos(previousPaymentLink.rows || []);

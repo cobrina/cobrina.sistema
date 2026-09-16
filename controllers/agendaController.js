@@ -7,7 +7,7 @@ import { canAssignAgenda } from "../config/roles.js";
 const fechaValida = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || "").trim());
 const horaValida = (value) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || "").trim());
 const TIPOS = new Set(["tarea", "reunion", "recordatorio"]);
-const RECURRENCIAS = new Set(["semanal", "mensual"]);
+const RECURRENCIAS = new Set(["diaria", "semanal", "mensual"]);
 const MAX_OCURRENCIAS = 120;
 
 function limpiarTexto(value, max) {
@@ -34,11 +34,12 @@ function sumarMesConAncla(fecha, meses, diaAncla) {
   return objetivo;
 }
 
-function fechasRecurrencia(fechaInicial, recurrencia, hastaClave) {
+function fechasRecurrencia(fechaInicial, recurrencia, hastaClave, cantidadSolicitada = 0) {
   if (!recurrencia) return [fechaInicial];
   if (!RECURRENCIAS.has(recurrencia)) throw new Error("Frecuencia de repetición inválida");
-  if (!fechaValida(hastaClave) || hastaClave < fechaInicial) {
-    throw new Error("Elegí hasta qué fecha se repite la actividad");
+  const cantidad = Math.max(0, Math.min(MAX_OCURRENCIAS, Math.floor(Number(cantidadSolicitada) || 0)));
+  if (!cantidad && (!fechaValida(hastaClave) || hastaClave < fechaInicial)) {
+    throw new Error("Elegí hasta qué fecha se repite la actividad o cuántas veces repetirla");
   }
 
   const inicio = fechaUTCDesdeClave(fechaInicial);
@@ -46,10 +47,14 @@ function fechasRecurrencia(fechaInicial, recurrencia, hastaClave) {
   const fechas = [];
   let cursor = new Date(inicio);
   let indice = 0;
-  while (claveDesdeFechaUTC(cursor) <= hastaClave && fechas.length < MAX_OCURRENCIAS) {
-    fechas.push(claveDesdeFechaUTC(cursor));
+  while (fechas.length < MAX_OCURRENCIAS) {
+    const clave = claveDesdeFechaUTC(cursor);
+    if (cantidad ? fechas.length >= cantidad : clave > hastaClave) break;
+    fechas.push(clave);
     indice += 1;
-    cursor = recurrencia === "semanal"
+    cursor = recurrencia === "diaria"
+      ? new Date(cursor.getTime() + 86_400_000)
+      : recurrencia === "semanal"
       ? new Date(cursor.getTime() + 7 * 86_400_000)
       : sumarMesConAncla(inicio, indice, diaAncla);
   }
@@ -186,7 +191,8 @@ export async function crearAgendaItem(req, res) {
     const propietario = await resolverPropietario(req);
     const recurrencia = String(req.body?.recurrencia || "").trim().toLowerCase();
     const recurrenciaHasta = recurrencia ? String(req.body?.recurrenciaHasta || "").trim() : "";
-    const fechas = fechasRecurrencia(payload.fechaClave, recurrencia, recurrenciaHasta);
+    const recurrenciaCantidad = recurrencia ? Math.max(0, Math.min(MAX_OCURRENCIAS, Number(req.body?.recurrenciaCantidad || 0))) : 0;
+    const fechas = fechasRecurrencia(payload.fechaClave, recurrencia, recurrenciaHasta, recurrenciaCantidad);
     const serieId = fechas.length > 1 ? randomUUID() : "";
     const base = {
       ...payload,

@@ -36,7 +36,7 @@ export async function limpiarRegistrosPersonalesAntiguos({ force = false, now = 
     const [tareas, agenda] = await Promise.all([
       // Las tareas que llevan más de tres meses sin cambios se consideran archivo vencido.
       // Usar updatedAt evita borrar una tarea antigua que la persona sigue manteniendo activa.
-      StickyNote.deleteMany({ updatedAt: { $lt: cutoffInstant } }),
+      StickyNote.deleteMany({ updatedAt: { $lt: cutoffInstant }, pinned: { $ne: true } }),
       // La agenda conserva siempre actividades futuras; solo se limpian fechas pasadas
       // cuya fecha calendario quedó fuera de la ventana móvil de tres meses.
       AgendaItem.deleteMany({ fechaClave: { $lt: cutoffAgenda } }),

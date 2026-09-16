@@ -30,6 +30,7 @@ const StickyNoteSchema = new mongoose.Schema(
     },
     dueDate: { type: Date, default: null, index: true },
     completedAt: { type: Date, default: null },
+    pinned: { type: Boolean, default: false, index: true },
     order: { type: Number, default: 0 },
   },
   { timestamps: true }

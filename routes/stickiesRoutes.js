@@ -25,7 +25,7 @@ router.get("/mine", verifyToken, async (req, res) => {
   try {
     const userId = userIdFrom(req);
     const notes = await StickyNote.find({ userId })
-      .sort({ status: 1, order: 1, updatedAt: -1 })
+      .sort({ status: 1, pinned: -1, order: 1, updatedAt: -1 })
       .lean();
 
     const migrations = [];
@@ -76,6 +76,7 @@ router.post("/", verifyToken, async (req, res) => {
       priority,
       month,
       dueDate: parseDueDate(req.body?.dueDate),
+      pinned: req.body?.pinned === true,
       completedAt: status === "finalizada" ? new Date() : null,
       order: max ? Number(max.order || 0) + 1 : 0,
     });
@@ -156,6 +157,9 @@ router.put("/:id", verifyToken, async (req, res) => {
     if (/^\d{4}-\d{2}$/.test(String(req.body?.month || ""))) update.month = String(req.body.month);
     if (Object.prototype.hasOwnProperty.call(req.body || {}, "dueDate")) {
       update.dueDate = parseDueDate(req.body.dueDate);
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, "pinned")) {
+      update.pinned = req.body.pinned === true;
     }
     if (STICKY_STATUSES.includes(req.body?.status)) {
       update.status = req.body.status;
