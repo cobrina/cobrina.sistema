@@ -642,6 +642,198 @@ async function obtenerResumenGestionesColchonExport(filas = [], desde, hasta, lo
   return resumen;
 }
 
+
+function etapasExistenciaPagoMes(desde, hasta) {
+  return [
+    {
+      $addFields: {
+        dniTextoPagoFiltro: { $toString: "$dni" },
+        entidadNumeroPagoFiltro: {
+          $convert: { input: "$entidadNumero", to: "int", onError: null, onNull: null },
+        },
+      },
+    },
+    {
+      $lookup: {
+        from: Pago.collection.name,
+        let: { dniCuota: "$dniTextoPagoFiltro", entidadNumero: "$entidadNumeroPagoFiltro" },
+        pipeline: [
+          {
+            $match: {
+              fechaPago: { $gte: desde, $lte: hasta },
+              monto: { $gt: 0 },
+              $expr: {
+                $and: [
+                  { $eq: ["$dni", "$$dniCuota"] },
+                  { $eq: ["$entidadId", "$$entidadNumero"] },
+                ],
+              },
+            },
+          },
+          { $project: { _id: 1 } },
+          { $limit: 1 },
+        ],
+        as: "pagoAplicadoMesExiste",
+      },
+    },
+    {
+      $addFields: {
+        tienePagoAplicado: { $gt: [{ $size: "$pagoAplicadoMesExiste" }, 0] },
+        pagoValidadoCobrina: { $gt: [{ $size: "$pagoAplicadoMesExiste" }, 0] },
+        // Para filtros/estado alcanza con existencia. El monto real se calcula
+        // después sobre la página visible o con el pipeline completo al ordenar.
+        pagadoTotal: { $cond: [{ $gt: [{ $size: "$pagoAplicadoMesExiste" }, 0] }, 1, 0] },
+      },
+    },
+    {
+      $addFields: {
+        estadoFinal: {
+          $cond: [
+            "$tienePagoAplicado",
+            "A cuota",
+            { $ifNull: ["$estadoOriginal", "$estado"] },
+          ],
+        },
+      },
+    },
+  ];
+}
+
+function etapasExistenciaGestionMes(desde, hasta) {
+  return [
+    {
+      $addFields: {
+        dniTextoGestionFiltro: { $toString: "$dni" },
+        entidadNumeroGestionFiltro: {
+          $convert: { input: "$entidadNumero", to: "int", onError: null, onNull: null },
+        },
+      },
+    },
+    {
+      $lookup: {
+        from: ReporteGestion.collection.name,
+        let: { dniCuota: "$dniTextoGestionFiltro", entidadNumero: "$entidadNumeroGestionFiltro" },
+        pipeline: [
+          {
+            $match: {
+              borrado: { $ne: true },
+              fecha: { $gte: desde, $lte: hasta },
+              $expr: {
+                $and: [
+                  { $eq: ["$dni", "$$dniCuota"] },
+                  { $eq: ["$entidadNumero", "$$entidadNumero"] },
+                ],
+              },
+            },
+          },
+          { $project: { _id: 1 } },
+          { $limit: 1 },
+        ],
+        as: "gestionMesExiste",
+      },
+    },
+    { $addFields: { tieneGestionMes: { $gt: [{ $size: "$gestionMesExiste" }, 0] } } },
+  ];
+}
+
+
+function etapasDetalleGestionColchon(desde, hasta) {
+  return [
+    {
+      $addFields: {
+        dniTextoGestionDetalle: { $toString: "$dni" },
+        entidadNumeroGestionDetalle: {
+          $convert: { input: "$entidadNumero", to: "int", onError: null, onNull: null },
+        },
+      },
+    },
+    {
+      $lookup: {
+        from: ReporteGestion.collection.name,
+        let: { dniCuota: "$dniTextoGestionDetalle", entidadNumero: "$entidadNumeroGestionDetalle" },
+        pipeline: [
+          {
+            $match: {
+              borrado: { $ne: true },
+              $expr: {
+                $and: [
+                  { $eq: ["$dni", "$$dniCuota"] },
+                  { $eq: ["$entidadNumero", "$$entidadNumero"] },
+                ],
+              },
+            },
+          },
+          { $sort: { fecha: -1, hora: -1, _id: -1 } },
+          { $project: { _id: 0, fecha: 1, hora: 1, usuario: 1, resultadoGestion: 1 } },
+          { $limit: 1 },
+        ],
+        as: "gestionReporteUltimaArr",
+      },
+    },
+    { $set: { gestionReporteUltima: { $arrayElemAt: ["$gestionReporteUltimaArr", 0] } } },
+    {
+      $lookup: {
+        from: ReporteGestion.collection.name,
+        let: { dniCuota: "$dniTextoGestionDetalle", entidadNumero: "$entidadNumeroGestionDetalle" },
+        pipeline: [
+          {
+            $match: {
+              borrado: { $ne: true },
+              fecha: { $gte: desde, $lte: hasta },
+              $expr: {
+                $and: [
+                  { $eq: ["$dni", "$$dniCuota"] },
+                  { $eq: ["$entidadNumero", "$$entidadNumero"] },
+                ],
+              },
+            },
+          },
+          { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$fecha", timezone: "UTC" } } } },
+          { $count: "dias" },
+        ],
+        as: "gestionReporteMesArr",
+      },
+    },
+    { $set: { diasTocadosMes: { $ifNull: [{ $arrayElemAt: ["$gestionReporteMesArr.dias", 0] }, 0] } } },
+  ];
+}
+
+async function obtenerClavesConGestionMes(filas = [], desde, hasta, lote = 1200) {
+  const pares = new Map();
+  for (const fila of filas) {
+    const dni = String(fila?.dni || "").replace(/\D/g, "");
+    const entidadNumero = Number(fila?.entidadId?.numero || fila?.entidadNumero || 0);
+    if (!dni || !entidadNumero) continue;
+    pares.set(claveGestionColchon(dni, entidadNumero), { dni, entidadNumero });
+  }
+
+  const lista = [...pares.values()];
+  const claves = new Set();
+  for (let i = 0; i < lista.length; i += lote) {
+    const bloque = lista.slice(i, i + lote);
+    const dnis = [...new Set(bloque.map((item) => item.dni))];
+    const entidades = [...new Set(bloque.map((item) => item.entidadNumero))];
+    if (!dnis.length || !entidades.length) continue;
+
+    const encontrados = await ReporteGestion.aggregate([
+      {
+        $match: {
+          borrado: { $ne: true },
+          fecha: { $gte: desde, $lte: hasta },
+          dni: { $in: dnis },
+          entidadNumero: { $in: entidades },
+        },
+      },
+      { $group: { _id: { dni: "$dni", entidadNumero: "$entidadNumero" } } },
+    ]).allowDiskUse(true);
+
+    for (const item of encontrados) {
+      claves.add(claveGestionColchon(item?._id?.dni, item?._id?.entidadNumero));
+    }
+  }
+  return claves;
+}
+
 function etapasPagosAplicadosMes(desde, hasta) {
   return [
     {
@@ -861,82 +1053,47 @@ export const filtrarCuotas = async (req, res) => {
     const filtroPagoAplicado = ["con", "sin"].includes(String(pagoAplicado || "").trim())
       ? String(pagoAplicado).trim()
       : "";
-    const necesitaPagosAntes = sortField === "pagadoTotal" || Boolean(filtroPagoAplicado) || Boolean(estado);
     const necesitaPagosConteo = Boolean(filtroPagoAplicado) || Boolean(estado);
     const necesitaLookupAntesDeOrdenar = [
       "empleado.username",
       "entidad.nombre",
       "subcesion.nombre",
-    ].includes(sortField) || necesitaPagosAntes;
+    ].includes(sortField) || sortField === "pagadoTotal";
     const { desde: pagosDesde, hasta: pagosHasta } = rangoPagosMesVigente();
 
-    // Gestión real proveniente de ReporteGestion. Se cruza por DNI + entidad y
-    // permite ver la última gestión, quién la hizo y cuántos días distintos fue
-    // trabajada la cuenta durante el mes vigente.
-    const gestionStages = [
-      {
-        $lookup: {
-          from: ReporteGestion.collection.name,
-          let: { dniCuota: "$dni", entidadCuota: "$entidad.numero" },
-          pipeline: [
-            {
-              $match: {
-                borrado: { $ne: true },
-                $expr: {
-                  $and: [
-                    { $eq: [{ $convert: { input: "$dni", to: "long", onError: -1, onNull: -1 } }, { $convert: { input: "$$dniCuota", to: "long", onError: -2, onNull: -2 } }] },
-                    { $eq: [{ $convert: { input: "$entidadNumero", to: "long", onError: -1, onNull: -1 } }, { $convert: { input: "$$entidadCuota", to: "long", onError: -2, onNull: -2 } }] },
-                  ],
-                },
-              },
-            },
-            { $sort: { fecha: -1, hora: -1, _id: -1 } },
-            { $limit: 1 },
-            { $project: { _id: 0, fecha: 1, hora: 1, usuario: 1, resultadoGestion: 1 } },
-          ],
-          as: "gestionReporteUltimaArr",
-        },
-      },
-      { $set: { gestionReporteUltima: { $arrayElemAt: ["$gestionReporteUltimaArr", 0] } } },
-      {
-        $lookup: {
-          from: ReporteGestion.collection.name,
-          let: { dniCuota: "$dni", entidadCuota: "$entidad.numero" },
-          pipeline: [
-            {
-              $match: {
-                borrado: { $ne: true },
-                fecha: { $gte: pagosDesde, $lte: pagosHasta },
-                $expr: {
-                  $and: [
-                    { $eq: [{ $convert: { input: "$dni", to: "long", onError: -1, onNull: -1 } }, { $convert: { input: "$$dniCuota", to: "long", onError: -2, onNull: -2 } }] },
-                    { $eq: [{ $convert: { input: "$entidadNumero", to: "long", onError: -1, onNull: -1 } }, { $convert: { input: "$$entidadCuota", to: "long", onError: -2, onNull: -2 } }] },
-                  ],
-                },
-              },
-            },
-            { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$fecha", timezone: "UTC" } } } },
-            { $count: "dias" },
-          ],
-          as: "gestionReporteMesArr",
-        },
-      },
-      { $set: { diasTocadosMes: { $ifNull: [{ $arrayElemAt: ["$gestionReporteMesArr.dias", 0] }, 0] } } },
-    ];
+    // Para filtrar "Sin gestión este mes" sólo necesitamos saber si existe
+    // al menos una gestión. El detalle (última gestión y días tocados) se
+    // enriquece recién sobre la página visible. Esto evita dos $lookup pesados
+    // por cada cuota antes de paginar.
     const filtraSinGestionMes = String(sinGestionMes || "").toLowerCase() === "true";
+    const gestionFiltroStages = filtraSinGestionMes
+      ? etapasExistenciaGestionMes(pagosDesde, pagosHasta)
+      : [];
     const gestionMatchStages = filtraSinGestionMes
-      ? [{ $match: { diasTocadosMes: { $lte: 0 } } }]
+      ? [{ $match: { tieneGestionMes: false } }]
       : [];
     const sortGestion = [
       "gestionReporteUltima.fecha",
       "gestionReporteUltima.usuario",
       "diasTocadosMes",
     ].includes(sortField);
-    const necesitaGestionAntes = filtraSinGestionMes || sortGestion;
-    const necesitaLookupDatosAntes = necesitaLookupAntesDeOrdenar || necesitaGestionAntes;
-    const paymentStages = necesitaPagosAntes ? etapasPagosAplicadosMes(pagosDesde, pagosHasta) : [];
+    const gestionSortStages = sortGestion
+      ? etapasDetalleGestionColchon(pagosDesde, pagosHasta)
+      : [];
+    const necesitaLookupDatosAntes = necesitaLookupAntesDeOrdenar;
+    const necesitaPagoTotalAntes = sortField === "pagadoTotal";
+    const necesitaPagoExistencia = Boolean(filtroPagoAplicado) || Boolean(estado);
+    const paymentStages = necesitaPagoTotalAntes
+      ? etapasPagosAplicadosMes(pagosDesde, pagosHasta)
+      : necesitaPagoExistencia
+        ? etapasExistenciaPagoMes(pagosDesde, pagosHasta)
+        : [];
     const paymentMatchStages = filtroPagoAplicado
-      ? [{ $match: filtroPagoAplicado === "con" ? { pagadoTotal: { $gt: 0 } } : { pagadoTotal: { $lte: 0 } } }]
+      ? [{
+          $match: necesitaPagoTotalAntes
+            ? (filtroPagoAplicado === "con" ? { pagadoTotal: { $gt: 0 } } : { pagadoTotal: { $lte: 0 } })
+            : { tienePagoAplicado: filtroPagoAplicado === "con" },
+        }]
       : [];
     const estadoMatchStages = estado ? [{ $match: { estadoFinal: estado } }] : [];
     const sortStage = { $sort: { [sortField]: sortDir, _id: 1 } };
@@ -948,10 +1105,9 @@ export const filtrarCuotas = async (req, res) => {
     const pipelineConteo = [
       { $match: baseMatch },
       ...derivedStages,
-      ...((filtraSinGestionMes || necesitaPagosConteo) ? lookupStages : []),
-      ...(filtraSinGestionMes ? gestionStages : []),
+      ...gestionFiltroStages,
       ...gestionMatchStages,
-      ...(necesitaPagosConteo ? etapasPagosAplicadosMes(pagosDesde, pagosHasta) : []),
+      ...(necesitaPagosConteo ? etapasExistenciaPagoMes(pagosDesde, pagosHasta) : []),
       ...paymentMatchStages,
       ...estadoMatchStages,
       { $count: "count" },
@@ -961,8 +1117,9 @@ export const filtrarCuotas = async (req, res) => {
       { $match: baseMatch },
       ...derivedStages,
       ...(necesitaLookupDatosAntes ? lookupStages : []),
-      ...(necesitaGestionAntes ? gestionStages : []),
+      ...gestionFiltroStages,
       ...gestionMatchStages,
+      ...gestionSortStages,
       ...paymentStages,
       ...paymentMatchStages,
       ...estadoMatchStages,
@@ -2707,6 +2864,22 @@ export const obtenerEstadisticasColchon = async (req, res) => {
         ? `${dniClave}|${entidadNumero}`
         : "";
     };
+
+    const filtraSinGestionMesStats = String(sinGestionMes || "").toLowerCase() === "true";
+    if (filtraSinGestionMesStats && cuotasBrutas.length) {
+      const clavesConGestion = await obtenerClavesConGestionMes(
+        cuotasBrutas,
+        pagosDesde,
+        pagosHasta
+      );
+      cuotasBrutas = cuotasBrutas.filter((cuota) => {
+        const key = claveGestionColchon(
+          cuota?.dni,
+          cuota?.entidadId?.numero || cuota?.entidadNumero
+        );
+        return key && !clavesConGestion.has(key);
+      });
+    }
 
     // Fuente única: TODOS los importes aplicados salen del módulo Pagos.
     // En Colchón el cruce se hace por DNI + número de entidad. La subcesión

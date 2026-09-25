@@ -14,7 +14,10 @@ import Empleado from "../models/Empleado.js";
 import Entidad from "../models/Entidad.js";
 import Pago from "../models/Pago.js";
 import { invalidateSeguimientoCache } from "./reportesSeguimientoController.js";
-import { sincronizarContactados } from "../services/contactadosService.js";
+import {
+  sincronizarContactados,
+  reconciliarContactadosTrasCambioGestiones,
+} from "../services/contactadosService.js";
 import {
   filtrarEmpleadosControlados,
   filtrarEmpleadosOperativosControl,
@@ -327,6 +330,40 @@ export async function cargar(req, res) {
     const normUser = (s) => norm(s).toLowerCase();
     const normEntidad = (s) => norm(s).toUpperCase();
 
+    // Regla de integridad: una gestión sólo puede ingresar si el usuario existe
+    // en RRHH/Empleados y continúa activo. Antes esta diferencia era sólo una
+    // advertencia y la fila igualmente se guardaba, lo que permitía mezclar
+    // gestiones de otra empresa y luego materializarlas en Contactados.
+    const usuariosEntrada = [...new Set(
+      filas
+        .map((f) => normUser(f?.USUARIO ?? f?.usuario))
+        .filter(Boolean)
+    )];
+    const empleadosArchivo = usuariosEntrada.length
+      ? await Empleado.find({ username: { $in: usuariosEntrada } })
+          .select("username nombre role isActive")
+          .lean()
+      : [];
+    const empleadosPorUsuario = new Map(
+      empleadosArchivo.map((emp) => [normUser(emp?.username), emp])
+    );
+    const rechazosOperadoresMap = new Map();
+    const registrarRechazoOperador = (usuario, estado, emp = null) => {
+      const key = `${usuario}|${estado}`;
+      const actual = rechazosOperadoresMap.get(key) || {
+        usuario,
+        nombre: String(emp?.nombre || "").trim(),
+        role: String(emp?.role || "").trim(),
+        gestiones: 0,
+        estado,
+        mensaje: estado === "INACTIVO"
+          ? "El usuario está dado de baja/inactivo en RRHH."
+          : "El usuario no existe en RRHH/Empleados.",
+      };
+      actual.gestiones += 1;
+      rechazosOperadoresMap.set(key, actual);
+    };
+
     const entidades = await Entidad.find().select("numero nombre").lean();
 
     const entidadesPorNombre = new Map();
@@ -342,6 +379,7 @@ export async function cargar(req, res) {
     const seen = new Set();
     const docs = [];
     const rawRows = [];
+    const rawRowNumbers = [];
 
     filas.forEach((f, idx) => {
       const row = idx + 2;
@@ -379,6 +417,28 @@ export async function cargar(req, res) {
       const fechaKey = fDate.toISOString().slice(0, 10);
 
       const usuario = normUser(usuarioRaw);
+      const empleado = empleadosPorUsuario.get(usuario);
+      if (!empleado) {
+        registrarRechazoOperador(usuario, "NO_EXISTE");
+        errores.push({
+          fila: row,
+          codigo: "USUARIO_NO_REGISTRADO",
+          motivo: `Usuario "${usuarioRaw}" no existe en Usuarios/RRHH. La gestión NO fue importada.`,
+          row: { ...f },
+        });
+        return;
+      }
+      if (empleado.isActive === false) {
+        registrarRechazoOperador(usuario, "INACTIVO", empleado);
+        errores.push({
+          fila: row,
+          codigo: "USUARIO_INACTIVO",
+          motivo: `Usuario "${usuarioRaw}" está inactivo en Usuarios/RRHH. La gestión NO fue importada.`,
+          row: { ...f },
+        });
+        return;
+      }
+
       const entidadNumeroIngresado = /^\d+$/.test(entidadRaw) ? Number(entidadRaw) : null;
       const entidadCatalogo = entidadNumeroIngresado != null
         ? entidadesPorNumero.get(entidadNumeroIngresado)
@@ -387,9 +447,6 @@ export async function cargar(req, res) {
       const entidadNumero = Number(entidadCatalogo?.numero);
       if (entidad.length > 120) entidad = entidad.slice(0, 120);
 
-      // La gestión de Mango se importa aunque el username todavía no esté
-      // dado de alta/activo en Empleados. Esto evita perder producción real por
-      // una diferencia administrativa de padrón.
 
       if (!entidadCatalogo || !Number.isFinite(entidadNumero)) {
         errores.push({
@@ -442,6 +499,7 @@ export async function cargar(req, res) {
         "OBSERVACION GESTION": observacion,
         ENTIDAD: entidadRaw,
       });
+      rawRowNumbers.push(row);
 
       // Una gestión puede contener varios destinatarios dentro de la observación.
       // Guardamos el conjunto único de e-mails encontrados tanto en TEL-MAIL
@@ -468,62 +526,22 @@ export async function cargar(req, res) {
       });
     });
 
-    // Aviso administrativo: no frenamos la importación por diferencias con el
-    // padrón de Empleados, pero las exponemos para detectar rápidamente
-    // gestiones de usuarios dados de baja o que ni siquiera están cargados.
-    const conteoUsuariosArchivo = new Map();
-    for (const doc of docs) {
-      const usuario = normUser(doc?.usuario);
-      if (!usuario) continue;
-      conteoUsuariosArchivo.set(usuario, (conteoUsuariosArchivo.get(usuario) || 0) + 1);
-    }
-
-    let advertenciasOperadores = [];
-    const usuariosArchivo = Array.from(conteoUsuariosArchivo.keys());
-    if (usuariosArchivo.length) {
-      const empleadosArchivo = await Empleado.find({ username: { $in: usuariosArchivo } })
-        .select("username nombre role isActive")
-        .lean();
-      const empleadosPorUsuario = new Map(
-        empleadosArchivo.map((emp) => [normUser(emp?.username), emp]),
-      );
-
-      advertenciasOperadores = usuariosArchivo
-        .map((usuario) => {
-          const emp = empleadosPorUsuario.get(usuario);
-          const gestiones = conteoUsuariosArchivo.get(usuario) || 0;
-          if (!emp) {
-            return {
-              usuario,
-              gestiones,
-              estado: "NO_EXISTE",
-              mensaje: "El usuario no existe en Empleados.",
-            };
-          }
-          if (emp.isActive === false) {
-            return {
-              usuario,
-              nombre: String(emp?.nombre || "").trim(),
-              role: String(emp?.role || "").trim(),
-              gestiones,
-              estado: "INACTIVO",
-              mensaje: "El usuario está dado de baja/inactivo en Empleados.",
-            };
-          }
-          return null;
-        })
-        .filter(Boolean)
-        .sort((a, b) => b.gestiones - a.gestiones || a.usuario.localeCompare(b.usuario));
-    }
+    const operadoresRechazados = [...rechazosOperadoresMap.values()]
+      .sort((a, b) => b.gestiones - a.gestiones || a.usuario.localeCompare(b.usuario));
+    // Campo legacy conservado para no romper clientes anteriores. Ya no son
+    // advertencias: esas filas se rechazan antes de escribir en Mongo.
+    const advertenciasOperadores = [];
 
     if (!docs.length) {
-      return res.status(200).json({
-        ok: true,
+      return res.status(422).json({
+        ok: false,
+        error: "No se importó ninguna gestión. Todas las filas fueron rechazadas; revisá el Excel de errores.",
         insertados: 0,
         duplicadosEnBD: 0,
-        totalProcesados: 0,
+        totalProcesados: filas.length,
         errores,
         advertenciasOperadores,
+        operadoresRechazados,
       });
     }
 
@@ -572,7 +590,7 @@ export async function cargar(req, res) {
         if (isDup(w)) {
           duplicadosEnBD++;
           errores.push({
-            fila: idx != null ? idx + 2 : "-",
+            fila: idx != null ? (rawRowNumbers[idx] ?? "-") : "-",
             motivo:
               "Gestion duplicada en BD (propietario+dni+fecha+hora+usuario+tipoContacto+resultadoGestion+estadoCuenta+entidad)",
             row: rowData || {},
@@ -582,7 +600,7 @@ export async function cargar(req, res) {
           const msg =
             w?.errmsg || w?.message || w?.err?.message || e?.message || "Error de insercion";
           errores.push({
-            fila: idx != null ? idx + 2 : "-",
+            fila: idx != null ? (rawRowNumbers[idx] ?? "-") : "-",
             motivo: String(msg).slice(0, 500),
             row: rowData || {},
           });
@@ -636,6 +654,7 @@ export async function cargar(req, res) {
           totalLeido: filas.length,
           errores,
           advertenciasOperadores,
+          operadoresRechazados,
         });
       }
     }
@@ -643,18 +662,24 @@ export async function cargar(req, res) {
     if (insertados > 0 || reemplazarTodo) {
       invalidateReportesAnalyticsCache();
       invalidateSeguimientoCache();
-      // No bloquea la importación: Contactados se actualiza inmediatamente
-      // y además tiene sincronización periódica como respaldo.
-      sincronizarContactados().catch(() => {});
+      if (reemplazarTodo) {
+        // Un reemplazo elimina gestiones existentes: Contactados debe
+        // reconstruirse, no alcanza con la sincronización incremental.
+        await reconciliarContactadosTrasCambioGestiones();
+      } else {
+        // Las altas nuevas sí pueden procesarse incrementalmente.
+        sincronizarContactados().catch(() => {});
+      }
     }
 
     return res.status(200).json({
       ok: true,
       insertados,
       duplicadosEnBD,
-      totalProcesados: docs.length + (errores?.length || 0),
+      totalProcesados: filas.length,
       errores,
       advertenciasOperadores,
+      operadoresRechazados,
     });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
@@ -1260,11 +1285,26 @@ export async function limpiar(req, res) {
     throwIfAborted(req);
 
     const r = await ReporteGestion.deleteMany(q);
+    let contactadosActualizados = false;
+    let advertenciaContactados = "";
     if ((r.deletedCount || 0) > 0) {
       invalidateReportesAnalyticsCache();
       invalidateSeguimientoCache();
+      try {
+        await reconciliarContactadosTrasCambioGestiones();
+        contactadosActualizados = true;
+      } catch (errorContactados) {
+        advertenciaContactados =
+          "Las gestiones se eliminaron, pero Contactados no pudo reconstruirse en ese momento. Reintentá la sincronización o reiniciá el backend.";
+        console.error("⚠️ Gestiones eliminadas pero falló la reconciliación de Contactados:", errorContactados?.message || errorContactados);
+      }
     }
-    return res.json({ ok: true, borrados: r.deletedCount || 0 });
+    return res.json({
+      ok: true,
+      borrados: r.deletedCount || 0,
+      contactadosActualizados,
+      ...(advertenciaContactados ? { advertenciaContactados } : {}),
+    });
   } catch (e) {
     if (e?.code === "CLIENT_ABORTED") return res.status(499).end();
     return res.status(500).json({ error: e.message });

@@ -128,6 +128,10 @@ ReporteGestionSchema.index({ propietario: 1, resultadoGestion: 1, fecha: -1 });
 ReporteGestionSchema.index({ fecha: -1, usuario: 1 }, { name: "idx_supervision_fecha_usuario" });
 ReporteGestionSchema.index({ fecha: -1, resultadoGestion: 1 }, { name: "idx_supervision_fecha_resultado" });
 ReporteGestionSchema.index({ resultadoGestion: 1, fecha: -1, usuario: 1 }, { name: "idx_supervision_resultado_fecha_usuario" });
+ReporteGestionSchema.index(
+  { dni: 1, entidadNumero: 1, fecha: -1, borrado: 1 },
+  { name: "idx_colchon_dni_entidad_fecha" }
+);
 
 // Contactados sincroniza incrementalmente por createdAt y luego acota por fecha.
 // Este índice evita escanear toda reportegestions en cada refresco de alertas.

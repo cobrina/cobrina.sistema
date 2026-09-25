@@ -31,7 +31,11 @@ import dashboardRoutes from "./routes/dashboardRoutes.js";
 import contactadosRoutes from "./routes/contactadosRoutes.js";
 import { procesarCierresAutomaticos } from "./controllers/asistenciaController.js";
 import { limpiarRegistrosPersonalesAntiguos } from "./utils/retencionPersonal.js";
-import { sincronizarContactados, expirarContactadosAhora } from "./services/contactadosService.js";
+import {
+  sincronizarContactados,
+  expirarContactadosAhora,
+  depurarContactadosMaterializados,
+} from "./services/contactadosService.js";
 
 dotenv.config();
 
@@ -43,7 +47,7 @@ if (missingEnv.length) {
 }
 
 const app = express();
-const BUILD_ID = "rdc-supervision-robusta-2026-08-21.1";
+const BUILD_ID = "rdc-integridad-filtros-pagos-2026-09-25.1";
 const PORT = Number(process.env.PORT) || 5000;
 let httpServer = null;
 let shuttingDown = false;
@@ -258,7 +262,7 @@ async function start() {
   try {
     await mongoose.connect(process.env.MONGO_URI, mongoOptions);
     console.log("✅ Conectado a MongoDB");
-    console.log("🔒 Los índices y datos existentes no se modifican automáticamente al iniciar.");
+    console.log("🔒 No se recrean índices al iniciar; Contactados puede depurarse contra Gestiones/RRHH para mantener integridad.");
 
     httpServer = app.listen(PORT, "0.0.0.0", () => {
       console.log(`✅ API RDC lista en el puerto ${PORT}`);
@@ -269,6 +273,13 @@ async function start() {
       procesarCierresAutomaticos();
     }, 60_000);
     asistenciaTimer.unref?.();
+
+    // Limpieza liviana inmediata: al desplegar una corrección no dejamos visibles
+    // ventanas de operadores inactivos ni Contactados cuyo origen ya fue borrado
+    // del Reporte de Gestiones. La reconstrucción mensual pesada conserva su delay.
+    depurarContactadosMaterializados().catch((error) => {
+      console.error("⚠️ No se pudo depurar Contactados al iniciar:", error?.message || error);
+    });
 
     // Contactados se mantiene sincronizado con las gestiones importadas.
     // Damos unos segundos de aire al arranque para que login/importaciones no

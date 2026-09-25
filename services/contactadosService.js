@@ -4,6 +4,8 @@ import ReporteGestion from "../models/ReporteGestion.js";
 import ContactadoVentana from "../models/ContactadoVentana.js";
 import ContactadoSyncState from "../models/ContactadoSyncState.js";
 import ContactadoObservacion from "../models/ContactadoObservacion.js";
+import Empleado from "../models/Empleado.js";
+import { filtrarEmpleadosOperativosControl } from "../utils/controlEquipo.js";
 import {
   agregarHorasHabilesArgentina,
   fechaHoraGestionArgentina,
@@ -40,6 +42,79 @@ function txt(value) {
 
 function normalizarUsername(value) {
   return txt(value).toLowerCase();
+}
+
+
+async function obtenerOperadoresActivosContactados() {
+  const empleados = await Empleado.find({ isActive: { $ne: false } })
+    .select("username role isActive")
+    .lean();
+  return new Set(
+    filtrarEmpleadosOperativosControl(empleados)
+      .map((empleado) => normalizarUsername(empleado?.username))
+      .filter(Boolean)
+  );
+}
+
+/**
+ * Contactados es una materialización de Reporte de Gestiones. Por eso puede
+ * quedar desfasado si una gestión se elimina después de haber sido procesada.
+ * Esta depuración hace cumplir dos invariantes:
+ *  1) una ventana operativa abierta sólo puede pertenecer a un operador activo de RRHH;
+ *  2) la gestión que originó cualquier ventana debe seguir existiendo.
+ * El histórico cerrado se conserva aunque una persona luego haya sido dada de baja.
+ */
+export async function depurarContactadosMaterializados({ operadoresPermitidos = null } = {}) {
+  const activos = operadoresPermitidos instanceof Set
+    ? operadoresPermitidos
+    : await obtenerOperadoresActivosContactados();
+
+  let eliminadasOperador = 0;
+  if (activos.size > 0) {
+    const r = await ContactadoVentana.deleteMany({
+      estado: "abierta",
+      operador: { $nin: [...activos] },
+    });
+    eliminadasOperador = Number(r?.deletedCount || 0);
+  } else {
+    console.warn("⚠️ Contactados: no se encontraron operadores activos; se omite la limpieza por operador para evitar un borrado masivo accidental.");
+  }
+
+  const huerfanas = await ContactadoVentana.aggregate([
+    { $match: { gestionInicioId: { $ne: null } } },
+    {
+      $lookup: {
+        from: ReporteGestion.collection.name,
+        localField: "gestionInicioId",
+        foreignField: "_id",
+        as: "__gestionOrigen",
+      },
+    },
+    { $match: { "__gestionOrigen.0": { $exists: false } } },
+    { $project: { _id: 1 } },
+  ]).allowDiskUse(true);
+
+  let eliminadasHuerfanas = 0;
+  for (let i = 0; i < huerfanas.length; i += 2000) {
+    const ids = huerfanas.slice(i, i + 2000).map((row) => row._id);
+    if (!ids.length) continue;
+    const r = await ContactadoVentana.deleteMany({ _id: { $in: ids } });
+    eliminadasHuerfanas += Number(r?.deletedCount || 0);
+  }
+
+  if (eliminadasOperador || eliminadasHuerfanas) {
+    console.log(
+      `🧹 Contactados depurados: ${eliminadasOperador} abiertos por operador no activo/no válido · ` +
+      `${eliminadasHuerfanas} sin gestión de origen.`
+    );
+  }
+
+  return {
+    operadoresActivos: activos,
+    eliminadasOperador,
+    eliminadasHuerfanas,
+    eliminadas: eliminadasOperador + eliminadasHuerfanas,
+  };
 }
 
 function mesClaveArgentina(date = new Date()) {
@@ -537,7 +612,7 @@ async function esTransicionRealContactadoDB(gestion, eventAt) {
   );
 }
 
-async function procesarLoteGestiones(gestiones, { activeByPair, now, mesClave, reconstruirTardias = true }) {
+async function procesarLoteGestiones(gestiones, { activeByPair, now, mesClave, reconstruirTardias = true, operadoresPermitidos = null }) {
   if (!gestiones.length) return { procesados: 0, leidos: 0, contactadosDetectados: 0 };
 
   // activeByPair conserva el nombre por compatibilidad interna, pero desde V5 la
@@ -672,6 +747,7 @@ async function procesarLoteGestiones(gestiones, { activeByPair, now, mesClave, r
     // Sin dueño vigente, una fila Contactado sólo abre una serie si representa
     // una transición REAL desde otro Estado de la Cuenta hacia Contactado.
     if (!esGestionContactado(gestion)) continue;
+    if (operadoresPermitidos instanceof Set && !operadoresPermitidos.has(operador)) continue;
     const esOrigenReal = await esTransicionRealContactadoDB(gestion, eventAt);
     if (!esOrigenReal) continue;
     contactadosDetectados += 1;
@@ -886,6 +962,7 @@ export function construirVentanasEnMemoria(eventos = [], {
   now = new Date(),
   estadosPrevios = new Map(),
   metadataExistente = new Map(),
+  operadoresPermitidos = null,
 } = {}) {
   const unicos = new Map();
   for (const gestion of eventos) {
@@ -976,7 +1053,7 @@ export function construirVentanasEnMemoria(eventos = [], {
         continue;
       }
 
-      if (!activa && transicionAContactado) {
+      if (!activa && transicionAContactado && (!(operadoresPermitidos instanceof Set) || operadoresPermitidos.has(operador))) {
         const meta = metadataExistente.get(gestion.__key) || null;
         activa = ventanaDesdeGestion(gestion, {
           serieId: meta?.serieId || randomUUID(),
@@ -1030,17 +1107,23 @@ async function reconstruirMesRapido({
   now,
   desdeAnalisis = null,
   metadataSeed = new Map(),
+  operadoresPermitidos = null,
 }) {
   const inicio = Date.now();
   const desde = desdeAnalisis || primerDia;
 
   // Candidatos por ESTADO DE LA CUENTA exclusivamente. Luego el constructor
   // cronológico decide cuáles son transiciones reales hacia Contactado.
-  const contactados = await ReporteGestion.find({
+  const filtroContactados = {
     borrado: { $ne: true },
     fecha: { $gte: desde, $lte: ultimoDia },
     estadoCuenta: CONTACTADO_RX,
-  })
+  };
+  if (operadoresPermitidos instanceof Set) {
+    filtroContactados.usuario = { $in: [...operadoresPermitidos] };
+  }
+
+  const contactados = await ReporteGestion.find(filtroContactados)
     .select(GESTION_SELECT)
     .lean();
 
@@ -1063,6 +1146,7 @@ async function reconstruirMesRapido({
     now,
     estadosPrevios,
     metadataExistente,
+    operadoresPermitidos,
   });
 
   // Sólo materializamos las ventanas que INICIAN en el mes solicitado. Las filas
@@ -1203,6 +1287,8 @@ async function refrescarEstadoActualVentanasAbiertas(now = new Date()) {
 async function ejecutarSincronizacion() {
   const syncStartedAt = new Date();
   const now = syncStartedAt;
+  const operadoresPermitidos = await obtenerOperadoresActivosContactados();
+  const depuracion = await depurarContactadosMaterializados({ operadoresPermitidos });
   const mesClave = mesClaveArgentina(now);
   const mesAnterior = mesAnteriorClave(mesClave);
   const stateKey = `contactados:${SYNC_VERSION}:${mesClave}`;
@@ -1235,6 +1321,7 @@ async function ejecutarSincronizacion() {
       now,
       desdeAnalisis: primerDiaAnterior,
       metadataSeed: prep.metadataExistente || new Map(),
+      operadoresPermitidos,
     });
     procesadosNuevos = r.procesados;
     leidos = r.leidos;
@@ -1271,6 +1358,7 @@ async function ejecutarSincronizacion() {
         now,
         mesClave,
         reconstruirTardias: true,
+        operadoresPermitidos,
       });
       procesadosNuevos = resultado.procesados;
       leidos = resultado.leidos;
@@ -1314,6 +1402,7 @@ async function ejecutarSincronizacion() {
     diasProcesados,
     primeraCarga: esPrimeraCarga,
     eliminadasTerminales,
+    depuracion,
   };
 }
 
@@ -1501,6 +1590,8 @@ export async function asegurarMesContactados(mesSolicitado) {
     // reconstruye desde Reporte de Gestiones con la regla nueva.
     if (!existentes) {
       const { primerDia, ultimoDia } = rangoDiasReporteMesCompleto(mesClave);
+      // El histórico conserva la producción válida de personas que estaban
+      // activas en ese momento aunque hoy ya no formen parte del equipo.
       resultado = await reconstruirMesRapido({
         mesClave,
         primerDia,
@@ -1533,6 +1624,34 @@ export async function asegurarMesContactados(mesSolicitado) {
 
   syncHistoricoEnCurso.set(mesClave, tarea);
   return tarea;
+}
+
+export async function reconciliarContactadosTrasCambioGestiones() {
+  // Si había una sincronización en curso, dejamos que termine antes de invalidar
+  // el estado; de lo contrario podría volver a grabar un cursor incremental viejo.
+  if (syncEnCurso) {
+    try {
+      await syncEnCurso;
+    } catch {
+      // La reconstrucción forzada de abajo vuelve a intentar desde un estado limpio.
+    }
+  }
+
+  const operadoresPermitidos = await obtenerOperadoresActivosContactados();
+  const depuracion = await depurarContactadosMaterializados({ operadoresPermitidos });
+  const mesClave = mesClaveArgentina();
+
+  await ContactadoSyncState.deleteMany({
+    $or: [
+      { key: `contactados:${SYNC_VERSION}:${mesClave}` },
+      { key: `contactados:cleanup-terminales-v4:${mesClave}` },
+    ],
+  });
+  limpiezaTerminalMesConfirmada.delete(mesClave);
+  mesesHistoricosConfirmados.delete(mesClave);
+
+  const reconstruccion = await sincronizarContactados();
+  return { mes: mesClave, depuracion, reconstruccion };
 }
 
 export async function expirarContactadosAhora() {
